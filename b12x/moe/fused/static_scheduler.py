@@ -27,8 +27,8 @@ class StaticSchedulerParams:
         active_row_counts: cute.Tensor,
         active_experts: cute.Tensor,
         active_expert_count: cute.Tensor,
-        c: cute.Tensor,
         c_tiler: Tuple[int, int],
+        num_tiles_n: Int32,
         cluster_shape_mnk: cute.Shape,
         *,
         loc=None,
@@ -37,26 +37,15 @@ class StaticSchedulerParams:
         if cluster_shape_mnk[2] != 1:
             raise ValueError(f"unsupported cluster_shape_k {cluster_shape_mnk[2]}")
 
-        gc = cute.zipped_divide(c, tiler=c_tiler)
-        problem_shape_ntile_mnl = gc[(0, (None, None, None))].shape
         self.row_counts = row_counts
         self.active_row_counts = active_row_counts
         self.active_experts = active_experts
         self.active_expert_count = active_expert_count
-        self.c = c
         self.c_tiler = c_tiler
-        self.problem_shape_ntile_mnl = problem_shape_ntile_mnl
+        self.num_tiles_n = num_tiles_n
         self._cluster_shape_mnk = cluster_shape_mnk
         self.cluster_shape_mn = cluster_shape_mnk[:2]
         self._loc = loc
-
-        self.problem_layout_ncluster_mnl = cute.make_layout(
-            cute.ceil_div(
-                self.problem_shape_ntile_mnl, cluster_shape_mnk[:2], loc=loc, ip=ip
-            ),
-            loc=loc,
-            ip=ip,
-        )
 
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
@@ -65,8 +54,8 @@ class StaticSchedulerParams:
             self.active_row_counts,
             self.active_experts,
             self.active_expert_count,
-            self.c,
             self.c_tiler,
+            self.num_tiles_n,
             self._cluster_shape_mnk,
         ]:
             obj_values = extract_mlir_values(obj)
@@ -82,8 +71,8 @@ class StaticSchedulerParams:
                 self.active_row_counts,
                 self.active_experts,
                 self.active_expert_count,
-                self.c,
                 self.c_tiler,
+                self.num_tiles_n,
                 self._cluster_shape_mnk,
             ],
             self._values_pos,
@@ -205,7 +194,7 @@ class StaticScheduler:
         self,
         current_work_linear_idx: Int32,
     ) -> WorkTileInfo:
-        num_tiles_n = self.params.problem_shape_ntile_mnl[1]
+        num_tiles_n = self.params.num_tiles_n
         accum_tile_m = self._accum_tile_m
         batch_idx = self._current_batch_idx
         num_active_experts = self.params.active_expert_count[Int32(0)]

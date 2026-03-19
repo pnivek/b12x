@@ -246,6 +246,7 @@ class MoEStaticKernel:
         self,
         sf_vec_size: int,
         mma_tiler_mn: Tuple[int, int],
+        output_tile_count_n: int,
         *,
         input_scales_are_reciprocal: bool = False,
         fast_math: bool = False,
@@ -257,6 +258,7 @@ class MoEStaticKernel:
         self.fast_math = fast_math
         tile_k = sf_vec_size * 8
         self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
+        self.output_tile_count_n = output_tile_count_n
         self.cluster_shape_mnk = (1, 1, 1)
         self.cluster_shape_mn = (1, 1)
         self.epi_tile = (mma_tiler_mn[0], mma_tiler_mn[1])
@@ -377,7 +379,6 @@ class MoEStaticKernel:
         sfb_w13_ptr: cute.Pointer,     # scale factors for concatenated w13
         b_down: cute.Tensor,           # [K, I_tp, E]
         sfb_down_ptr: cute.Pointer,
-        c_out: cute.Tensor,            # [max_rows, I_tp, E] -- scheduler shape (intermediate)
         row_counts: cute.Tensor,       # expert_counts [E]
         active_experts: cute.Tensor,   # [E] active local expert ids in scheduler order
         active_expert_count: cute.Tensor,  # [1] active expert count
@@ -399,7 +400,9 @@ class MoEStaticKernel:
         self.sf_dtype = sfa_ptr.dtype
         self.a_layout = utils.LayoutEnum.from_tensor(packed_a)
         self.b_layout = utils.LayoutEnum.from_tensor(b_w13)
-        self.c_layout = utils.LayoutEnum.from_tensor(c_out)
+        # Match the old scheduler proxy tensor layout without materializing
+        # the dummy global buffer.
+        self.c_layout = utils.LayoutEnum.ROW_MAJOR
 
         self._setup_attributes()
 
@@ -445,11 +448,10 @@ class MoEStaticKernel:
         )
 
         # Scheduler tiles over (m_tile, intermediate_slice, expert).
-        # c_out shape is (max_rows, I_tp, E), tiled by (128, 128).
         c_tiler = (self.tile_shape_mnk[0], self.tile_shape_mnk[1])
         tile_sched_params = StaticSchedulerParams(
             row_counts, active_row_counts, active_experts, active_expert_count,
-            c_out, c_tiler, (*self.cluster_shape_mn, 1),
+            c_tiler, Int32(self.output_tile_count_n), (*self.cluster_shape_mn, 1),
         )
         grid = StaticScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
         self.kernel(

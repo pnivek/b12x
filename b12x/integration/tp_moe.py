@@ -54,7 +54,6 @@ class TPCompactStaticWorkspace(TPMoEWorkspace):
     active_row_counts: torch.Tensor
     weight_expert_ids: torch.Tensor
     global_to_local_expert: torch.Tensor
-    scheduler_out: torch.Tensor
 
 
 @dataclass(kw_only=True)
@@ -283,33 +282,13 @@ def _get_cached_static_execution_args(
         s.barrier_count, s.barrier_epoch,
         wv.w13_fp4, wv.sfb_w13_ptr,
         wv.down_fp4, wv.sfb_down_ptr,
-        s.scheduler_out, s.expert_counts, s.active_experts, s.active_expert_count, s.weight_expert_ids, s.global_to_local_expert, s.active_row_counts,
+        s.expert_counts, s.active_experts, s.active_expert_count, s.weight_expert_ids, s.global_to_local_expert, s.active_row_counts,
         input_gs, w1_alpha, w2_alpha, down_input_scale,
         scatter_output, s.token_map, s.token_weights_map,
         mac, stream,
     )
     _LAST_STATIC_EXECUTION_ARGS = (cache_key, exe_args, adapted_args)
     return exe_args, adapted_args
-
-
-def _alloc_unique_ld_tensor(
-    shape: Tuple[int, int, int],
-    *,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    """Allocate a 3D tensor with exactly one stride-1 dimension.
-
-    CuTe's dynamic-layout inference fails when a compact tensor has multiple
-    stride-1 dimensions, which happens for shapes like [M, N, 1]. Padding the
-    size-1 expert stride avoids the ambiguity while preserving the logical
-    M-major [M, N, E] layout.
-    """
-    m, n, e = shape
-    if e != 1:
-        return torch.empty(shape, dtype=dtype, device=device)
-    storage = torch.empty(m * n, dtype=dtype, device=device)
-    return torch.as_strided(storage, shape, (n, 1, m * n))
 
 
 def _safe_max_rows_per_launch(E: int, k: int, n: int) -> int:
@@ -477,10 +456,9 @@ def _alloc_workspace(
             active_experts=torch.empty(state_E, dtype=torch.int32, device=device),
             active_expert_count=torch.zeros(1, dtype=torch.int32, device=device),
             active_row_counts=torch.zeros(state_E, dtype=torch.int32, device=device),
-            weight_expert_ids=torch.arange(state_E, dtype=torch.int32, device=device),
-            global_to_local_expert=torch.empty(weight_E, dtype=torch.int32, device=device),
-            scheduler_out=_alloc_unique_ld_tensor((max_rows, n, state_E), dtype=dtype, device=device),
-        )
+        weight_expert_ids=torch.arange(state_E, dtype=torch.int32, device=device),
+        global_to_local_expert=torch.empty(weight_E, dtype=torch.int32, device=device),
+    )
         _finalize_workspace_views(workspace)
         return workspace
 
@@ -873,6 +851,7 @@ def _get_static_kernel(
     kernel = MoEStaticKernel(
         sf_vec_size=sf_vec_size,
         mma_tiler_mn=(128, 128),
+        output_tile_count_n=max(1, (n + 128 - 1) // 128),
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
     )
@@ -915,9 +894,6 @@ def _get_static_kernel(
         ab_dtype, (k, n, weight_E), stride_order=(1, 0, 2), assumed_align=16,
     )
     sfb_down_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    c_fake = cute.runtime.make_fake_compact_tensor(
-        a_dtype, (max_rows, n, state_E), stride_order=(1, 0, 2), assumed_align=16,
-    )
     row_counts_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (state_E,), assumed_align=4,
     )
@@ -965,7 +941,7 @@ def _get_static_kernel(
         barrier_count_fake, barrier_epoch_fake,
         b_w13_fake, sfb_w13_fake,
         b_down_fake, sfb_down_fake,
-        c_fake, row_counts_fake, active_experts_fake, active_expert_count_fake, weight_expert_ids_fake, global_to_local_expert_fake, active_row_counts_fake,
+        row_counts_fake, active_experts_fake, active_expert_count_fake, weight_expert_ids_fake, global_to_local_expert_fake, active_row_counts_fake,
         input_gs_fake, alpha_fake, down_alpha_fake, global_scale_fake,
         scatter_fake, token_map_fake, token_weights_fake,
         mac, current_cuda_stream(),

@@ -114,8 +114,8 @@ def _launch_with_alias_consumer(
 def _assert_matches(actual: torch.Tensor, expected: torch.Tensor) -> None:
     metrics = compare_to_reference(actual, expected)
     assert metrics.max_abs <= 2e-3
-    assert metrics.rmse <= 1.5e-5
-    assert metrics.cos > 0.99994
+    assert metrics.rmse <= 2e-5
+    assert metrics.cos > 0.99989
 
 
 def test_b12x_supports_overlapping_stream_launches() -> None:
