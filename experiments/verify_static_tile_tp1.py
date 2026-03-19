@@ -110,7 +110,6 @@ def _run_static(
         g2_alphas,
         topk_weights,
         topk_ids,
-        implementation="static",
     )
     torch.cuda.synchronize()
     return out.detach().clone()

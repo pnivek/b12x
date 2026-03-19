@@ -588,8 +588,6 @@ def allocate_layer_chain_workspace(
     params_stack: Sequence[ScaleContractParams],
     x: torch.Tensor,
     topk_ids_per_layer: Sequence[torch.Tensor],
-    *,
-    backend: str,
 ):
     from b12x.integration.tp_moe import allocate_tp_moe_workspace
 
@@ -602,7 +600,6 @@ def allocate_layer_chain_workspace(
         params_stack[0].a2_gscale,
         weights_stack[0].w2_weight,
         topk_ids_per_layer[0],
-        implementation=backend,
         input_scales_static=True,
     )
 
@@ -614,7 +611,6 @@ def run_moe_layer_chain(
     topk_ids_per_layer: Sequence[torch.Tensor],
     topk_weights_per_layer: Sequence[torch.Tensor],
     *,
-    backend: str,
     fast_math: bool,
     output_buffers: Sequence[torch.Tensor] | None = None,
     workspace,
@@ -649,7 +645,6 @@ def run_moe_layer_chain(
             params.g2_alphas,
             topk_weights,
             topk_ids,
-            implementation=backend,
             fast_math=fast_math,
             output=output,
             workspace=workspace,
@@ -666,7 +661,6 @@ def capture_moe_layer_chain(
     topk_ids_per_layer: Sequence[torch.Tensor],
     topk_weights_per_layer: Sequence[torch.Tensor],
     *,
-    backend: str,
     fast_math: bool,
     output_buffers: Sequence[torch.Tensor],
     workspace,
@@ -679,7 +673,6 @@ def capture_moe_layer_chain(
             x,
             topk_ids_per_layer,
             topk_weights_per_layer,
-            backend=backend,
             fast_math=fast_math,
             output_buffers=output_buffers,
             workspace=workspace,
@@ -725,7 +718,7 @@ def bench_multilayer_graph_mode(
     if args.reference != "none" or args.validate != "none":
         print("Note: multi-layer graph mode skips flashinfer/oracle checks and validates graph replay against an eager layer chain.")
     print("Multi-layer graph mode")
-    print(f"Backend: {args.backend}")
+    print("Backend: b12x auto")
     print(f"Layers: {layer_start}..{layer_start + graph_num_layers - 1}")
     print(f"Patterns: disjoint, overlap, random")
     print()
@@ -773,7 +766,6 @@ def bench_multilayer_graph_mode(
             params_stack,
             x_buf,
             topk_ids_bufs,
-            backend=args.backend,
         )
 
         run_moe_layer_chain(
@@ -782,7 +774,6 @@ def bench_multilayer_graph_mode(
             x_buf,
             topk_ids_bufs,
             topk_weights_bufs,
-            backend=args.backend,
             fast_math=args.fast_math,
             output_buffers=graph_output_bufs,
             workspace=shared_workspace,
@@ -794,7 +785,6 @@ def bench_multilayer_graph_mode(
             x_buf,
             topk_ids_bufs,
             topk_weights_bufs,
-            backend=args.backend,
             fast_math=args.fast_math,
             output_buffers=graph_output_bufs,
             workspace=shared_workspace,
@@ -807,7 +797,6 @@ def bench_multilayer_graph_mode(
                 x_buf,
                 topk_ids_bufs,
                 topk_weights_bufs,
-                backend=args.backend,
                 fast_math=args.fast_math,
                 output_buffers=eager_output_bufs,
                 workspace=shared_workspace,
@@ -911,7 +900,6 @@ def bench_e2e() -> None:
     )
     parser.add_argument("--batch-size-profile", choices=sorted(BATCH_SIZE_PROFILES), default="micro")
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=None)
-    parser.add_argument("--backend", choices=["static", "dynamic"], default="static")
     parser.add_argument("--graph-mode", choices=["single-op", "multi-layer"], default="single-op")
     parser.add_argument("--graph-num-layers", type=int, default=4)
     parser.add_argument("--graph-layer-start", type=int, default=0)
@@ -935,7 +923,7 @@ def bench_e2e() -> None:
     )
     parser.add_argument(
         "--profile-once",
-        choices=["none", "backend", "static", "dynamic", "flashinfer"],
+        choices=["none", "backend", "flashinfer"],
         default="none",
     )
     parser.add_argument(
@@ -973,7 +961,7 @@ def bench_e2e() -> None:
         f"E={spec.num_experts}, top_k={spec.top_k}"
     )
     print(f"Batch-size profile: {args.batch_size_profile} -> {batch_sizes}")
-    print(f"Backend: {args.backend}")
+    print("Backend: b12x auto")
     print(f"Scale contract: {args.scale_contract}")
     print(f"Validation: {args.validate}")
     print(f"Fast math: {'on' if args.fast_math else 'off'}")
@@ -1015,7 +1003,6 @@ def bench_e2e() -> None:
         params.a2_gscale,
         weights.w2_weight,
         topk_ids_w,
-        implementation=args.backend,
         input_scales_static=True,
     )
     b12x_moe_fp4(
@@ -1030,14 +1017,13 @@ def bench_e2e() -> None:
         params.g2_alphas,
         topk_weights_w,
         topk_ids_w,
-        implementation=args.backend,
         workspace=warmup_workspace,
         fast_math=args.fast_math,
     )
     torch.cuda.synchronize()
     print(" done.")
 
-    backend_label = f"b12x {args.backend}"
+    backend_label = "b12x"
 
     batch_results: dict[int, BatchResult] = {}
     accuracy_failures: list[str] = []
@@ -1053,13 +1039,9 @@ def bench_e2e() -> None:
         topk_logits, topk_ids = torch.topk(routing_logits, spec.top_k, dim=-1)
         topk_weights = torch.softmax(topk_logits, dim=-1)
         backend_output = torch.empty_like(x)
-        backend_workspaces: dict[str, object] = {}
+        backend_workspace = allocate_tp_moe_workspace_pool()
 
-        def make_backend_e2e(backend: str) -> Callable[[], torch.Tensor]:
-            backend_workspace = backend_workspaces.get(backend)
-            if backend_workspace is None:
-                backend_workspace = allocate_tp_moe_workspace_pool()
-                backend_workspaces[backend] = backend_workspace
+        def make_backend_e2e() -> Callable[[], torch.Tensor]:
 
             def impl_launch(topk_ids_local: torch.Tensor, topk_weights_local: torch.Tensor) -> torch.Tensor:
                 return b12x_moe_fp4(
@@ -1074,7 +1056,6 @@ def bench_e2e() -> None:
                     params.g2_alphas,
                     topk_weights_local,
                     topk_ids_local,
-                    implementation=backend,
                     workspace=backend_workspace,
                     fast_math=args.fast_math,
                     output=backend_output,
@@ -1089,7 +1070,7 @@ def bench_e2e() -> None:
 
             return impl_e2e
 
-        backend_e2e = make_backend_e2e(args.backend)
+        backend_e2e = make_backend_e2e()
 
         ref_name = None
         ref_launch = None
@@ -1173,9 +1154,8 @@ def bench_e2e() -> None:
                 profile_fn = ref_launch
                 profile_name = ref_name or "flashinfer"
             else:
-                profile_backend = args.backend if args.profile_once == "backend" else args.profile_once
-                profile_fn = backend_e2e if profile_backend == args.backend else make_backend_e2e(profile_backend)
-                profile_name = f"b12x {profile_backend}"
+                profile_fn = backend_e2e
+                profile_name = backend_label
             print(f"  profiling once: {profile_name}")
             torch.cuda.synchronize()
             cudart = torch.cuda.cudart()
@@ -1277,7 +1257,7 @@ def bench_e2e() -> None:
             parts = [f"bs={batch_size}"]
             if result.ref_stats is not None:
                 parts.append(f"ref {result.ref_stats.median_us:.1f} us")
-            parts.append(f"{args.backend} {result.backend_stats.median_us:.1f} us")
+            parts.append(f"b12x {result.backend_stats.median_us:.1f} us")
             if result.ratio_stats is not None:
                 parts.append(f"ratio {fmt_ratio_stats(result.ratio_stats)}")
             print("  " + " | ".join(parts))

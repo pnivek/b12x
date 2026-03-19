@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Independent Torch reference for the TP MoE path.
 
-This verifies `b12x_moe_fp4(..., implementation=...)` against a pure PyTorch
+This verifies auto-dispatched `b12x_moe_fp4(...)` against a pure PyTorch
 reference that models the NVFP4 block-scaled FC1/FC2 math directly, rather
 than using another kernel implementation as the correctness oracle.
 """
@@ -287,7 +287,6 @@ def _run_impl(
         scale_params.g2_alphas,
         topk_weights,
         topk_ids,
-        implementation=impl,
         workspace=workspace,
         input_scales_static=True,
     )
@@ -345,7 +344,6 @@ def _run_impl_sequence(
             scale_params.g2_alphas,
             topk_weights,
             topk_ids,
-            implementation=impl,
             workspace=workspace,
             input_scales_static=True,
         )
@@ -360,13 +358,14 @@ def main() -> None:
     parser.add_argument("--layer-indices", type=int, nargs="+", default=[0])
     parser.add_argument("--sequence-repeats", type=int, default=1)
     parser.add_argument("--clear-state-between-calls", action="store_true")
-    parser.add_argument("--impls", nargs="+", default=["flashinfer", "static"])
+    parser.add_argument("--impls", nargs="+", default=["flashinfer", "b12x"])
     parser.add_argument("--activation-scale", type=float, default=10.0)
     parser.add_argument("--oracle-mode", choices=["f32", "nvfp4"], default="nvfp4")
     parser.add_argument("--scale-contract", choices=["shared", "per-expert"], default="per-expert")
     parser.add_argument("--base-seed", type=int, default=42)
     parser.add_argument("--trials", type=int, default=1)
     args = parser.parse_args()
+    args.impls = ["b12x" if impl in {"static", "dynamic"} else impl for impl in args.impls]
     if args.scale_contract == "per-expert" and "flashinfer" in args.impls:
         raise ValueError("flashinfer does not support --scale-contract per-expert")
 

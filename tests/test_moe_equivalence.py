@@ -1,4 +1,4 @@
-"""Smoke test that the static TP MoE path returns a non-zero tensor."""
+"""Smoke tests for the auto-dispatched TP MoE path."""
 
 from __future__ import annotations
 
@@ -88,7 +88,6 @@ def test_moe_nonzero(m):
         weights.w2_input_scale_per_expert,
         weights.w2_weight,
         topk_ids,
-        implementation="static",
         input_scales_static=True,
     )
 
@@ -103,7 +102,6 @@ def test_moe_nonzero(m):
         weights.w2_blockscale_swizzled,
         weights.g2_alphas_per_expert,
         topk_weights, topk_ids,
-        implementation="static",
         workspace=workspace,
         input_scales_static=True,
     )
@@ -144,7 +142,6 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
         weights.w2_input_scale_per_expert,
         weights.w2_weight,
         topk_ids_buf,
-        implementation="static",
         input_scales_static=True,
     )
 
@@ -161,7 +158,6 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
         weights.g2_alphas_per_expert,
         topk_weights_buf,
         topk_ids_buf,
-        implementation="static",
         output=graph_output,
         workspace=workspace,
         input_scales_static=True,
@@ -182,7 +178,6 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
             weights.g2_alphas_per_expert,
             topk_weights_buf,
             topk_ids_buf,
-            implementation="static",
             output=graph_output,
             workspace=workspace,
             input_scales_static=True,
@@ -210,7 +205,6 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
             weights.g2_alphas_per_expert,
             topk_weights,
             topk_ids,
-            implementation="static",
             workspace=workspace,
             input_scales_static=True,
         )
@@ -257,7 +251,6 @@ def test_moe_cuda_graph_replay_multilayer_tracks_routing_updates(m):
         params_stack,
         x_buf,
         topk_ids_bufs,
-        backend="static",
     )
 
     run_moe_layer_chain(
@@ -266,7 +259,6 @@ def test_moe_cuda_graph_replay_multilayer_tracks_routing_updates(m):
         x_buf,
         topk_ids_bufs,
         topk_weights_bufs,
-        backend="static",
         fast_math=True,
         output_buffers=graph_output_bufs,
         workspace=shared_workspace,
@@ -278,7 +270,6 @@ def test_moe_cuda_graph_replay_multilayer_tracks_routing_updates(m):
         x_buf,
         topk_ids_bufs,
         topk_weights_bufs,
-        backend="static",
         fast_math=True,
         output_buffers=graph_output_bufs,
         workspace=shared_workspace,
@@ -323,7 +314,6 @@ def test_moe_cuda_graph_replay_multilayer_tracks_routing_updates(m):
             x_buf,
             topk_ids_bufs,
             topk_weights_bufs,
-            backend="static",
             fast_math=True,
             output_buffers=eager_output_bufs,
             workspace=shared_workspace,

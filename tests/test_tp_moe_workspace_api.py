@@ -50,7 +50,6 @@ def test_workspace_pool_handles_chunked_calls(monkeypatch: pytest.MonkeyPatch) -
         weights.w2_input_scale_per_expert,
         weights.w2_weight,
         topk_ids,
-        implementation="static",
         input_scales_static=True,
     )
     expected = b12x_moe_fp4(
@@ -65,7 +64,6 @@ def test_workspace_pool_handles_chunked_calls(monkeypatch: pytest.MonkeyPatch) -
         weights.g2_alphas_per_expert,
         topk_weights,
         topk_ids,
-        implementation="static",
         workspace=exact_workspace,
         input_scales_static=True,
     ).clone()
@@ -85,7 +83,6 @@ def test_workspace_pool_handles_chunked_calls(monkeypatch: pytest.MonkeyPatch) -
         weights.g2_alphas_per_expert,
         topk_weights,
         topk_ids,
-        implementation="static",
         workspace=pool,
         input_scales_static=True,
     ).clone()
@@ -104,7 +101,6 @@ def test_workspace_pool_handles_chunked_calls(monkeypatch: pytest.MonkeyPatch) -
             weights.g2_alphas_per_expert,
             topk_weights,
             topk_ids,
-            implementation="static",
             workspace=exact_workspace,
             input_scales_static=True,
         )
@@ -112,7 +108,7 @@ def test_workspace_pool_handles_chunked_calls(monkeypatch: pytest.MonkeyPatch) -
     assert len(pool.workspaces) == 1
     metrics = compare_to_reference(actual, expected)
     assert metrics.max_abs <= 5e-4
-    assert metrics.cos > 0.9999
+    assert metrics.cos > 0.9998
 
 
 def test_cuda_graph_capture_requires_output_buffer() -> None:
@@ -132,7 +128,6 @@ def test_cuda_graph_capture_requires_output_buffer() -> None:
         weights.w2_input_scale_per_expert,
         weights.w2_weight,
         topk_ids,
-        implementation="static",
         input_scales_static=True,
     )
 
@@ -151,7 +146,6 @@ def test_cuda_graph_capture_requires_output_buffer() -> None:
                 weights.g2_alphas_per_expert,
                 topk_weights,
                 topk_ids,
-                implementation="static",
                 workspace=workspace,
                 input_scales_static=True,
             )
@@ -175,7 +169,7 @@ def test_dynamic_workspace_uses_compact_storage() -> None:
     device = torch.device("cuda")
     spec = _make_spec()
     weights = load_expert_weights(MODEL_PATH, spec, layer_idx=0)
-    x, topk_ids, _topk_weights = make_routed_inputs(spec, 1, seed=777, device=device)
+    x, topk_ids, _topk_weights = make_routed_inputs(spec, 13, seed=777, device=device)
 
     workspace = allocate_tp_moe_workspace(
         x,
@@ -184,7 +178,6 @@ def test_dynamic_workspace_uses_compact_storage() -> None:
         weights.w2_input_scale_per_expert,
         weights.w2_weight,
         topk_ids,
-        implementation="dynamic",
         input_scales_static=True,
     )
 
@@ -192,7 +185,7 @@ def test_dynamic_workspace_uses_compact_storage() -> None:
     max_phys_tiles, _, max_tasks = tp_moe._dynamic_task_geometry(
         spec.num_experts,
         n,
-        spec.top_k,
+        x.shape[0] * spec.top_k,
     )
     rows_padded = max_phys_tiles * tp_moe._LEVEL_TILE_M
     cols_pad_k = tp_moe.align_up(spec.hidden_size // tp_moe._NVFP4_BLOCK_SIZE, 4)
@@ -206,3 +199,4 @@ def test_dynamic_workspace_uses_compact_storage() -> None:
     assert tuple(workspace.packed_input_scale.shape) == (rows_padded, cols_pad_k)
     assert tuple(workspace.tile_write_count.shape) == (max_phys_tiles,)
     assert tuple(workspace.task_ready.shape) == (max_tasks,)
+    assert tp_moe.select_tp_moe_backend(num_tokens=x.shape[0], num_topk=spec.top_k) == "dynamic"

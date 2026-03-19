@@ -92,7 +92,6 @@ def _run_parameter_launch_case(case: str) -> subprocess.CompletedProcess[str]:
             a2_gscale,
             weights.w2_weight,
             topk_ids,
-            implementation="static",
             input_scales_static=True,
         )
         print(f"case={{case}} start", flush=True)
@@ -108,7 +107,6 @@ def _run_parameter_launch_case(case: str) -> subprocess.CompletedProcess[str]:
             w2_alphas,
             topk_weights,
             topk_ids,
-            implementation="static",
             workspace=workspace,
             output=out,
             input_scales_are_reciprocal=True,

@@ -70,7 +70,6 @@ def _run_b12x(
         w2_alphas=weights.g2_alphas,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        implementation="static",
         workspace=workspace,
         input_scales_are_reciprocal=True,
     )
@@ -139,7 +138,6 @@ def test_b12x_uses_current_cuda_stream() -> None:
         weights.w2_input_scale_quant,
         weights.w2_weight,
         topk_ids,
-        implementation="static",
         input_scales_static=True,
     )
 

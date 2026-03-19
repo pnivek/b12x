@@ -52,6 +52,9 @@ python -m pip install -e '.[dev]'
 ## MoE runtime contract
 
 - `b12x.integration.tp_moe.b12x_moe_fp4` requires a caller-owned workspace.
+- `b12x` selects its fused MoE backend from shape alone:
+  - compact routed workloads use the static backend
+  - all larger routed workloads use dynamic
 - Use `allocate_tp_moe_workspace(...)` for one exact unchunked launch shape.
 - Use `allocate_tp_moe_workspace_pool()` for variable-size or chunked workloads, and keep one pool per active stream or captured CUDA graph.
 - During CUDA graph capture, `output=` must also be caller-owned and stable across replays.
@@ -80,32 +83,29 @@ python -m pip install -e '.[dev]'
 ## Common commands
 
 ```bash
-# Static backend, graph-first benchmark defaults
-B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --backend static
-
-# Dynamic backend, same benchmark harness
-B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --backend dynamic
+# Graph-first benchmark defaults with auto-dispatch
+B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py
 
 # Measure eager launches instead of CUDA graph replay
-B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --backend static --no-cuda-graph
+B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --no-cuda-graph
 
 # Include routing in the timed region
-B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --backend static --include-routing
+B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --include-routing
 
 # Use the recorded single-request sglang profile
-B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --backend static --batch-size-profile sglang-single-request
+B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --batch-size-profile sglang-single-request
 
 # Graph-first prefill-scale sweep aligned with chunked-prefill serving
-B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --backend static --batch-size-profile chunked-prefill
+B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --batch-size-profile chunked-prefill
 
 # Multi-layer CUDA-graph replay validation with real consecutive MoE layers
-B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --backend static --graph-mode multi-layer --reference none --validate none
+B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --graph-mode multi-layer --reference none --validate none
 
 # Dense GEMM microbenchmark
 python benchmarks/benchmark_dense_gemm.py
 
 # Oracle-backed MoE correctness
-python tests/test_tp_moe_reference.py --impls static dynamic --scale-contract per-expert
+python tests/test_tp_moe_reference.py --impls b12x --scale-contract per-expert
 
 # Real-weight CUDA-graph smoke
 pytest tests/test_moe_equivalence.py

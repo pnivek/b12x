@@ -372,15 +372,16 @@ def _dynamic_token_chunk_limit(E: int, k: int, n: int, num_topk: int) -> int:
     return min(compact_limit, legacy_limit)
 
 
-def _normalize_impl(implementation: str | None) -> str:
-    impl = implementation or "static"
-    if impl == "level9":
+def select_tp_moe_backend(
+    *,
+    num_tokens: int,
+    num_topk: int,
+) -> str:
+    """Pick the fused MoE backend from the intrinsic routed workload shape."""
+    routed_rows = num_tokens * num_topk
+    if routed_rows < _get_static_compact_cutover_pairs():
         return "static"
-    if impl == "level10":
-        return "dynamic"
-    if impl in {"static", "dynamic"}:
-        return impl
-    raise ValueError(f"b12x_moe_fp4 only supports implementation='static' or 'dynamic', got {impl!r}")
+    return "dynamic"
 
 
 def _dynamic_task_geometry(E: int, n: int, max_rows: int) -> tuple[int, int, int]:
@@ -615,23 +616,23 @@ def _get_weight_views(
 
 
 def _resolve_workspace_layout(
-    implementation: str,
     *,
     num_tokens: int,
     weight_E: int,
     num_topk: int,
-) -> tuple[bool, int, int]:
+) -> tuple[str, bool, int, int]:
     routed_rows = num_tokens * num_topk
-    use_compact_static = (
-        implementation == "static"
-        and routed_rows < _get_static_compact_cutover_pairs()
+    implementation = select_tp_moe_backend(
+        num_tokens=num_tokens,
+        num_topk=num_topk,
     )
+    use_compact_static = implementation == "static"
     state_E = weight_E
     state_max_rows = ((routed_rows + 127) // 128) * 128
     if use_compact_static:
         state_E = max(1, routed_rows)
         state_max_rows = max(1, routed_rows)
-    return use_compact_static, state_E, state_max_rows
+    return implementation, use_compact_static, state_E, state_max_rows
 
 
 def _validate_workspace(
@@ -791,7 +792,6 @@ def allocate_tp_moe_workspace(
     w2_fp4: torch.Tensor,
     topk_ids: torch.Tensor,
     *,
-    implementation: str | None = None,
     input_scales_static: bool = False,
 ) -> TPMoEWorkspace:
     """Allocate reusable scratch for one exact unchunked `b12x_moe_fp4` call shape."""
@@ -805,9 +805,7 @@ def allocate_tp_moe_workspace(
     weight_E = w1_fp4.shape[0]
     n = w2_fp4.shape[2] * 2
     num_topk = topk_ids.shape[1]
-    impl = _normalize_impl(implementation)
-    _, state_E, state_max_rows = _resolve_workspace_layout(
-        impl,
+    impl, _, state_E, state_max_rows = _resolve_workspace_layout(
         num_tokens=m,
         weight_E=weight_E,
         num_topk=num_topk,
@@ -1202,7 +1200,6 @@ def b12x_moe_fp4(
     topk_weights: torch.Tensor,  # [m, topk] float
     topk_ids: torch.Tensor,    # [m, topk] int
     apply_router_weight_on_input: bool = False,
-    implementation: str | None = None,
     *,
     workspace: TPMoEWorkspace | TPMoEWorkspacePool,
     output: torch.Tensor | None = None,
@@ -1210,10 +1207,11 @@ def b12x_moe_fp4(
     input_scales_static: bool = False,
     fast_math: bool | None = None,
 ) -> torch.Tensor:
-    """MoE with the fused static or dynamic kernels.
+    """MoE with shape-selected fused static or dynamic kernels.
 
-    Uses the selected fused kernel, chunking large token batches when the CuTe
-    runtime cannot describe the required work buffers in a single launch.
+    Compact workloads use the graph-safe static backend. All larger routed
+    workloads use dynamic. Large token batches are chunked only when the chosen
+    backend cannot describe the required work buffers in a single launch.
     """
     m, k = a.shape
     E = w1_fp4.shape[0]
@@ -1222,7 +1220,6 @@ def b12x_moe_fp4(
     num_topk = topk_ids.shape[1]
     routed_rows = m * num_topk
     device = a.device
-    requested_impl = _normalize_impl(implementation)
 
     if apply_router_weight_on_input:
         raise NotImplementedError("apply_router_weight_on_input is not implemented in b12x_moe_fp4")
@@ -1235,9 +1232,7 @@ def b12x_moe_fp4(
         or (a1_gscale.numel() == 1 and a2_gscale.numel() == 1)
     )
 
-    impl = requested_impl
-    use_compact_static, state_E, state_max_rows = _resolve_workspace_layout(
-        requested_impl,
+    impl, use_compact_static, state_E, state_max_rows = _resolve_workspace_layout(
         num_tokens=m,
         weight_E=weight_E,
         num_topk=num_topk,
@@ -1272,7 +1267,6 @@ def b12x_moe_fp4(
                 topk_weights[start:end],
                 topk_ids[start:end],
                 apply_router_weight_on_input=apply_router_weight_on_input,
-                implementation=impl,
                 output=chunk_output[start:end],
                 workspace=workspace,
                 input_scales_are_reciprocal=input_scales_are_reciprocal,
