@@ -14,11 +14,14 @@ from .attention import (
     allocate_paged_attention_workspace_pool,
     allocate_paged_attention_workspace_for_plan,
     b12x_attention_forward,
+    b12x_paged_decode,
     b12x_paged_attention_forward,
+    b12x_paged_extend,
     choose_paged_attention_num_splits,
     clear_attention_caches,
     create_attention_plan,
     create_paged_attention_plan,
+    infer_paged_attention_mode,
 )
 from .tp_moe import b12x_moe_fp4
 
@@ -38,10 +41,13 @@ __all__ = [
     "allocate_paged_attention_workspace_pool",
     "allocate_paged_attention_workspace_for_plan",
     "b12x_attention_forward",
+    "b12x_paged_decode",
     "b12x_paged_attention_forward",
+    "b12x_paged_extend",
     "choose_paged_attention_num_splits",
     "clear_attention_caches",
     "create_attention_plan",
     "create_paged_attention_plan",
+    "infer_paged_attention_mode",
     "b12x_moe_fp4",
 ]

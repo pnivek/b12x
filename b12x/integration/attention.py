@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass, field
+from typing import Literal
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -167,6 +168,22 @@ def _metadata_to_cpu_int_list(t: torch.Tensor, *, name: str) -> list[int]:
     return [int(v) for v in t.detach().cpu().tolist()]
 
 
+def _q_lengths_from_cu_seqlens(cu_seqlens_q: torch.Tensor) -> list[int]:
+    cu_seqlens_q_list = _metadata_to_cpu_int_list(cu_seqlens_q, name="cu_seqlens_q")
+    q_lengths: list[int] = []
+    for start, end in zip(cu_seqlens_q_list[:-1], cu_seqlens_q_list[1:]):
+        if end < start:
+            raise ValueError("cu_seqlens_q must be non-decreasing")
+        q_lengths.append(end - start)
+    return q_lengths
+
+
+def infer_paged_attention_mode(cu_seqlens_q: torch.Tensor) -> Literal["decode", "extend"]:
+    """Infer whether a paged launch is decode-like or extend-like from Q lengths."""
+    q_lengths = _q_lengths_from_cu_seqlens(cu_seqlens_q)
+    return "decode" if q_lengths and all(q_len == 1 for q_len in q_lengths) else "extend"
+
+
 def _cuda_device_index(device: torch.device) -> int:
     if device.type != "cuda":
         raise ValueError(f"expected CUDA device, got {device}")
@@ -311,11 +328,7 @@ def _validate_paged_lengths(
     if cu_seqlens_q_list[-1] != total_q:
         raise ValueError(f"cu_seqlens_q must end at total_q={total_q}, got {cu_seqlens_q_list[-1]}")
 
-    q_lengths: list[int] = []
-    for start, end in zip(cu_seqlens_q_list[:-1], cu_seqlens_q_list[1:]):
-        if end < start:
-            raise ValueError("cu_seqlens_q must be non-decreasing")
-        q_lengths.append(end - start)
+    q_lengths = _q_lengths_from_cu_seqlens(cu_seqlens_q)
 
     for request_idx, (q_len, cache_len) in enumerate(zip(q_lengths, cache_seqlens_list)):
         if cache_len < 0:
@@ -456,6 +469,7 @@ class PagedAttentionPlanKey:
     device_index: int
     dtype: torch.dtype
     causal: bool
+    mode: Literal["decode", "extend"]
     tile_m: int
     tile_n: int
     num_splits: int
@@ -530,6 +544,7 @@ class PagedAttentionWorkspace:
     device: torch.device
     dtype: torch.dtype
     causal: bool
+    mode: Literal["decode", "extend"]
     tile_m: int
     tile_n: int
     num_splits: int
@@ -918,10 +933,12 @@ def _compile_paged_attention(
     cu_seqlens_q_shape: tuple[int, ...],
     dtype: torch.dtype,
     causal: bool,
+    mode: Literal["decode", "extend"],
     tile_m: int,
     tile_n: int,
     num_splits: int,
 ):
+    del mode
     cutlass_dtype = _torch_to_cutlass_dtype(dtype)
     launch = _PagedAttentionForwardLaunch(
         q_shape=q_shape,
@@ -1043,6 +1060,7 @@ def _get_paged_attention_plan(
     device_index: int,
     dtype: torch.dtype,
     causal: bool,
+    mode: Literal["decode", "extend"],
     tile_m: int,
     tile_n: int,
     num_splits: int,
@@ -1068,6 +1086,7 @@ def _get_paged_attention_plan(
             device_index=device_index,
             dtype=dtype,
             causal=causal,
+            mode=mode,
             tile_m=tile_m,
             tile_n=tile_n,
             num_splits=num_splits,
@@ -1089,6 +1108,7 @@ def _get_paged_attention_plan(
             cu_seqlens_q_shape,
             dtype,
             causal,
+            mode,
             tile_m,
             tile_n,
             num_splits,
@@ -1168,6 +1188,7 @@ def _validate_paged_workspace(
         plan.device,
         plan.dtype,
         plan.causal,
+        plan.mode,
         plan.tile_m,
         plan.tile_n,
         plan.num_splits,
@@ -1180,6 +1201,7 @@ def _validate_paged_workspace(
         workspace.device,
         workspace.dtype,
         workspace.causal,
+        workspace.mode,
         workspace.tile_m,
         workspace.tile_n,
         workspace.num_splits,
@@ -1187,7 +1209,8 @@ def _validate_paged_workspace(
     if expected != actual:
         raise ValueError(
             "paged workspace shape mismatch: "
-            f"expected q/k_cache/v_cache/page_table/device/dtype/causal/tile/splits={expected}, got {actual}"
+            "expected q/k_cache/v_cache/page_table/device/dtype/causal/mode/tile/splits="
+            f"{expected}, got {actual}"
         )
     if workspace.num_splits < 1:
         raise ValueError(f"paged workspace num_splits must be >= 1, got {workspace.num_splits}")
@@ -1276,6 +1299,7 @@ def allocate_paged_attention_workspace_for_plan(plan: PagedAttentionPlan) -> Pag
         device=plan.device,
         dtype=plan.dtype,
         causal=plan.causal,
+        mode=plan.mode,
         tile_m=plan.tile_m,
         tile_n=plan.tile_n,
         num_splits=plan.num_splits,
@@ -1372,6 +1396,7 @@ def create_paged_attention_plan(
     cu_seqlens_q: torch.Tensor,
     *,
     causal: bool = True,
+    mode: Literal["decode", "extend"] | None = None,
     tile_shape: tuple[int, int] | None = None,
     num_splits: int | None = None,
     split_buckets: tuple[int, ...] = _DEFAULT_PAGED_SPLIT_BUCKETS,
@@ -1403,6 +1428,11 @@ def create_paged_attention_plan(
         cu_seqlens_q=cu_seqlens_q,
         causal=causal,
     )
+    inferred_mode = infer_paged_attention_mode(cu_seqlens_q)
+    if mode is None:
+        mode = inferred_mode
+    elif mode != inferred_mode:
+        raise ValueError(f"paged attention mode mismatch: requested {mode}, inferred {inferred_mode}")
     if num_splits in (None, 0):
         num_splits = choose_paged_attention_num_splits(
             cache_seqlens,
@@ -1428,6 +1458,7 @@ def create_paged_attention_plan(
         _cuda_device_index(device),
         dtype,
         causal,
+        mode,
         tile_m,
         tile_n,
         num_splits,
@@ -1462,6 +1493,7 @@ def allocate_paged_attention_workspace(
     cu_seqlens_q: torch.Tensor,
     *,
     causal: bool = True,
+    mode: Literal["decode", "extend"] | None = None,
     tile_shape: tuple[int, int] | None = None,
     num_splits: int | None = None,
     split_buckets: tuple[int, ...] = _DEFAULT_PAGED_SPLIT_BUCKETS,
@@ -1476,6 +1508,7 @@ def allocate_paged_attention_workspace(
         cache_seqlens,
         cu_seqlens_q,
         causal=causal,
+        mode=mode,
         tile_shape=tile_shape,
         num_splits=num_splits,
         split_buckets=split_buckets,
@@ -1630,6 +1663,7 @@ def b12x_paged_attention_forward(
             _cuda_device_index(workspace.device),
             workspace.dtype,
             workspace.causal,
+            workspace.mode,
             workspace.tile_m,
             workspace.tile_n,
             workspace.num_splits,
@@ -1688,6 +1722,100 @@ def b12x_paged_attention_forward(
     return resolved_workspace.output, resolved_workspace.lse.transpose(0, 1)
 
 
+def b12x_paged_decode(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    *,
+    workspace: PagedAttentionWorkspace | PagedAttentionWorkspacePool,
+    plan: PagedAttentionPlan | None = None,
+    softmax_scale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode-oriented paged attention surface; currently shares the main kernel."""
+    resolved_plan = plan
+    if resolved_plan is None:
+        if isinstance(workspace, PagedAttentionWorkspacePool):
+            raise TypeError("workspace pools require an explicit PagedAttentionPlan")
+        resolved_plan = _get_paged_attention_plan(
+            tuple(int(dim) for dim in q.shape),
+            workspace.k_cache_shape,
+            workspace.v_cache_shape,
+            workspace.page_table_shape,
+            tuple(int(dim) for dim in cache_seqlens.shape),
+            tuple(int(dim) for dim in cu_seqlens_q.shape),
+            _cuda_device_index(workspace.device),
+            workspace.dtype,
+            workspace.causal,
+            workspace.mode,
+            workspace.tile_m,
+            workspace.tile_n,
+            workspace.num_splits,
+        )
+    if resolved_plan.mode != "decode":
+        raise ValueError(f"expected a decode plan, got {resolved_plan.mode}")
+    return b12x_paged_attention_forward(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        workspace=workspace,
+        plan=resolved_plan,
+        softmax_scale=softmax_scale,
+    )
+
+
+def b12x_paged_extend(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    *,
+    workspace: PagedAttentionWorkspace | PagedAttentionWorkspacePool,
+    plan: PagedAttentionPlan | None = None,
+    softmax_scale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extend-oriented paged attention surface; currently shares the main kernel."""
+    resolved_plan = plan
+    if resolved_plan is None:
+        if isinstance(workspace, PagedAttentionWorkspacePool):
+            raise TypeError("workspace pools require an explicit PagedAttentionPlan")
+        resolved_plan = _get_paged_attention_plan(
+            tuple(int(dim) for dim in q.shape),
+            workspace.k_cache_shape,
+            workspace.v_cache_shape,
+            workspace.page_table_shape,
+            tuple(int(dim) for dim in cache_seqlens.shape),
+            tuple(int(dim) for dim in cu_seqlens_q.shape),
+            _cuda_device_index(workspace.device),
+            workspace.dtype,
+            workspace.causal,
+            workspace.mode,
+            workspace.tile_m,
+            workspace.tile_n,
+            workspace.num_splits,
+        )
+    if resolved_plan.mode != "extend":
+        raise ValueError(f"expected an extend plan, got {resolved_plan.mode}")
+    return b12x_paged_attention_forward(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        workspace=workspace,
+        plan=resolved_plan,
+        softmax_scale=softmax_scale,
+    )
+
+
 __all__ = [
     "AttentionPlan",
     "AttentionPlanKey",
@@ -1704,9 +1832,12 @@ __all__ = [
     "allocate_paged_attention_workspace_pool",
     "allocate_paged_attention_workspace_for_plan",
     "b12x_attention_forward",
+    "b12x_paged_decode",
     "b12x_paged_attention_forward",
+    "b12x_paged_extend",
     "choose_paged_attention_num_splits",
     "clear_attention_caches",
     "create_attention_plan",
     "create_paged_attention_plan",
+    "infer_paged_attention_mode",
 ]

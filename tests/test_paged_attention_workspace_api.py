@@ -7,10 +7,13 @@ from b12x.attention.reference import paged_attention_reference
 from b12x.integration.attention import (
     allocate_paged_attention_workspace_pool,
     allocate_paged_attention_workspace_for_plan,
+    b12x_paged_decode,
+    b12x_paged_extend,
     b12x_paged_attention_forward,
     choose_paged_attention_num_splits,
     clear_attention_caches,
     create_paged_attention_plan,
+    infer_paged_attention_mode,
 )
 
 from .helpers import require_sm120
@@ -157,6 +160,28 @@ def test_paged_plan_exposes_logical_gqa_dimensions() -> None:
     assert plan.seqlen_k_static == page_size * page_table.shape[1]
     assert plan.logical_q_rows_static == sum(q_seqlens) * 8
     assert plan.logical_total_q_rows == sum(q_seqlens) * 8
+    assert plan.mode == "extend"
+
+
+def test_paged_mode_inference_distinguishes_decode_from_extend() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    _, _, _, _, _, cu_seqlens_decode = _make_paged_inputs(
+        q_seqlens=[1, 1, 1, 1],
+        cache_seqlens=[64, 64, 64, 64],
+        page_size=64,
+        seed=33,
+    )
+    _, _, _, _, _, cu_seqlens_extend = _make_paged_inputs(
+        q_seqlens=[6, 5, 7, 4],
+        cache_seqlens=[97, 81, 113, 68],
+        page_size=64,
+        seed=35,
+    )
+
+    assert infer_paged_attention_mode(cu_seqlens_decode) == "decode"
+    assert infer_paged_attention_mode(cu_seqlens_extend) == "extend"
 
 
 def test_paged_workspace_pool_reuses_plan_exact_shape() -> None:
@@ -227,6 +252,74 @@ def test_paged_workspace_pool_requires_explicit_plan() -> None:
             cache_seqlens,
             cu_seqlens_q,
             workspace=pool,
+        )
+
+
+def test_paged_decode_and_extend_surfaces_validate_mode() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    decode_inputs = _make_paged_inputs(
+        q_seqlens=[1, 1, 1, 1],
+        cache_seqlens=[64, 96, 128, 70],
+        page_size=64,
+        seed=47,
+    )
+    extend_inputs = _make_paged_inputs(
+        q_seqlens=[6, 5, 7, 4],
+        cache_seqlens=[97, 81, 113, 68],
+        page_size=64,
+        seed=49,
+    )
+    q_d, k_d, v_d, pt_d, cs_d, cu_d = decode_inputs
+    q_e, k_e, v_e, pt_e, cs_e, cu_e = extend_inputs
+    decode_plan = create_paged_attention_plan(q_d, k_d, v_d, pt_d, cs_d, cu_d, causal=True)
+    extend_plan = create_paged_attention_plan(q_e, k_e, v_e, pt_e, cs_e, cu_e, causal=True)
+    decode_workspace = allocate_paged_attention_workspace_for_plan(decode_plan)
+    extend_workspace = allocate_paged_attention_workspace_for_plan(extend_plan)
+
+    b12x_paged_decode(
+        q_d,
+        k_d,
+        v_d,
+        pt_d,
+        cs_d,
+        cu_d,
+        workspace=decode_workspace,
+        plan=decode_plan,
+    )
+    b12x_paged_extend(
+        q_e,
+        k_e,
+        v_e,
+        pt_e,
+        cs_e,
+        cu_e,
+        workspace=extend_workspace,
+        plan=extend_plan,
+    )
+
+    with pytest.raises(ValueError, match="expected a decode plan"):
+        b12x_paged_decode(
+            q_e,
+            k_e,
+            v_e,
+            pt_e,
+            cs_e,
+            cu_e,
+            workspace=extend_workspace,
+            plan=extend_plan,
+        )
+    with pytest.raises(ValueError, match="expected an extend plan"):
+        b12x_paged_extend(
+            q_d,
+            k_d,
+            v_d,
+            pt_d,
+            cs_d,
+            cu_d,
+            workspace=decode_workspace,
+            plan=decode_plan,
         )
 
 
