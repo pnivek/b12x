@@ -52,16 +52,13 @@ def _run_parameter_launch_case(case: str) -> subprocess.CompletedProcess[str]:
 
         from benchmarks.benchmark_moe import ModelSpec, load_expert_weights, make_routed_inputs
         from b12x.integration.tp_moe import (
-            _STATIC_KERNEL_CACHE,
-            _STATE_CACHE,
-            _WEIGHT_CACHE,
+            allocate_tp_moe_workspace,
             b12x_moe_fp4,
+            clear_tp_moe_caches,
         )
 
         case = {case!r}
-        _STATE_CACHE.clear()
-        _WEIGHT_CACHE.clear()
-        _STATIC_KERNEL_CACHE.clear()
+        clear_tp_moe_caches()
 
         device = torch.device("cuda")
         spec = ModelSpec(
@@ -88,6 +85,16 @@ def _run_parameter_launch_case(case: str) -> subprocess.CompletedProcess[str]:
             w2_alphas = Parameter(w2_alphas, requires_grad=False)
 
         out = torch.empty_like(x)
+        workspace = allocate_tp_moe_workspace(
+            x,
+            a1_gscale,
+            weights.w13_weight,
+            a2_gscale,
+            weights.w2_weight,
+            topk_ids,
+            implementation="static",
+            input_scales_static=True,
+        )
         print(f"case={{case}} start", flush=True)
         b12x_moe_fp4(
             x,
@@ -102,6 +109,7 @@ def _run_parameter_launch_case(case: str) -> subprocess.CompletedProcess[str]:
             topk_weights,
             topk_ids,
             implementation="static",
+            workspace=workspace,
             output=out,
             input_scales_are_reciprocal=True,
             input_scales_static=True,

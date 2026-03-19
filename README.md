@@ -49,6 +49,13 @@ python -m pip install -e '.[dev]'
 - `b12x.sglang`
   - Thin `sglang` integration shims
 
+## MoE runtime contract
+
+- `b12x.integration.tp_moe.b12x_moe_fp4` requires a caller-owned workspace.
+- Use `allocate_tp_moe_workspace(...)` for one exact unchunked launch shape.
+- Use `allocate_tp_moe_workspace_pool()` for variable-size or chunked workloads, and keep one pool per active stream or captured CUDA graph.
+- During CUDA graph capture, `output=` must also be caller-owned and stable across replays.
+
 ## Benchmarks and tests
 
 ### Benchmarks
@@ -57,6 +64,7 @@ python -m pip install -e '.[dev]'
   - End-to-end Qwen3.5-397B TP=4 MoE benchmark
   - `micro` batch profile: `[1, 2, 4, 8]`
   - `sglang-single-request` batch profile: `[1, 23, 80]`
+  - `chunked-prefill` batch profile: `[8192, 16384, 24576, 32768]`
 - `benchmarks/benchmark_dense_gemm.py`
   - Dense FP4 GEMM vs FlashInfer/cuDNN/CUTLASS
 
@@ -86,6 +94,9 @@ B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe
 
 # Use the recorded single-request sglang profile
 B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --backend static --batch-size-profile sglang-single-request
+
+# Graph-first prefill-scale sweep aligned with chunked-prefill serving
+B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --backend static --batch-size-profile chunked-prefill
 
 # Multi-layer CUDA-graph replay validation with real consecutive MoE layers
 B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --backend static --graph-mode multi-layer --reference none --validate none

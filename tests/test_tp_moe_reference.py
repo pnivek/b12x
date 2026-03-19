@@ -28,7 +28,11 @@ from benchmarks.benchmark_moe import (
     get_scale_contract_params,
     load_expert_weights,
 )
-from b12x.integration.tp_moe import _STATIC_KERNEL_CACHE, _STATE_CACHE, _WEIGHT_CACHE, b12x_moe_fp4
+from b12x.integration.tp_moe import (
+    allocate_tp_moe_workspace_pool,
+    b12x_moe_fp4,
+    clear_tp_moe_caches,
+)
 
 
 def _clear_codegen_artifacts() -> None:
@@ -267,9 +271,10 @@ def _run_impl(
         return output.detach().clone()
 
     scale_params = get_scale_contract_params(weights, scale_contract)
+    workspace = allocate_tp_moe_workspace_pool()
 
     if clear_state:
-        _STATE_CACHE.clear()
+        clear_tp_moe_caches()
     out = b12x_moe_fp4(
         x,
         scale_params.a1_gscale,
@@ -283,6 +288,8 @@ def _run_impl(
         topk_weights,
         topk_ids,
         implementation=impl,
+        workspace=workspace,
+        input_scales_static=True,
     )
     torch.cuda.synchronize()
     return out.detach().clone()
@@ -299,21 +306,51 @@ def _run_impl_sequence(
     clear_state_between_calls: bool,
 ) -> list[torch.Tensor]:
     if impl != "flashinfer" and not clear_state_between_calls:
-        _STATE_CACHE.clear()
+        clear_tp_moe_caches()
+    shared_workspace = None
+    if impl != "flashinfer" and weights_sequence:
+        shared_workspace = allocate_tp_moe_workspace_pool()
 
     outputs = []
     for weights in weights_sequence:
-        outputs.append(
-            _run_impl(
-                impl,
-                x,
-                weights,
-                topk_weights,
-                topk_ids,
-                scale_contract,
-                clear_state=(impl != "flashinfer" and clear_state_between_calls),
+        if impl == "flashinfer":
+            outputs.append(
+                _run_impl(
+                    impl,
+                    x,
+                    weights,
+                    topk_weights,
+                    topk_ids,
+                    scale_contract,
+                    clear_state=False,
+                )
             )
+            continue
+
+        scale_params = get_scale_contract_params(weights, scale_contract)
+        workspace = shared_workspace
+        if workspace is None:
+            workspace = allocate_tp_moe_workspace_pool()
+        if clear_state_between_calls:
+            clear_tp_moe_caches()
+        out = b12x_moe_fp4(
+            x,
+            scale_params.a1_gscale,
+            weights.w13_weight,
+            weights.w13_blockscale_swizzled,
+            scale_params.g1_alphas,
+            scale_params.a2_gscale,
+            weights.w2_weight,
+            weights.w2_blockscale_swizzled,
+            scale_params.g2_alphas,
+            topk_weights,
+            topk_ids,
+            implementation=impl,
+            workspace=workspace,
+            input_scales_static=True,
         )
+        torch.cuda.synchronize()
+        outputs.append(out.detach().clone())
     return outputs
 
 
@@ -350,9 +387,7 @@ def main() -> None:
         for layer_idx in args.layer_indices
     ]
     _clear_codegen_artifacts()
-    _STATE_CACHE.clear()
-    _WEIGHT_CACHE.clear()
-    _STATIC_KERNEL_CACHE.clear()
+    clear_tp_moe_caches()
     torch.cuda.empty_cache()
 
     print("Independent TP MoE verification")

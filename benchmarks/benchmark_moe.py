@@ -42,9 +42,14 @@ LEGACY_BATCH_SIZES = [1, 2, 4, 8]
 # - larger prefill chunk m=80 during the same request path
 # - decode remains effectively m=1 for a single running request
 RECORDED_SGLANG_SINGLE_REQUEST_BATCH_SIZES = [1, 23, 80]
+# Representative total-token sizes for packed chunked-prefill forwards.
+# The first point is one full server-side prefill chunk, then we scale to
+# larger packed forwards up to four chunks' worth of tokens.
+CHUNKED_PREFILL_BATCH_SIZES = [8192, 16384, 24576, 32768]
 BATCH_SIZE_PROFILES = {
     "micro": LEGACY_BATCH_SIZES,
     "sglang-single-request": RECORDED_SGLANG_SINGLE_REQUEST_BATCH_SIZES,
+    "chunked-prefill": CHUNKED_PREFILL_BATCH_SIZES,
 }
 TP_SIZE = 4
 TP_RANK = 0
@@ -536,17 +541,9 @@ def check_oracle_metrics(
 
 
 def _clear_b12x_caches() -> None:
-    from b12x.integration.tp_moe import (
-        _DYNAMIC_KERNEL_CACHE,
-        _STATIC_KERNEL_CACHE,
-        _STATE_CACHE,
-        _WEIGHT_CACHE,
-    )
+    from b12x.integration.tp_moe import clear_tp_moe_caches
 
-    _STATE_CACHE.clear()
-    _WEIGHT_CACHE.clear()
-    _STATIC_KERNEL_CACHE.clear()
-    _DYNAMIC_KERNEL_CACHE.clear()
+    clear_tp_moe_caches()
 
 
 GRAPH_REPLAY_TOLERANCES = {
@@ -586,6 +583,30 @@ def compare_graph_replay_outputs(
     return metrics
 
 
+def allocate_layer_chain_workspace(
+    weights_stack: Sequence[ExpertWeights],
+    params_stack: Sequence[ScaleContractParams],
+    x: torch.Tensor,
+    topk_ids_per_layer: Sequence[torch.Tensor],
+    *,
+    backend: str,
+):
+    from b12x.integration.tp_moe import allocate_tp_moe_workspace
+
+    if not weights_stack:
+        raise ValueError("weights_stack must not be empty")
+    return allocate_tp_moe_workspace(
+        x,
+        params_stack[0].a1_gscale,
+        weights_stack[0].w13_weight,
+        params_stack[0].a2_gscale,
+        weights_stack[0].w2_weight,
+        topk_ids_per_layer[0],
+        implementation=backend,
+        input_scales_static=True,
+    )
+
+
 def run_moe_layer_chain(
     weights_stack: Sequence[ExpertWeights],
     params_stack: Sequence[ScaleContractParams],
@@ -596,6 +617,7 @@ def run_moe_layer_chain(
     backend: str,
     fast_math: bool,
     output_buffers: Sequence[torch.Tensor] | None = None,
+    workspace,
 ) -> list[torch.Tensor]:
     from b12x.integration.tp_moe import b12x_moe_fp4
 
@@ -630,6 +652,8 @@ def run_moe_layer_chain(
             implementation=backend,
             fast_math=fast_math,
             output=output,
+            workspace=workspace,
+            input_scales_static=True,
         )
         layer_outputs.append(current)
     return layer_outputs
@@ -645,6 +669,7 @@ def capture_moe_layer_chain(
     backend: str,
     fast_math: bool,
     output_buffers: Sequence[torch.Tensor],
+    workspace,
 ) -> torch.cuda.CUDAGraph:
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -657,6 +682,7 @@ def capture_moe_layer_chain(
             backend=backend,
             fast_math=fast_math,
             output_buffers=output_buffers,
+            workspace=workspace,
         )
     return graph
 
@@ -742,6 +768,13 @@ def bench_multilayer_graph_mode(
         topk_weights_bufs = [topk_weights.clone() for _, topk_weights in initial_case]
         graph_output_bufs = [torch.empty_like(x_buf) for _ in range(graph_num_layers)]
         eager_output_bufs = [torch.empty_like(x_buf) for _ in range(graph_num_layers)]
+        shared_workspace = allocate_layer_chain_workspace(
+            weights_stack,
+            params_stack,
+            x_buf,
+            topk_ids_bufs,
+            backend=args.backend,
+        )
 
         run_moe_layer_chain(
             weights_stack,
@@ -752,6 +785,7 @@ def bench_multilayer_graph_mode(
             backend=args.backend,
             fast_math=args.fast_math,
             output_buffers=graph_output_bufs,
+            workspace=shared_workspace,
         )
         torch.cuda.synchronize()
         graph = capture_moe_layer_chain(
@@ -763,6 +797,7 @@ def bench_multilayer_graph_mode(
             backend=args.backend,
             fast_math=args.fast_math,
             output_buffers=graph_output_bufs,
+            workspace=shared_workspace,
         )
 
         def eager_chain() -> None:
@@ -775,6 +810,7 @@ def bench_multilayer_graph_mode(
                 backend=args.backend,
                 fast_math=args.fast_math,
                 output_buffers=eager_output_bufs,
+                workspace=shared_workspace,
             )
 
         for scenario_name, pattern, seed in scenario_specs:
@@ -958,7 +994,11 @@ def bench_e2e() -> None:
     weights = load_expert_weights(MODEL_PATH, spec)
     params = get_scale_contract_params(weights, args.scale_contract)
 
-    from b12x.integration.tp_moe import b12x_moe_fp4
+    from b12x.integration.tp_moe import (
+        allocate_tp_moe_workspace,
+        allocate_tp_moe_workspace_pool,
+        b12x_moe_fp4,
+    )
 
     _clear_b12x_caches()
 
@@ -968,6 +1008,16 @@ def bench_e2e() -> None:
     routing_warm = torch.randn(1, spec.num_experts, dtype=torch.float32, device=device)
     topk_logits_w, topk_ids_w = torch.topk(routing_warm, spec.top_k, dim=-1)
     topk_weights_w = torch.softmax(topk_logits_w, dim=-1)
+    warmup_workspace = allocate_tp_moe_workspace(
+        x_warm,
+        params.a1_gscale,
+        weights.w13_weight,
+        params.a2_gscale,
+        weights.w2_weight,
+        topk_ids_w,
+        implementation=args.backend,
+        input_scales_static=True,
+    )
     b12x_moe_fp4(
         x_warm,
         params.a1_gscale,
@@ -981,6 +1031,7 @@ def bench_e2e() -> None:
         topk_weights_w,
         topk_ids_w,
         implementation=args.backend,
+        workspace=warmup_workspace,
         fast_math=args.fast_math,
     )
     torch.cuda.synchronize()
@@ -1001,8 +1052,15 @@ def bench_e2e() -> None:
         routing_logits = torch.randn(batch_size, spec.num_experts, dtype=torch.float32, device=device)
         topk_logits, topk_ids = torch.topk(routing_logits, spec.top_k, dim=-1)
         topk_weights = torch.softmax(topk_logits, dim=-1)
+        backend_output = torch.empty_like(x)
+        backend_workspaces: dict[str, object] = {}
 
         def make_backend_e2e(backend: str) -> Callable[[], torch.Tensor]:
+            backend_workspace = backend_workspaces.get(backend)
+            if backend_workspace is None:
+                backend_workspace = allocate_tp_moe_workspace_pool()
+                backend_workspaces[backend] = backend_workspace
+
             def impl_launch(topk_ids_local: torch.Tensor, topk_weights_local: torch.Tensor) -> torch.Tensor:
                 return b12x_moe_fp4(
                     x,
@@ -1017,7 +1075,9 @@ def bench_e2e() -> None:
                     topk_weights_local,
                     topk_ids_local,
                     implementation=backend,
+                    workspace=backend_workspace,
                     fast_math=args.fast_math,
+                    output=backend_output,
                 )
 
             def impl_e2e() -> torch.Tensor:

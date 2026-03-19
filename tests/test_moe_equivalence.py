@@ -16,6 +16,7 @@ from benchmarks.benchmark_moe import (
     MODEL_PATH,
     TP_RANK,
     TP_SIZE,
+    allocate_layer_chain_workspace,
     ModelSpec,
     compare_graph_replay_outputs,
     capture_moe_layer_chain,
@@ -67,17 +68,29 @@ def test_moe_nonzero(m):
     """Validate `b12x_moe_fp4` produces non-zero output with real weights."""
     _skip_if_unavailable()
 
-    from b12x.integration.tp_moe import _STATIC_KERNEL_CACHE, _STATE_CACHE, _WEIGHT_CACHE, b12x_moe_fp4
+    from b12x.integration.tp_moe import (
+        allocate_tp_moe_workspace,
+        b12x_moe_fp4,
+        clear_tp_moe_caches,
+    )
 
-    _STATE_CACHE.clear()
-    _WEIGHT_CACHE.clear()
-    _STATIC_KERNEL_CACHE.clear()
+    clear_tp_moe_caches()
 
     device = torch.device("cuda")
     spec = _make_spec()
     weights = load_expert_weights(MODEL_PATH, spec)
 
     x, topk_ids, topk_weights = make_routed_inputs(spec, m, seed=99, device=device)
+    workspace = allocate_tp_moe_workspace(
+        x,
+        weights.w13_input_scale_per_expert,
+        weights.w13_weight,
+        weights.w2_input_scale_per_expert,
+        weights.w2_weight,
+        topk_ids,
+        implementation="static",
+        input_scales_static=True,
+    )
 
     out = b12x_moe_fp4(
         x,
@@ -91,6 +104,8 @@ def test_moe_nonzero(m):
         weights.g2_alphas_per_expert,
         topk_weights, topk_ids,
         implementation="static",
+        workspace=workspace,
+        input_scales_static=True,
     )
     torch.cuda.synchronize()
 
@@ -105,11 +120,13 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
     """Validate graph replay stays correct when routing contents change."""
     _skip_if_unavailable()
 
-    from b12x.integration.tp_moe import _STATIC_KERNEL_CACHE, _STATE_CACHE, _WEIGHT_CACHE, b12x_moe_fp4
+    from b12x.integration.tp_moe import (
+        allocate_tp_moe_workspace,
+        b12x_moe_fp4,
+        clear_tp_moe_caches,
+    )
 
-    _STATE_CACHE.clear()
-    _WEIGHT_CACHE.clear()
-    _STATIC_KERNEL_CACHE.clear()
+    clear_tp_moe_caches()
 
     device = torch.device("cuda")
     spec = _make_spec()
@@ -120,6 +137,16 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
     topk_ids_buf = topk_ids0.clone()
     topk_weights_buf = topk_weights0.clone()
     graph_output = torch.empty_like(x_buf)
+    workspace = allocate_tp_moe_workspace(
+        x_buf,
+        weights.w13_input_scale_per_expert,
+        weights.w13_weight,
+        weights.w2_input_scale_per_expert,
+        weights.w2_weight,
+        topk_ids_buf,
+        implementation="static",
+        input_scales_static=True,
+    )
 
     # Compile once before capture; the replay check below is about routing safety.
     b12x_moe_fp4(
@@ -136,6 +163,8 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
         topk_ids_buf,
         implementation="static",
         output=graph_output,
+        workspace=workspace,
+        input_scales_static=True,
     )
     torch.cuda.synchronize()
 
@@ -155,6 +184,8 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
             topk_ids_buf,
             implementation="static",
             output=graph_output,
+            workspace=workspace,
+            input_scales_static=True,
         )
 
     for seed in (123, 456):
@@ -180,6 +211,8 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
             topk_weights,
             topk_ids,
             implementation="static",
+            workspace=workspace,
+            input_scales_static=True,
         )
         torch.cuda.synchronize()
 
@@ -196,11 +229,9 @@ def test_moe_cuda_graph_replay_multilayer_tracks_routing_updates(m):
     """Validate a captured multi-layer graph stays correct under routing churn."""
     _skip_if_unavailable()
 
-    from b12x.integration.tp_moe import _STATIC_KERNEL_CACHE, _STATE_CACHE, _WEIGHT_CACHE
+    from b12x.integration.tp_moe import clear_tp_moe_caches
 
-    _STATE_CACHE.clear()
-    _WEIGHT_CACHE.clear()
-    _STATIC_KERNEL_CACHE.clear()
+    clear_tp_moe_caches()
 
     device = torch.device("cuda")
     spec = _make_spec()
@@ -221,6 +252,13 @@ def test_moe_cuda_graph_replay_multilayer_tracks_routing_updates(m):
     topk_weights_bufs = [topk_weights.clone() for _, topk_weights in initial_case]
     graph_output_bufs = [torch.empty_like(x_buf) for _ in range(num_layers)]
     eager_output_bufs = [torch.empty_like(x_buf) for _ in range(num_layers)]
+    shared_workspace = allocate_layer_chain_workspace(
+        weights_stack,
+        params_stack,
+        x_buf,
+        topk_ids_bufs,
+        backend="static",
+    )
 
     run_moe_layer_chain(
         weights_stack,
@@ -231,6 +269,7 @@ def test_moe_cuda_graph_replay_multilayer_tracks_routing_updates(m):
         backend="static",
         fast_math=True,
         output_buffers=graph_output_bufs,
+        workspace=shared_workspace,
     )
     torch.cuda.synchronize()
     graph = capture_moe_layer_chain(
@@ -242,6 +281,7 @@ def test_moe_cuda_graph_replay_multilayer_tracks_routing_updates(m):
         backend="static",
         fast_math=True,
         output_buffers=graph_output_bufs,
+        workspace=shared_workspace,
     )
 
     scenario_specs = [
@@ -286,6 +326,7 @@ def test_moe_cuda_graph_replay_multilayer_tracks_routing_updates(m):
             backend="static",
             fast_math=True,
             output_buffers=eager_output_bufs,
+            workspace=shared_workspace,
         )
         torch.cuda.synchronize()
 

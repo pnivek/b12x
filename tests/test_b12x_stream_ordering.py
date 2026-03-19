@@ -9,7 +9,7 @@ import torch
 
 import b12x.integration.tp_moe as tp_moe
 from benchmarks.benchmark_moe import MODEL_PATH, TP_RANK, TP_SIZE, ModelSpec, bench_flashinfer, load_expert_weights
-from b12x.integration.tp_moe import _STATIC_KERNEL_CACHE, _STATE_CACHE, _WEIGHT_CACHE, b12x_moe_fp4
+from b12x.integration.tp_moe import allocate_tp_moe_workspace, b12x_moe_fp4, clear_tp_moe_caches
 from b12x.moe.fused.reference import compare_to_reference
 
 from .helpers import require_sm120
@@ -56,6 +56,7 @@ def _run_b12x(
     weights,
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
+    workspace,
 ) -> torch.Tensor:
     return b12x_moe_fp4(
         a=x,
@@ -70,6 +71,7 @@ def _run_b12x(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         implementation="static",
+        workspace=workspace,
         input_scales_are_reciprocal=True,
     )
 
@@ -81,6 +83,7 @@ def _launch_on_stream(
     topk_ids_src: torch.Tensor,
     topk_weights_src: torch.Tensor,
     weights,
+    workspace,
     force_stream: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     x_stage = torch.zeros_like(x_src)
@@ -106,6 +109,7 @@ def _launch_on_stream(
                 weights=weights,
                 topk_ids=topk_ids_stage,
                 topk_weights=topk_weights_stage,
+                workspace=workspace,
             )
             eager_clone = out_alias.clone()
     launch_stream.synchronize()
@@ -117,9 +121,7 @@ def test_b12x_uses_current_cuda_stream() -> None:
     require_sm120()
     _require_model_weights()
 
-    _STATE_CACHE.clear()
-    _WEIGHT_CACHE.clear()
-    _STATIC_KERNEL_CACHE.clear()
+    clear_tp_moe_caches()
 
     device = torch.device("cuda")
     spec = _make_spec()
@@ -130,6 +132,16 @@ def test_b12x_uses_current_cuda_stream() -> None:
     routing = torch.randn(8, spec.num_experts, dtype=torch.float32, device=device)
     topk_logits, topk_ids = torch.topk(routing, spec.top_k, dim=-1)
     topk_weights = torch.softmax(topk_logits, dim=-1)
+    workspace = allocate_tp_moe_workspace(
+        x,
+        weights.w13_input_scale_quant,
+        weights.w13_weight,
+        weights.w2_input_scale_quant,
+        weights.w2_weight,
+        topk_ids,
+        implementation="static",
+        input_scales_static=True,
+    )
 
     fi_launch, fi_output = bench_flashinfer(weights, x, topk_ids, topk_weights)
     fi_launch()
@@ -141,6 +153,7 @@ def test_b12x_uses_current_cuda_stream() -> None:
         weights=weights,
         topk_ids=topk_ids,
         topk_weights=topk_weights,
+        workspace=workspace,
     )
     baseline = baseline_alias.clone()
     torch.cuda.synchronize(device)
@@ -152,6 +165,7 @@ def test_b12x_uses_current_cuda_stream() -> None:
         topk_ids_src=topk_ids,
         topk_weights_src=topk_weights,
         weights=weights,
+        workspace=workspace,
         force_stream="current",
     )
     forced_default_eager, forced_default_settled = _launch_on_stream(
@@ -160,6 +174,7 @@ def test_b12x_uses_current_cuda_stream() -> None:
         topk_ids_src=topk_ids,
         topk_weights_src=topk_weights,
         weights=weights,
+        workspace=workspace,
         force_stream="default",
     )
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Tuple
 
 import cutlass
@@ -22,8 +22,16 @@ _DYNAMIC_SLICE_CHUNK = 2
 
 
 @dataclass
-class _TPMoEState:
-    """Pre-allocated work buffers for `b12x_moe_fp4`."""
+class TPMoEWorkspace:
+    """Reusable scratch buffers for one exact `b12x_moe_fp4` launch shape."""
+    state_E: int
+    weight_E: int
+    max_rows: int
+    k: int
+    n: int
+    num_topk: int
+    device: torch.device
+    dtype: torch.dtype
     # Expert maps
     expert_counts: torch.Tensor       # [E] int32
     active_experts: torch.Tensor      # [E] int32 active local expert ids in scheduler order
@@ -38,10 +46,9 @@ class _TPMoEState:
     packed_input_scale: torch.Tensor  # [E, rows_pad, cols_pad] uint8
     # Dummy output tensor used only to define the grouped scheduler shape.
     scheduler_out: torch.Tensor       # [max_rows, n, E] bf16
-    scatter_output: torch.Tensor      # [m, k] bf16
     # Pre-expanded scale tensors (filled at allocation time)
-    input_gs: torch.Tensor            # [E] float32
-    down_input_scale: torch.Tensor    # [E] float32
+    input_gs: torch.Tensor            # [weight_E] float32
+    down_input_scale: torch.Tensor    # [weight_E] float32
     barrier_count: torch.Tensor       # [1] int32 — static resident-grid barrier
     barrier_epoch: torch.Tensor       # [1] int32 — static resident-grid barrier
     pair_head: torch.Tensor           # [1] int32 — dynamic routed-pair allocator
@@ -58,11 +65,27 @@ class _TPMoEState:
     tile_write_count: torch.Tensor    # [E * max_m_tiles] int32
     # Pre-computed views (cached to avoid per-call Python overhead)
     packed_a_view: object = None      # packed_input permuted + fp4 view
-    packed_a_flat: object = None      # packed_input.view(-1)
-    scale_flat: object = None         # packed_input_scale.view(-1)
     sfa_ptr: object = None            # CuTe pointer for scale factors
+    packed_a_flat: torch.Tensor | None = None  # flat uint8 backing packed_input
+    scale_flat: torch.Tensor | None = None     # flat uint8 backing packed_input_scale
+    packed_a_storage_ptr: object = None  # legacy CuTe pointer for packed_input backing storage
     input_gs_src_ptr: int = 0
     down_input_scale_src_ptr: int = 0
+
+
+@dataclass
+class TPMoEWorkspacePool:
+    """Caller-owned exact-shape workspace cache for one execution context.
+
+    Pools are explicit and not concurrency-safe. Use one pool per active stream
+    or captured CUDA graph so scratch buffers remain stable without being shared
+    across overlapping launches.
+    """
+
+    workspaces: Dict[Tuple, TPMoEWorkspace] = field(default_factory=dict)
+
+    def clear(self) -> None:
+        self.workspaces.clear()
 
 
 @dataclass
@@ -80,7 +103,6 @@ class _WeightViews:
     sfb_w13_ptr: object = None
     sfb_down_ptr: object = None
 
-_STATE_CACHE: Dict[Tuple, _TPMoEState] = {}
 _WEIGHT_CACHE: Dict[Tuple[int, int, int], _WeightViews] = {}
 _STATIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _DYNAMIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
@@ -89,11 +111,27 @@ _PLAIN_PARAM_CACHE: Dict[Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtyp
 _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = _LEVEL_TILE_M
 _STATIC_COMPACT_CUTOVER_PAIRS_CACHE: int | None = None
 _DYNAMIC_MULTICTA_CACHE: bool | None = None
-# Fast path: cache last-used state/weights/kernel to avoid dict lookup
-_LAST_STATE: Tuple = (None, None)  # (cache_key, state)
+_STATIC_CHUNK_MULTIPLIER_CACHE: int | None = None
+_DYNAMIC_CHUNK_MULTIPLIER_CACHE: int | None = None
 _LAST_WEIGHTS: Tuple = (None, None)  # (cache_key, views)
 _LAST_KERNEL: Tuple = (None, None)  # (cache_key, (compiled, mac))
 _LAST_STATIC_EXECUTION_ARGS: Tuple = (None, None, None)  # (cache_key, exe_args, adapted_args)
+
+
+def clear_tp_moe_caches() -> None:
+    """Clear runtime caches owned by `tp_moe`.
+
+    Explicit workspaces and workspace pools are caller-owned and intentionally
+    unaffected by this helper.
+    """
+    global _LAST_WEIGHTS, _LAST_KERNEL, _LAST_STATIC_EXECUTION_ARGS
+    _WEIGHT_CACHE.clear()
+    _STATIC_KERNEL_CACHE.clear()
+    _DYNAMIC_KERNEL_CACHE.clear()
+    _PLAIN_PARAM_CACHE.clear()
+    _LAST_WEIGHTS = (None, None)
+    _LAST_KERNEL = (None, None)
+    _LAST_STATIC_EXECUTION_ARGS = (None, None, None)
 
 
 def _env_flag(name: str, *, default: bool) -> bool:
@@ -129,6 +167,22 @@ def _dynamic_multicta_enabled() -> bool:
             multicta_env = os.environ.get("B12X_LEVEL10_ENABLE_MULTICTA", "1")
         _DYNAMIC_MULTICTA_CACHE = multicta_env == "1"
     return _DYNAMIC_MULTICTA_CACHE
+
+
+def _get_static_chunk_multiplier() -> int:
+    global _STATIC_CHUNK_MULTIPLIER_CACHE
+    if _STATIC_CHUNK_MULTIPLIER_CACHE is None:
+        mult_env = os.environ.get("B12X_STATIC_CHUNK_MULTIPLIER", "1")
+        _STATIC_CHUNK_MULTIPLIER_CACHE = max(1, int(mult_env))
+    return _STATIC_CHUNK_MULTIPLIER_CACHE
+
+
+def _get_dynamic_chunk_multiplier() -> int:
+    global _DYNAMIC_CHUNK_MULTIPLIER_CACHE
+    if _DYNAMIC_CHUNK_MULTIPLIER_CACHE is None:
+        mult_env = os.environ.get("B12X_DYNAMIC_CHUNK_MULTIPLIER", "2")
+        _DYNAMIC_CHUNK_MULTIPLIER_CACHE = max(1, int(mult_env))
+    return _DYNAMIC_CHUNK_MULTIPLIER_CACHE
 
 
 def _tensor_arg_key(t: torch.Tensor) -> tuple:
@@ -185,7 +239,7 @@ def _get_cached_static_execution_args(
     a: torch.Tensor,
     flat_ids: torch.Tensor,
     flat_weights: torch.Tensor,
-    s: _TPMoEState,
+    s: TPMoEWorkspace,
     wv: _WeightViews,
     input_gs: torch.Tensor,
     w1_alpha: torch.Tensor,
@@ -295,59 +349,66 @@ def _dynamic_task_geometry(E: int, n: int, max_rows: int) -> tuple[int, int, int
     return max_m_tiles, gate_tile_cnt, max_tasks
 
 
-def _get_state(
-    E: int, m: int, k: int, n: int, num_topk: int,
-    device: torch.device, dtype: torch.dtype,
-    a1_gscale: torch.Tensor, a2_gscale: torch.Tensor,
+def _refresh_workspace_scales(
+    workspace: TPMoEWorkspace,
+    a1_gscale: torch.Tensor,
+    a2_gscale: torch.Tensor,
     *,
-    max_rows: int | None = None,
     input_scales_static: bool,
-) -> _TPMoEState:
-    global _LAST_STATE
-    if max_rows is None:
-        max_rows = ((m * num_topk + 127) // 128) * 128
-    stream_key = int(torch.cuda.current_stream(device).cuda_stream)
-    cache_key = (E, m, k, n, num_topk, max_rows, device.index or 0, dtype, stream_key)
+) -> None:
+    a1_src_ptr = a1_gscale.data_ptr()
+    a2_src_ptr = a2_gscale.data_ptr()
+    if (
+        not input_scales_static
+        or workspace.input_gs_src_ptr != a1_src_ptr
+        or workspace.down_input_scale_src_ptr != a2_src_ptr
+    ):
+        workspace.input_gs.copy_(a1_gscale.expand(workspace.weight_E))
+        workspace.down_input_scale.copy_(a2_gscale.expand(workspace.weight_E))
+        workspace.input_gs_src_ptr = a1_src_ptr if input_scales_static else 0
+        workspace.down_input_scale_src_ptr = a2_src_ptr if input_scales_static else 0
 
-    # Fast path: check last-used state first
-    last_key, last_state = _LAST_STATE
-    if last_key == cache_key:
-        state = last_state
-    else:
-        state = _STATE_CACHE.get(cache_key)
-    if state is not None:
-        a1_src_ptr = a1_gscale.data_ptr()
-        a2_src_ptr = a2_gscale.data_ptr()
-        if (
-            not input_scales_static
-            or state.input_gs_src_ptr != a1_src_ptr
-            or state.down_input_scale_src_ptr != a2_src_ptr
-        ):
-            state.input_gs.copy_(a1_gscale.expand(E))
-            state.down_input_scale.copy_(a2_gscale.expand(E))
-            state.input_gs_src_ptr = a1_src_ptr if input_scales_static else 0
-            state.down_input_scale_src_ptr = a2_src_ptr if input_scales_static else 0
-        return state
 
+def _alloc_workspace(
+    state_E: int,
+    weight_E: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    a1_gscale: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    *,
+    max_rows: int,
+    input_scales_static: bool,
+) -> TPMoEWorkspace:
     rows_pad_k = align_up(max_rows, 128)
     cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
-    max_m_tiles, _, max_tasks = _dynamic_task_geometry(E, n, max_rows)
+    max_m_tiles, _, max_tasks = _dynamic_task_geometry(state_E, n, max_rows)
 
-    state = _TPMoEState(
-        expert_counts=torch.zeros(E, dtype=torch.int32, device=device),
-        active_experts=torch.empty(E, dtype=torch.int32, device=device),
+    workspace = TPMoEWorkspace(
+        state_E=state_E,
+        weight_E=weight_E,
+        max_rows=max_rows,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        device=device,
+        dtype=dtype,
+        expert_counts=torch.zeros(state_E, dtype=torch.int32, device=device),
+        active_experts=torch.empty(state_E, dtype=torch.int32, device=device),
         active_expert_count=torch.zeros(1, dtype=torch.int32, device=device),
-        active_row_counts=torch.zeros(E, dtype=torch.int32, device=device),
-        weight_expert_ids=torch.arange(E, dtype=torch.int32, device=device),
-        global_to_local_expert=torch.empty(E, dtype=torch.int32, device=device),
-        token_map=torch.zeros(E, max_rows, dtype=torch.int32, device=device),
-        token_weights_map=torch.zeros(E, max_rows, dtype=torch.float32, device=device),
-        packed_input=torch.empty(E, max_rows, k // 2, dtype=torch.uint8, device=device),
-        packed_input_scale=torch.empty(E, rows_pad_k, cols_pad_k, dtype=torch.uint8, device=device),
-        scheduler_out=_alloc_unique_ld_tensor((max_rows, n, E), dtype=dtype, device=device),
-        scatter_output=torch.zeros(m, k, dtype=dtype, device=device),
-        input_gs=torch.empty(E, dtype=torch.float32, device=device),
-        down_input_scale=torch.empty(E, dtype=torch.float32, device=device),
+        active_row_counts=torch.zeros(state_E, dtype=torch.int32, device=device),
+        weight_expert_ids=torch.arange(state_E, dtype=torch.int32, device=device),
+        global_to_local_expert=torch.empty(weight_E, dtype=torch.int32, device=device),
+        token_map=torch.zeros(state_E, max_rows, dtype=torch.int32, device=device),
+        token_weights_map=torch.zeros(state_E, max_rows, dtype=torch.float32, device=device),
+        packed_input=torch.empty(state_E, max_rows, k // 2, dtype=torch.uint8, device=device),
+        packed_input_scale=torch.empty(state_E, rows_pad_k, cols_pad_k, dtype=torch.uint8, device=device),
+        scheduler_out=_alloc_unique_ld_tensor((max_rows, n, state_E), dtype=dtype, device=device),
+        input_gs=torch.empty(weight_E, dtype=torch.float32, device=device),
+        down_input_scale=torch.empty(weight_E, dtype=torch.float32, device=device),
         barrier_count=torch.zeros(1, dtype=torch.int32, device=device),
         barrier_epoch=torch.zeros(1, dtype=torch.int32, device=device),
         pair_head=torch.zeros(1, dtype=torch.int32, device=device),
@@ -361,21 +422,31 @@ def _get_state(
         task_slice_begin=torch.zeros(max_tasks, dtype=torch.int32, device=device),
         task_slice_count=torch.zeros(max_tasks, dtype=torch.int32, device=device),
         task_valid_rows=torch.zeros(max_tasks, dtype=torch.int32, device=device),
-        tile_write_count=torch.zeros(E * max_m_tiles, dtype=torch.int32, device=device),
-        input_gs_src_ptr=a1_gscale.data_ptr() if input_scales_static else 0,
-        down_input_scale_src_ptr=a2_gscale.data_ptr() if input_scales_static else 0,
+        tile_write_count=torch.zeros(state_E * max_m_tiles, dtype=torch.int32, device=device),
     )
-    state.input_gs.copy_(a1_gscale.expand(E))
-    state.down_input_scale.copy_(a2_gscale.expand(E))
-    # Pre-compute constant views
+    _refresh_workspace_scales(
+        workspace,
+        a1_gscale,
+        a2_gscale,
+        input_scales_static=input_scales_static,
+    )
     sf_dtype = cutlass.Float8E4M3FN
-    state.packed_a_view = state.packed_input.permute(1, 2, 0).view(torch.float4_e2m1fn_x2)
-    state.packed_a_flat = state.packed_input.view(-1)
-    state.scale_flat = state.packed_input_scale.view(-1)
-    state.sfa_ptr = make_ptr(sf_dtype, state.packed_input_scale.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-    _STATE_CACHE[cache_key] = state
-    _LAST_STATE = (cache_key, state)
-    return state
+    workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0).view(torch.float4_e2m1fn_x2)
+    workspace.packed_a_flat = workspace.packed_input.view(-1)
+    workspace.scale_flat = workspace.packed_input_scale.view(-1)
+    workspace.sfa_ptr = make_ptr(
+        sf_dtype,
+        workspace.packed_input_scale.data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    workspace.packed_a_storage_ptr = make_ptr(
+        cutlass.Uint8,
+        workspace.packed_input.data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    return workspace
 
 
 def _get_weight_views(
@@ -437,17 +508,221 @@ def _get_weight_views(
     return views
 
 
-def _ensure_compact_static_scratch(
-    state: _TPMoEState,
+def _resolve_workspace_layout(
+    implementation: str,
     *,
+    num_tokens: int,
     weight_E: int,
+    num_topk: int,
+) -> tuple[bool, int, int]:
+    routed_rows = num_tokens * num_topk
+    use_compact_static = (
+        implementation == "static"
+        and routed_rows < _get_static_compact_cutover_pairs()
+    )
+    state_E = weight_E
+    state_max_rows = ((routed_rows + 127) // 128) * 128
+    if use_compact_static:
+        state_E = max(1, routed_rows)
+        state_max_rows = max(1, routed_rows)
+    return use_compact_static, state_E, state_max_rows
+
+
+def _validate_workspace(
+    workspace: TPMoEWorkspace,
+    *,
+    state_E: int,
+    weight_E: int,
+    max_rows: int,
+    k: int,
+    n: int,
+    num_topk: int,
     device: torch.device,
+    dtype: torch.dtype,
 ) -> None:
-    if (
-        state.global_to_local_expert is None
-        or tuple(state.global_to_local_expert.shape) != (weight_E,)
-    ):
-        state.global_to_local_expert = torch.empty(weight_E, dtype=torch.int32, device=device)
+    expected = (
+        state_E,
+        weight_E,
+        max_rows,
+        k,
+        n,
+        num_topk,
+        device,
+        dtype,
+    )
+    actual = (
+        workspace.state_E,
+        workspace.weight_E,
+        workspace.max_rows,
+        workspace.k,
+        workspace.n,
+        workspace.num_topk,
+        workspace.device,
+        workspace.dtype,
+    )
+    if actual != expected:
+        raise ValueError(
+            "workspace shape mismatch: "
+            f"expected {(state_E, weight_E, max_rows, k, n, num_topk, device, dtype)}, "
+            f"got {actual}"
+        )
+
+
+def _workspace_pool_key(
+    implementation: str,
+    *,
+    state_E: int,
+    weight_E: int,
+    max_rows: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple:
+    return (
+        implementation,
+        state_E,
+        weight_E,
+        max_rows,
+        k,
+        n,
+        num_topk,
+        device.index or 0,
+        dtype,
+    )
+
+
+def _resolve_workspace(
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+    *,
+    implementation: str,
+    state_E: int,
+    weight_E: int,
+    max_rows: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    a1_gscale: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    input_scales_static: bool,
+) -> TPMoEWorkspace:
+    if isinstance(workspace, TPMoEWorkspace):
+        _validate_workspace(
+            workspace,
+            state_E=state_E,
+            weight_E=weight_E,
+            max_rows=max_rows,
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            device=device,
+            dtype=dtype,
+        )
+        _refresh_workspace_scales(
+            workspace,
+            a1_gscale,
+            a2_gscale,
+            input_scales_static=input_scales_static,
+        )
+        return workspace
+
+    if not isinstance(workspace, TPMoEWorkspacePool):
+        raise TypeError(
+            "workspace must be a TPMoEWorkspace or TPMoEWorkspacePool"
+        )
+
+    key = _workspace_pool_key(
+        implementation,
+        state_E=state_E,
+        weight_E=weight_E,
+        max_rows=max_rows,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        device=device,
+        dtype=dtype,
+    )
+    resolved = workspace.workspaces.get(key)
+    if resolved is None:
+        resolved = _alloc_workspace(
+            state_E,
+            weight_E,
+            k,
+            n,
+            num_topk,
+            device,
+            dtype,
+            a1_gscale,
+            a2_gscale,
+            max_rows=max_rows,
+            input_scales_static=input_scales_static,
+        )
+        workspace.workspaces[key] = resolved
+        return resolved
+
+    _refresh_workspace_scales(
+        resolved,
+        a1_gscale,
+        a2_gscale,
+        input_scales_static=input_scales_static,
+    )
+    return resolved
+
+
+def allocate_tp_moe_workspace(
+    a: torch.Tensor,
+    a1_gscale: torch.Tensor,
+    w1_fp4: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    implementation: str | None = None,
+    input_scales_static: bool = False,
+) -> TPMoEWorkspace:
+    """Allocate reusable scratch for one exact unchunked `b12x_moe_fp4` call shape."""
+    if a.ndim != 2:
+        raise ValueError(f"expected input activations with rank 2, got shape {tuple(a.shape)}")
+    if topk_ids.ndim != 2:
+        raise ValueError(f"expected topk_ids with rank 2, got shape {tuple(topk_ids.shape)}")
+    m, k = a.shape
+    if topk_ids.shape[0] != m:
+        raise ValueError(f"topk_ids batch mismatch: expected {m}, got {topk_ids.shape[0]}")
+    weight_E = w1_fp4.shape[0]
+    n = w2_fp4.shape[2] * 2
+    num_topk = topk_ids.shape[1]
+    impl = _normalize_impl(implementation)
+    _, state_E, state_max_rows = _resolve_workspace_layout(
+        impl,
+        num_tokens=m,
+        weight_E=weight_E,
+        num_topk=num_topk,
+    )
+    effective_input_scales_static = (
+        input_scales_static
+        or (a1_gscale.numel() == 1 and a2_gscale.numel() == 1)
+    )
+    return _alloc_workspace(
+        state_E,
+        weight_E,
+        k,
+        n,
+        num_topk,
+        a.device,
+        a.dtype,
+        a1_gscale,
+        a2_gscale,
+        max_rows=state_max_rows,
+        input_scales_static=effective_input_scales_static,
+    )
+
+
+def allocate_tp_moe_workspace_pool() -> TPMoEWorkspacePool:
+    """Allocate an explicit caller-owned workspace pool."""
+    return TPMoEWorkspacePool()
 
 
 def _get_kernel_cache(impl: str) -> Dict[Tuple, Tuple]:
@@ -813,6 +1088,7 @@ def b12x_moe_fp4(
     apply_router_weight_on_input: bool = False,
     implementation: str | None = None,
     *,
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
     output: torch.Tensor | None = None,
     input_scales_are_reciprocal: bool = False,
     input_scales_static: bool = False,
@@ -844,14 +1120,24 @@ def b12x_moe_fp4(
     )
 
     impl = requested_impl
-    use_compact_static = requested_impl == "static" and routed_rows < _get_static_compact_cutover_pairs()
-
+    use_compact_static, state_E, state_max_rows = _resolve_workspace_layout(
+        requested_impl,
+        num_tokens=m,
+        weight_E=weight_E,
+        num_topk=num_topk,
+    )
     max_rows = ((routed_rows + 127) // 128) * 128
-    state_max_rows = max_rows
-    if use_compact_static:
-        state_max_rows = max(1, routed_rows)
     max_tokens_per_launch = _safe_token_chunk(E, k, n, num_topk)
+    if impl == "static":
+        max_tokens_per_launch *= _get_static_chunk_multiplier()
+    if impl == "dynamic":
+        max_tokens_per_launch *= _get_dynamic_chunk_multiplier()
     if m > max_tokens_per_launch:
+        if isinstance(workspace, TPMoEWorkspace):
+            raise ValueError(
+                "chunked requests require a TPMoEWorkspacePool; "
+                "an exact TPMoEWorkspace only supports one launch shape"
+            )
         chunk_output = output
         if chunk_output is None:
             chunk_output = torch.empty(m, k, dtype=a.dtype, device=device)
@@ -872,6 +1158,7 @@ def b12x_moe_fp4(
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 implementation=impl,
                 output=chunk_output[start:end],
+                workspace=workspace,
                 input_scales_are_reciprocal=input_scales_are_reciprocal,
                 input_scales_static=effective_input_scales_static,
                 fast_math=fast_math,
@@ -879,22 +1166,20 @@ def b12x_moe_fp4(
         return chunk_output
 
     compact_static_path = impl == "static" and use_compact_static
-    state_E = E
-    state_a1_seed = a1_gscale
-    state_a2_seed = a2_gscale
-    state_input_scales_static = effective_input_scales_static
-    if compact_static_path:
-        state_E = max(1, routed_rows)
-        if a1_gscale.numel() > 1:
-            state_a1_seed = a1_gscale[:1]
-        if a2_gscale.numel() > 1:
-            state_a2_seed = a2_gscale[:1]
-        state_input_scales_static = True
-
-    s = _get_state(
-        state_E, m, k, n, num_topk, device, a.dtype, state_a1_seed, state_a2_seed,
+    s = _resolve_workspace(
+        workspace,
+        implementation=impl,
+        state_E=state_E,
+        weight_E=weight_E,
         max_rows=state_max_rows,
-        input_scales_static=state_input_scales_static,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        device=device,
+        dtype=a.dtype,
+        a1_gscale=a1_gscale,
+        a2_gscale=a2_gscale,
+        input_scales_static=effective_input_scales_static,
     )
 
     # CUDA graph capture may run on a non-default stream, so the launch stream
@@ -902,14 +1187,6 @@ def b12x_moe_fp4(
     stream = current_cuda_stream()
 
     if compact_static_path:
-        _ensure_compact_static_scratch(
-            s,
-            weight_E=weight_E,
-            device=device,
-        )
-        if s.global_to_local_expert is None:
-            raise RuntimeError("compact static scratch allocation failed")
-
         flat_ids = _flatten_routing_ids(topk_ids)
         flat_weights = _flatten_routing_weights(topk_weights)
 
@@ -945,7 +1222,12 @@ def b12x_moe_fp4(
         flat_ids = _flatten_routing_ids(topk_ids)
         flat_weights = _flatten_routing_weights(topk_weights)
 
-    scatter_output = s.scatter_output if output is None else output
+    if output is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise ValueError("CUDA graph capture requires a caller-owned output buffer")
+        scatter_output = torch.zeros(m, k, dtype=a.dtype, device=device)
+    else:
+        scatter_output = output
     if scatter_output.shape != (m, k):
         raise ValueError(f"output must have shape {(m, k)}, got {tuple(scatter_output.shape)}")
     if scatter_output.dtype != a.dtype:
@@ -968,8 +1250,7 @@ def b12x_moe_fp4(
         )
         compiled(
             a, flat_ids, flat_weights,
-            s.packed_a_view, s.sfa_ptr,
-            s.packed_a_flat, s.scale_flat,
+            s.packed_a_view, s.sfa_ptr, s.packed_a_flat, s.scale_flat,
             s.barrier_count, s.barrier_epoch,
             s.pair_head, s.producers_done_count, s.all_work_published,
             s.task_head, s.task_tail, s.task_ready,
