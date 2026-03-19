@@ -51,7 +51,6 @@ class TPMoEWorkspace:
 class TPCompactStaticWorkspace(TPMoEWorkspace):
     active_experts: torch.Tensor
     active_expert_count: torch.Tensor
-    active_row_counts: torch.Tensor
     weight_expert_ids: torch.Tensor
     global_to_local_expert: torch.Tensor
 
@@ -116,7 +115,6 @@ _PLAIN_PARAM_CACHE: Dict[Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtyp
 _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = _LEVEL_TILE_M
 _STATIC_COMPACT_CUTOVER_PAIRS_CACHE: int | None = None
 _DYNAMIC_MULTICTA_CACHE: bool | None = None
-_STATIC_CHUNK_MULTIPLIER_CACHE: int | None = None
 _DYNAMIC_CHUNK_MULTIPLIER_CACHE: int | None = None
 _LAST_WEIGHTS: Tuple = (None, None)  # (cache_key, views)
 _LAST_KERNEL: Tuple = (None, None)  # (cache_key, (compiled, mac))
@@ -172,14 +170,6 @@ def _dynamic_multicta_enabled() -> bool:
             multicta_env = os.environ.get("B12X_LEVEL10_ENABLE_MULTICTA", "1")
         _DYNAMIC_MULTICTA_CACHE = multicta_env == "1"
     return _DYNAMIC_MULTICTA_CACHE
-
-
-def _get_static_chunk_multiplier() -> int:
-    global _STATIC_CHUNK_MULTIPLIER_CACHE
-    if _STATIC_CHUNK_MULTIPLIER_CACHE is None:
-        mult_env = os.environ.get("B12X_STATIC_CHUNK_MULTIPLIER", "1")
-        _STATIC_CHUNK_MULTIPLIER_CACHE = max(1, int(mult_env))
-    return _STATIC_CHUNK_MULTIPLIER_CACHE
 
 
 def _get_dynamic_chunk_multiplier() -> int:
@@ -282,7 +272,7 @@ def _get_cached_static_execution_args(
         s.barrier_count, s.barrier_epoch,
         wv.w13_fp4, wv.sfb_w13_ptr,
         wv.down_fp4, wv.sfb_down_ptr,
-        s.expert_counts, s.active_experts, s.active_expert_count, s.weight_expert_ids, s.global_to_local_expert, s.active_row_counts,
+        s.expert_counts, s.active_experts, s.active_expert_count, s.weight_expert_ids, s.global_to_local_expert,
         input_gs, w1_alpha, w2_alpha, down_input_scale,
         scatter_output, s.token_map, s.token_weights_map,
         mac, stream,
@@ -455,10 +445,9 @@ def _alloc_workspace(
             packed_input_scale=torch.empty(state_E, static_rows_pad_k, cols_pad_k, dtype=torch.uint8, device=device),
             active_experts=torch.empty(state_E, dtype=torch.int32, device=device),
             active_expert_count=torch.zeros(1, dtype=torch.int32, device=device),
-            active_row_counts=torch.zeros(state_E, dtype=torch.int32, device=device),
-        weight_expert_ids=torch.arange(state_E, dtype=torch.int32, device=device),
-        global_to_local_expert=torch.empty(weight_E, dtype=torch.int32, device=device),
-    )
+            weight_expert_ids=torch.arange(state_E, dtype=torch.int32, device=device),
+            global_to_local_expert=torch.empty(weight_E, dtype=torch.int32, device=device),
+        )
         _finalize_workspace_views(workspace)
         return workspace
 
@@ -909,9 +898,6 @@ def _get_static_kernel(
     global_to_local_expert_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (weight_E,), assumed_align=4,
     )
-    active_row_counts_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (state_E,), assumed_align=4,
-    )
     input_gs_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype, (weight_E,), assumed_align=16,
     )
@@ -941,7 +927,7 @@ def _get_static_kernel(
         barrier_count_fake, barrier_epoch_fake,
         b_w13_fake, sfb_w13_fake,
         b_down_fake, sfb_down_fake,
-        row_counts_fake, active_experts_fake, active_expert_count_fake, weight_expert_ids_fake, global_to_local_expert_fake, active_row_counts_fake,
+        row_counts_fake, active_experts_fake, active_expert_count_fake, weight_expert_ids_fake, global_to_local_expert_fake,
         input_gs_fake, alpha_fake, down_alpha_fake, global_scale_fake,
         scatter_fake, token_map_fake, token_weights_fake,
         mac, current_cuda_stream(),
@@ -1182,13 +1168,13 @@ def b12x_moe_fp4(
         weight_E=weight_E,
         num_topk=num_topk,
     )
-    max_rows = ((routed_rows + 127) // 128) * 128
-    if impl == "static":
-        max_tokens_per_launch = _safe_token_chunk(E, k, n, num_topk)
-        max_tokens_per_launch *= _get_static_chunk_multiplier()
-    else:
+    if impl == "dynamic":
+        max_rows = ((routed_rows + 127) // 128) * 128
         max_tokens_per_launch = _dynamic_token_chunk_limit(E, k, n, num_topk)
-    if m > max_tokens_per_launch:
+    else:
+        max_rows = state_max_rows
+        max_tokens_per_launch = m
+    if impl == "dynamic" and m > max_tokens_per_launch:
         if isinstance(workspace, TPMoEWorkspace):
             raise ValueError(
                 "chunked requests require a TPMoEWorkspacePool; "

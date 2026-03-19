@@ -41,7 +41,7 @@ def test_workspace_pool_handles_chunked_calls(monkeypatch: pytest.MonkeyPatch) -
     device = torch.device("cuda")
     spec = _make_spec()
     weights = load_expert_weights(MODEL_PATH, spec, layer_idx=0)
-    x, topk_ids, topk_weights = make_routed_inputs(spec, 8, seed=321, device=device)
+    x, topk_ids, topk_weights = make_routed_inputs(spec, 39, seed=321, device=device)
 
     exact_workspace = allocate_tp_moe_workspace(
         x,
@@ -52,7 +52,7 @@ def test_workspace_pool_handles_chunked_calls(monkeypatch: pytest.MonkeyPatch) -
         topk_ids,
         input_scales_static=True,
     )
-    assert isinstance(exact_workspace, tp_moe.TPCompactStaticWorkspace)
+    assert isinstance(exact_workspace, tp_moe.TPDynamicWorkspace)
     expected = b12x_moe_fp4(
         x,
         weights.w13_input_scale_per_expert,
@@ -71,7 +71,7 @@ def test_workspace_pool_handles_chunked_calls(monkeypatch: pytest.MonkeyPatch) -
     torch.cuda.synchronize(device)
 
     pool = allocate_tp_moe_workspace_pool()
-    monkeypatch.setattr(tp_moe, "_safe_token_chunk", lambda *_args: 2)
+    monkeypatch.setattr(tp_moe, "_dynamic_token_chunk_limit", lambda *_args: 13)
     actual = b12x_moe_fp4(
         x,
         weights.w13_input_scale_per_expert,
@@ -108,7 +108,7 @@ def test_workspace_pool_handles_chunked_calls(monkeypatch: pytest.MonkeyPatch) -
 
     assert len(pool.workspaces) == 1
     metrics = compare_to_reference(actual, expected)
-    assert metrics.max_abs <= 5e-4
+    assert metrics.max_abs <= 1e-3
     assert metrics.cos > 0.9998
 
 

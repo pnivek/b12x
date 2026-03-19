@@ -132,7 +132,6 @@ class StaticSchedulerParams:
     def __init__(
         self,
         row_counts: cute.Tensor,
-        active_row_counts: cute.Tensor,
         active_experts: cute.Tensor,
         active_expert_count: cute.Tensor,
         c_tiler: Tuple[int, int],
@@ -146,7 +145,6 @@ class StaticSchedulerParams:
             raise ValueError(f"unsupported cluster_shape_k {cluster_shape_mnk[2]}")
 
         self.row_counts = row_counts
-        self.active_row_counts = active_row_counts
         self.active_experts = active_experts
         self.active_expert_count = active_expert_count
         self.c_tiler = c_tiler
@@ -159,7 +157,6 @@ class StaticSchedulerParams:
         values, self._values_pos = [], []
         for obj in [
             self.row_counts,
-            self.active_row_counts,
             self.active_experts,
             self.active_expert_count,
             self.c_tiler,
@@ -176,7 +173,6 @@ class StaticSchedulerParams:
         for obj, n_items in zip(
             [
                 self.row_counts,
-                self.active_row_counts,
                 self.active_experts,
                 self.active_expert_count,
                 self.c_tiler,
@@ -306,32 +302,30 @@ class StaticScheduler:
         accum_tile_m = self._accum_tile_m
         batch_idx = self._current_batch_idx
         num_active_experts = self.params.active_expert_count[Int32(0)]
+        scan_batch_idx = batch_idx
 
-        while (
-            batch_idx < num_active_experts
-            and (
-                accum_tile_m
-                + cute.ceil_div(self.params.active_row_counts[batch_idx], self.params.c_tiler[0])
-            )
-            * num_tiles_n
-            <= current_work_linear_idx
-        ):
-            accum_tile_m += cute.ceil_div(
-                self.params.active_row_counts[batch_idx], self.params.c_tiler[0]
-            )
-            batch_idx += Int32(1)
+        while scan_batch_idx < num_active_experts:
+            local_expert_idx = self.params.active_experts[scan_batch_idx]
+            batch_rows = self.params.row_counts[local_expert_idx]
+            batch_m_tiles = cute.ceil_div(batch_rows, self.params.c_tiler[0])
+            if (accum_tile_m + batch_m_tiles) * num_tiles_n > current_work_linear_idx:
+                batch_idx = scan_batch_idx
+                scan_batch_idx = num_active_experts
+            else:
+                accum_tile_m += batch_m_tiles
+                scan_batch_idx += Int32(1)
+                batch_idx = scan_batch_idx
 
         self._accum_tile_m = accum_tile_m
         self._current_batch_idx = batch_idx
 
         is_valid = self._current_batch_idx < num_active_experts
         if is_valid:
+            local_expert_idx = self.params.active_experts[self._current_batch_idx]
+            batch_rows = self.params.row_counts[local_expert_idx]
             is_valid = (
                 self._accum_tile_m
-                + cute.ceil_div(
-                    self.params.active_row_counts[self._current_batch_idx],
-                    self.params.c_tiler[0],
-                )
+                + cute.ceil_div(batch_rows, self.params.c_tiler[0])
             ) * num_tiles_n > current_work_linear_idx
 
         cur_cluster_coord = (
@@ -632,7 +626,6 @@ class MoEStaticKernel:
         active_expert_count: cute.Tensor,  # [1] active expert count
         weight_expert_ids: cute.Tensor,  # [E] local expert id -> global weight expert id
         global_to_local_expert: cute.Tensor,  # [weight_E] global expert id -> local expert id
-        active_row_counts: cute.Tensor,  # [E] compact row counts aligned with active_experts
         input_global_scale: cute.Tensor,  # [E] per-expert FC1 input scale
         alpha: cute.Tensor,
         down_alpha: cute.Tensor,
@@ -698,7 +691,7 @@ class MoEStaticKernel:
         # Scheduler tiles over (m_tile, intermediate_slice, expert).
         c_tiler = (self.tile_shape_mnk[0], self.tile_shape_mnk[1])
         tile_sched_params = StaticSchedulerParams(
-            row_counts, active_row_counts, active_experts, active_expert_count,
+            row_counts, active_experts, active_expert_count,
             c_tiler, Int32(self.output_tile_count_n), (*self.cluster_shape_mn, 1),
         )
         grid = StaticScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
@@ -1010,18 +1003,6 @@ class MoEStaticKernel:
             barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
         )
 
-        if flat_tid == Int32(0):
-            active_count = tile_sched_params.active_expert_count[Int32(0)]
-            active_idx = Int32(0)
-            while active_idx < active_count:
-                expert_idx = tile_sched_params.active_experts[active_idx]
-                tile_sched_params.active_row_counts[active_idx] = tile_sched_params.row_counts[expert_idx]
-                active_idx += Int32(1)
-
-        self._resident_grid_barrier(
-            barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
-        )
-
         gA = cute.local_tile(mA, cute.slice_(self.tile_shape_mnk, (None, 0, None)), (None, None, None))
         # Single tiled view over concatenated w13 [2*I_tp, K, E].
         # W13 is packed as [up, gate] across the concatenated N dimension.
@@ -1149,7 +1130,7 @@ class MoEStaticKernel:
                 local_expert_idx = tile_sched_params.active_experts[tile_coord[2]]
                 weight_expert_idx = weight_expert_ids[local_expert_idx]
                 alpha_value = alpha[weight_expert_idx].to(cutlass.Float32)
-                valid_rows = tile_sched_params.active_row_counts[tile_coord[2]]
+                valid_rows = tile_sched_params.row_counts[local_expert_idx]
                 tile_m_base = tile_coord[0] * Int32(self.tile_shape_mnk[0])
                 intermediate_slice = tile_coord[1]
 
