@@ -156,6 +156,63 @@ def _select_paged_tile_shape(head_dim: int, *, causal: bool, page_size: int) -> 
     )
 
 
+@dataclass(frozen=True)
+class PagedKernelConfig:
+    kernel_family: Literal["main", "decode_micro"]
+    tile_m: int
+    tile_n: int
+    num_compute_warps: int
+    num_stages: int
+    q_in_regs: bool
+
+
+def _select_paged_kernel_config(
+    head_dim: int,
+    *,
+    causal: bool,
+    page_size: int,
+    mode: Literal["decode", "extend"],
+    max_pages: int,
+    tile_shape: tuple[int, int] | None = None,
+) -> PagedKernelConfig:
+    if not causal:
+        raise ValueError("b12x paged attention currently supports causal mode only")
+    if page_size != 64:
+        raise ValueError(
+            f"b12x paged attention currently requires page_size=64 for the TMA path, got {page_size}"
+        )
+    if tile_shape is not None:
+        tile_m, tile_n = tile_shape
+    elif head_dim <= 128:
+        tile_m, tile_n = (128, 64)
+    elif mode == "decode" and head_dim == 256 and max_pages <= 4:
+        tile_m, tile_n = (16, 64)
+    elif head_dim == 256:
+        tile_m, tile_n = (64, 64)
+    else:
+        raise ValueError(
+            f"unsupported head_dim={head_dim} for the current b12x paged attention path"
+        )
+
+    if mode == "decode" and head_dim == 256 and max_pages <= 4:
+        return PagedKernelConfig(
+            kernel_family="decode_micro",
+            tile_m=tile_m,
+            tile_n=tile_n,
+            num_compute_warps=1,
+            num_stages=1,
+            q_in_regs=True,
+        )
+    return PagedKernelConfig(
+        kernel_family="main",
+        tile_m=tile_m,
+        tile_n=tile_n,
+        num_compute_warps=4,
+        num_stages=1,
+        q_in_regs=False,
+    )
+
+
 def _normalize_tensor_shape(t: torch.Tensor) -> tuple[int, ...]:
     return tuple(int(dim) for dim in t.shape)
 
@@ -176,6 +233,13 @@ def _q_lengths_from_cu_seqlens(cu_seqlens_q: torch.Tensor) -> list[int]:
             raise ValueError("cu_seqlens_q must be non-decreasing")
         q_lengths.append(end - start)
     return q_lengths
+
+
+def _max_pages_from_cache_seqlens(cache_seqlens: torch.Tensor, *, page_size: int) -> int:
+    max_pages = 0
+    for cache_len in _metadata_to_cpu_int_list(cache_seqlens, name="cache_seqlens"):
+        max_pages = max(max_pages, (cache_len + page_size - 1) // page_size)
+    return max_pages
 
 
 def infer_paged_attention_mode(cu_seqlens_q: torch.Tensor) -> Literal["decode", "extend"]:
@@ -363,10 +427,7 @@ def choose_paged_attention_num_splits(
     if min_pages_per_split < 1:
         raise ValueError(f"min_pages_per_split must be >= 1, got {min_pages_per_split}")
     buckets = _normalize_split_buckets(split_buckets)
-    cache_seqlens_list = _metadata_to_cpu_int_list(cache_seqlens, name="cache_seqlens")
-    max_pages = 0
-    for cache_len in cache_seqlens_list:
-        max_pages = max(max_pages, (cache_len + page_size - 1) // page_size)
+    max_pages = _max_pages_from_cache_seqlens(cache_seqlens, page_size=page_size)
     chosen = 1
     for bucket in buckets[1:]:
         if max_pages >= bucket * min_pages_per_split:
@@ -470,9 +531,13 @@ class PagedAttentionPlanKey:
     dtype: torch.dtype
     causal: bool
     mode: Literal["decode", "extend"]
+    kernel_family: Literal["main", "decode_micro"]
     tile_m: int
     tile_n: int
     num_splits: int
+    num_compute_warps: int
+    num_stages: int
+    q_in_regs: bool
     num_batch: int
     num_q_heads: int
     num_kv_heads: int
@@ -545,9 +610,13 @@ class PagedAttentionWorkspace:
     dtype: torch.dtype
     causal: bool
     mode: Literal["decode", "extend"]
+    kernel_family: Literal["main", "decode_micro"]
     tile_m: int
     tile_n: int
     num_splits: int
+    num_compute_warps: int
+    num_stages: int
+    q_in_regs: bool
     output: torch.Tensor
     lse: torch.Tensor
     split_output: torch.Tensor | None = None
@@ -686,9 +755,14 @@ class _PagedAttentionForwardLaunch:
         cu_seqlens_q_shape: tuple[int, ...],
         dtype: torch.dtype,
         causal: bool,
+        mode: Literal["decode", "extend"],
+        kernel_family: Literal["main", "decode_micro"],
         tile_m: int,
         tile_n: int,
         num_splits: int,
+        num_compute_warps: int,
+        num_stages: int,
+        q_in_regs: bool,
     ):
         self._q_shape = q_shape
         self._k_cache_shape = k_cache_shape
@@ -733,15 +807,18 @@ class _PagedAttentionForwardLaunch:
             head_dim_v,
             tile_m,
             tile_n,
-            1,
-            160,
+            num_stages,
+            (num_compute_warps + 1) * 32,
             causal,
-            False,
+            q_in_regs,
+            num_compute_warps=num_compute_warps,
         ):
             raise TypeError(
                 "b12x paged attention launch is unsupported with "
                 f"dtype={dtype}, q_shape={q_shape}, k_cache_shape={k_cache_shape}, "
-                f"v_cache_shape={v_cache_shape}, causal={causal}, tile=({tile_m}, {tile_n})"
+                f"v_cache_shape={v_cache_shape}, causal={causal}, mode={mode}, "
+                f"kernel_family={kernel_family}, tile=({tile_m}, {tile_n}), "
+                f"num_compute_warps={num_compute_warps}, num_stages={num_stages}, q_in_regs={q_in_regs}"
             )
         self._kernel = SM120ForwardKernel(
             self._dtype,
@@ -752,7 +829,10 @@ class _PagedAttentionForwardLaunch:
             pack_gqa=qhead_per_kvhead != 1,
             tile_m=tile_m,
             tile_n=tile_n,
+            num_stages=num_stages,
             num_splits=num_splits,
+            num_compute_warps=num_compute_warps,
+            Q_in_regs=q_in_regs,
         )
         assert head_dim == head_dim_k
 
@@ -934,11 +1014,14 @@ def _compile_paged_attention(
     dtype: torch.dtype,
     causal: bool,
     mode: Literal["decode", "extend"],
+    kernel_family: Literal["main", "decode_micro"],
     tile_m: int,
     tile_n: int,
     num_splits: int,
+    num_compute_warps: int,
+    num_stages: int,
+    q_in_regs: bool,
 ):
-    del mode
     cutlass_dtype = _torch_to_cutlass_dtype(dtype)
     launch = _PagedAttentionForwardLaunch(
         q_shape=q_shape,
@@ -949,9 +1032,14 @@ def _compile_paged_attention(
         cu_seqlens_q_shape=cu_seqlens_q_shape,
         dtype=dtype,
         causal=causal,
+        mode=mode,
+        kernel_family=kernel_family,
         tile_m=tile_m,
         tile_n=tile_n,
         num_splits=num_splits,
+        num_compute_warps=num_compute_warps,
+        num_stages=num_stages,
+        q_in_regs=q_in_regs,
     )
     return cute.compile(
         launch,
@@ -1061,9 +1149,13 @@ def _get_paged_attention_plan(
     dtype: torch.dtype,
     causal: bool,
     mode: Literal["decode", "extend"],
+    kernel_family: Literal["main", "decode_micro"],
     tile_m: int,
     tile_n: int,
     num_splits: int,
+    num_compute_warps: int,
+    num_stages: int,
+    q_in_regs: bool,
 ) -> PagedAttentionPlan:
     (
         num_batch,
@@ -1087,9 +1179,13 @@ def _get_paged_attention_plan(
             dtype=dtype,
             causal=causal,
             mode=mode,
+            kernel_family=kernel_family,
             tile_m=tile_m,
             tile_n=tile_n,
             num_splits=num_splits,
+            num_compute_warps=num_compute_warps,
+            num_stages=num_stages,
+            q_in_regs=q_in_regs,
             num_batch=num_batch,
             num_q_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
@@ -1106,13 +1202,17 @@ def _get_paged_attention_plan(
             page_table_shape,
             cache_seqlens_shape,
             cu_seqlens_q_shape,
-            dtype,
-            causal,
-            mode,
-            tile_m,
-            tile_n,
-            num_splits,
-        ),
+                dtype,
+                causal,
+                mode,
+                kernel_family,
+                tile_m,
+                tile_n,
+                num_splits,
+                num_compute_warps,
+                num_stages,
+                q_in_regs,
+            ),
         compiled_combine=(
             _compile_paged_attention_combine(
                 _split_paged_output_shape(q_shape, num_splits=num_splits),
@@ -1189,9 +1289,13 @@ def _validate_paged_workspace(
         plan.dtype,
         plan.causal,
         plan.mode,
+        plan.kernel_family,
         plan.tile_m,
         plan.tile_n,
         plan.num_splits,
+        plan.num_compute_warps,
+        plan.num_stages,
+        plan.q_in_regs,
     )
     actual = (
         workspace.q_shape,
@@ -1202,14 +1306,18 @@ def _validate_paged_workspace(
         workspace.dtype,
         workspace.causal,
         workspace.mode,
+        workspace.kernel_family,
         workspace.tile_m,
         workspace.tile_n,
         workspace.num_splits,
+        workspace.num_compute_warps,
+        workspace.num_stages,
+        workspace.q_in_regs,
     )
     if expected != actual:
         raise ValueError(
             "paged workspace shape mismatch: "
-            "expected q/k_cache/v_cache/page_table/device/dtype/causal/mode/tile/splits="
+            "expected q/k_cache/v_cache/page_table/device/dtype/causal/mode/kernel/tile/splits/config="
             f"{expected}, got {actual}"
         )
     if workspace.num_splits < 1:
@@ -1300,9 +1408,13 @@ def allocate_paged_attention_workspace_for_plan(plan: PagedAttentionPlan) -> Pag
         dtype=plan.dtype,
         causal=plan.causal,
         mode=plan.mode,
+        kernel_family=plan.kernel_family,
         tile_m=plan.tile_m,
         tile_n=plan.tile_n,
         num_splits=plan.num_splits,
+        num_compute_warps=plan.num_compute_warps,
+        num_stages=plan.num_stages,
+        q_in_regs=plan.q_in_regs,
         output=output,
         lse=lse,
         split_output=split_output,
@@ -1442,11 +1554,15 @@ def create_paged_attention_plan(
         )
     elif num_splits not in buckets:
         raise ValueError(f"num_splits must be one of {buckets}, got {num_splits}")
+    max_pages = _max_pages_from_cache_seqlens(cache_seqlens, page_size=page_size)
     _, _, head_dim = q_shape
-    tile_m, tile_n = tile_shape or _select_paged_tile_shape(
+    kernel_config = _select_paged_kernel_config(
         head_dim,
         causal=causal,
         page_size=page_size,
+        mode=mode,
+        max_pages=max_pages,
+        tile_shape=tile_shape,
     )
     return _get_paged_attention_plan(
         q_shape,
@@ -1459,9 +1575,13 @@ def create_paged_attention_plan(
         dtype,
         causal,
         mode,
-        tile_m,
-        tile_n,
+        kernel_config.kernel_family,
+        kernel_config.tile_m,
+        kernel_config.tile_n,
         num_splits,
+        kernel_config.num_compute_warps,
+        kernel_config.num_stages,
+        kernel_config.q_in_regs,
     )
 
 
@@ -1664,9 +1784,13 @@ def b12x_paged_attention_forward(
             workspace.dtype,
             workspace.causal,
             workspace.mode,
+            workspace.kernel_family,
             workspace.tile_m,
             workspace.tile_n,
             workspace.num_splits,
+            workspace.num_compute_warps,
+            workspace.num_stages,
+            workspace.q_in_regs,
         )
     else:
         resolved_plan = plan
@@ -1750,9 +1874,13 @@ def b12x_paged_decode(
             workspace.dtype,
             workspace.causal,
             workspace.mode,
+            workspace.kernel_family,
             workspace.tile_m,
             workspace.tile_n,
             workspace.num_splits,
+            workspace.num_compute_warps,
+            workspace.num_stages,
+            workspace.q_in_regs,
         )
     if resolved_plan.mode != "decode":
         raise ValueError(f"expected a decode plan, got {resolved_plan.mode}")
@@ -1797,9 +1925,13 @@ def b12x_paged_extend(
             workspace.dtype,
             workspace.causal,
             workspace.mode,
+            workspace.kernel_family,
             workspace.tile_m,
             workspace.tile_n,
             workspace.num_splits,
+            workspace.num_compute_warps,
+            workspace.num_stages,
+            workspace.q_in_regs,
         )
     if resolved_plan.mode != "extend":
         raise ValueError(f"expected an extend plan, got {resolved_plan.mode}")

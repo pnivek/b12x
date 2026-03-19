@@ -114,6 +114,7 @@ class SM120ForwardKernel:
         num_stages: int = 1,
         num_splits: int = 1,
         num_threads: int = 160,
+        num_compute_warps: int = 4,
         Q_in_regs: bool = False,
         score_mod: Optional[cutlass.Constexpr] = None,
         mask_mod: Optional[cutlass.Constexpr] = None,
@@ -148,7 +149,8 @@ class SM120ForwardKernel:
         self.mma_pv_is_rs = mma_pv_is_rs
         assert self.mma_pv_is_rs, "SM120 rewrite currently only supports register-sourced PV"
         self.buffer_align_bytes = 1024
-        self.num_compute_warps = 4
+        self.num_compute_warps = num_compute_warps
+        assert self.num_compute_warps >= 1
         self.num_threads_per_warp = 32
         self.producer_warp_idx = self.num_compute_warps
         self.use_tma_KV = not paged_kv_non_tma
@@ -258,6 +260,7 @@ class SM120ForwardKernel:
         num_threads,
         is_causal,
         Q_in_regs=False,
+        num_compute_warps=4,
     ) -> bool:
         if dtype not in [cutlass.Float16, cutlass.BFloat16]:
             return False
@@ -265,11 +268,15 @@ class SM120ForwardKernel:
             return False
         if head_dim_v % 8 != 0:
             return False
-        if tile_m % 64 != 0:
+        if num_compute_warps < 1:
+            return False
+        if tile_m % (num_compute_warps * 16) != 0:
             return False
         if tile_n % 16 != 0:
             return False
         if num_threads % 32 != 0:
+            return False
+        if num_threads != (num_compute_warps + 1) * 32:
             return False
         smem_usage_Q = tile_m * head_dim * 2
         smem_usage_K = tile_n * head_dim * num_stages * 2

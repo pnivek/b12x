@@ -161,6 +161,10 @@ def test_paged_plan_exposes_logical_gqa_dimensions() -> None:
     assert plan.logical_q_rows_static == sum(q_seqlens) * 8
     assert plan.logical_total_q_rows == sum(q_seqlens) * 8
     assert plan.mode == "extend"
+    assert plan.kernel_family == "main"
+    assert plan.num_compute_warps == 4
+    assert plan.num_stages == 1
+    assert plan.q_in_regs is False
 
 
 def test_paged_mode_inference_distinguishes_decode_from_extend() -> None:
@@ -182,6 +186,61 @@ def test_paged_mode_inference_distinguishes_decode_from_extend() -> None:
 
     assert infer_paged_attention_mode(cu_seqlens_decode) == "decode"
     assert infer_paged_attention_mode(cu_seqlens_extend) == "extend"
+
+
+def test_decode_plan_selects_decode_micro_kernel_family() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[1, 1, 1, 1],
+        cache_seqlens=[64, 96, 128, 70],
+        page_size=64,
+        seed=39,
+    )
+    plan = create_paged_attention_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+    )
+
+    assert plan.mode == "decode"
+    assert plan.kernel_family == "decode_micro"
+    assert plan.tile_m == 16
+    assert plan.tile_n == 64
+    assert plan.num_compute_warps == 1
+    assert plan.q_in_regs is True
+
+
+def test_long_decode_plan_falls_back_to_main_kernel_family() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[1, 1, 1, 1],
+        cache_seqlens=[512, 768, 640, 1024],
+        page_size=64,
+        seed=45,
+    )
+    plan = create_paged_attention_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+    )
+
+    assert plan.mode == "decode"
+    assert plan.kernel_family == "main"
+    assert plan.tile_m == 64
+    assert plan.num_compute_warps == 4
+    assert plan.q_in_regs is False
 
 
 def test_paged_workspace_pool_reuses_plan_exact_shape() -> None:
