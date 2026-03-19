@@ -5,9 +5,11 @@ import torch
 
 from b12x.attention.reference import paged_attention_reference
 from b12x.integration.attention import (
-    allocate_paged_attention_workspace,
+    allocate_paged_attention_workspace_for_plan,
     b12x_paged_attention_forward,
+    choose_paged_attention_num_splits,
     clear_attention_caches,
+    create_paged_attention_plan,
 )
 
 from .helpers import require_sm120
@@ -86,7 +88,7 @@ def test_paged_workspace_matches_reference_for_qwen_like_extend_shape(num_splits
         page_size=64,
         seed=23,
     )
-    workspace = allocate_paged_attention_workspace(
+    plan = create_paged_attention_plan(
         q,
         k_cache,
         v_cache,
@@ -96,6 +98,7 @@ def test_paged_workspace_matches_reference_for_qwen_like_extend_shape(num_splits
         causal=True,
         num_splits=num_splits,
     )
+    workspace = allocate_paged_attention_workspace_for_plan(plan)
     out, lse = b12x_paged_attention_forward(
         q,
         k_cache,
@@ -104,6 +107,7 @@ def test_paged_workspace_matches_reference_for_qwen_like_extend_shape(num_splits
         cache_seqlens,
         cu_seqlens_q,
         workspace=workspace,
+        plan=plan,
     )
     ref_out, ref_lse = paged_attention_reference(
         q,
@@ -141,7 +145,7 @@ def test_exact_paged_workspace_rejects_shape_mismatch() -> None:
         page_table_width=3,
         num_pages=10,
     )
-    workspace = allocate_paged_attention_workspace(
+    plan0 = create_paged_attention_plan(
         q0,
         k0,
         v0,
@@ -150,8 +154,9 @@ def test_exact_paged_workspace_rejects_shape_mismatch() -> None:
         cu_seqlens_q0,
         causal=True,
     )
+    workspace = allocate_paged_attention_workspace_for_plan(plan0)
 
-    with pytest.raises(ValueError, match="paged workspace shape mismatch"):
+    with pytest.raises(ValueError, match="paged attention plan mismatch"):
         b12x_paged_attention_forward(
             q1,
             k1,
@@ -160,6 +165,7 @@ def test_exact_paged_workspace_rejects_shape_mismatch() -> None:
             cache_seqlens1,
             cu_seqlens_q1,
             workspace=workspace,
+            plan=plan0,
         )
 
 
@@ -175,7 +181,7 @@ def test_single_token_single_key_paged_corner_is_rejected() -> None:
     )
 
     with pytest.raises(ValueError, match="single-token single-key corner"):
-        allocate_paged_attention_workspace(
+        create_paged_attention_plan(
             q,
             k_cache,
             v_cache,
@@ -197,8 +203,8 @@ def test_invalid_num_splits_is_rejected() -> None:
         seed=71,
     )
 
-    with pytest.raises(ValueError, match="num_splits must be >= 1"):
-        allocate_paged_attention_workspace(
+    with pytest.raises(ValueError, match="num_splits must be one of"):
+        create_paged_attention_plan(
             q,
             k_cache,
             v_cache,
@@ -206,8 +212,53 @@ def test_invalid_num_splits_is_rejected() -> None:
             cache_seqlens,
             cu_seqlens_q,
             causal=True,
-            num_splits=0,
+            num_splits=3,
         )
+
+
+def test_auto_split_bucket_selection_is_deterministic() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q0, k0, v0, page_table0, cache_seqlens0, cu_seqlens_q0 = _make_paged_inputs(
+        q_seqlens=[1] * 8,
+        cache_seqlens=[64] * 8,
+        page_size=64,
+        seed=83,
+    )
+    q1, k1, v1, page_table1, cache_seqlens1, cu_seqlens_q1 = _make_paged_inputs(
+        q_seqlens=[6] * 8,
+        cache_seqlens=[2048] * 8,
+        page_size=64,
+        seed=89,
+    )
+
+    assert choose_paged_attention_num_splits(cache_seqlens0, page_size=64) == 1
+    assert choose_paged_attention_num_splits(cache_seqlens1, page_size=64) == 4
+
+    plan0 = create_paged_attention_plan(
+        q0,
+        k0,
+        v0,
+        page_table0,
+        cache_seqlens0,
+        cu_seqlens_q0,
+        causal=True,
+        num_splits=0,
+    )
+    plan1 = create_paged_attention_plan(
+        q1,
+        k1,
+        v1,
+        page_table1,
+        cache_seqlens1,
+        cu_seqlens_q1,
+        causal=True,
+        num_splits=0,
+    )
+
+    assert plan0.num_splits == 1
+    assert plan1.num_splits == 4
 
 
 def test_page_size_other_than_64_is_rejected() -> None:
@@ -222,7 +273,7 @@ def test_page_size_other_than_64_is_rejected() -> None:
     )
 
     with pytest.raises(ValueError, match="page_size=64"):
-        allocate_paged_attention_workspace(
+        create_paged_attention_plan(
             q,
             k_cache,
             v_cache,

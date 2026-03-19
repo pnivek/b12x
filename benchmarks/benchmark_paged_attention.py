@@ -15,9 +15,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from b12x.integration.attention import (
-    allocate_paged_attention_workspace,
+    allocate_paged_attention_workspace_for_plan,
     b12x_paged_attention_forward,
     clear_attention_caches,
+    create_paged_attention_plan,
 )
 
 
@@ -190,8 +191,8 @@ def _capture_b12x_graph(
     cu_seqlens_q: torch.Tensor,
     num_splits: int,
     warmup: int,
-) -> tuple[torch.cuda.CUDAGraph, torch.Tensor]:
-    workspace = allocate_paged_attention_workspace(
+) -> tuple[torch.cuda.CUDAGraph, torch.Tensor, int]:
+    plan = create_paged_attention_plan(
         q,
         k_cache,
         v_cache,
@@ -201,6 +202,7 @@ def _capture_b12x_graph(
         causal=True,
         num_splits=num_splits,
     )
+    workspace = allocate_paged_attention_workspace_for_plan(plan)
 
     def run() -> None:
         b12x_paged_attention_forward(
@@ -211,10 +213,11 @@ def _capture_b12x_graph(
             cache_seqlens,
             cu_seqlens_q,
             workspace=workspace,
+            plan=plan,
         )
 
     graph = _capture_graph(run, warmup=warmup)
-    return graph, workspace.output
+    return graph, workspace.output, plan.num_splits
 
 
 def _capture_flashinfer_fa2_graph(
@@ -378,7 +381,7 @@ def main() -> None:
                 seed=1 + case_idx,
             )
         )
-        b12x_graph, b12x_output = _capture_b12x_graph(
+        b12x_graph, b12x_output, b12x_num_splits = _capture_b12x_graph(
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
@@ -432,7 +435,7 @@ def main() -> None:
             f"bs={case.batch:2d} "
             f"q={case.q_seqlen:2d} "
             f"k={case.cache_seqlen:5d} "
-            f"splits={args.num_splits:2d} "
+            f"splits={b12x_num_splits:2d} "
             f"| b12x median={b12x_metrics.median_us:8.1f} us min={b12x_metrics.min_us:8.1f} us"
         )
         if flashinfer_metrics is not None:

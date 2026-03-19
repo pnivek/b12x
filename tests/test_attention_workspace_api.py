@@ -5,9 +5,10 @@ import torch
 
 from b12x.attention.reference import attention_reference
 from b12x.integration.attention import (
-    allocate_attention_workspace,
+    allocate_attention_workspace_for_plan,
     b12x_attention_forward,
     clear_attention_caches,
+    create_attention_plan,
 )
 
 from .helpers import require_sm120
@@ -39,8 +40,9 @@ def test_exact_workspace_matches_reference_for_qwen_like_shape() -> None:
     clear_attention_caches()
 
     q, k, v = _make_gqa_inputs((1, 48, 8, 256), kv_heads=1, seed=7)
-    workspace = allocate_attention_workspace(q, k, v, causal=True)
-    out, lse = b12x_attention_forward(q, k, v, workspace=workspace)
+    plan = create_attention_plan(q, k, v, causal=True)
+    workspace = allocate_attention_workspace_for_plan(plan)
+    out, lse = b12x_attention_forward(q, k, v, workspace=workspace, plan=plan)
     ref_out, ref_lse = attention_reference(q, k, v, causal=True)
     torch.cuda.synchronize()
 
@@ -59,9 +61,10 @@ def test_right_aligned_causal_multi_tile_shape_matches_reference() -> None:
     q = torch.randn(1, 6, 8, 256, device="cuda", dtype=torch.bfloat16) / 4
     k = torch.randn(1, 33, 1, 256, device="cuda", dtype=torch.bfloat16) / 4
     v = torch.randn(1, 33, 1, 256, device="cuda", dtype=torch.bfloat16) / 4
-    workspace = allocate_attention_workspace(q, k, v, causal=True)
+    plan = create_attention_plan(q, k, v, causal=True)
+    workspace = allocate_attention_workspace_for_plan(plan)
 
-    out, lse = b12x_attention_forward(q, k, v, workspace=workspace)
+    out, lse = b12x_attention_forward(q, k, v, workspace=workspace, plan=plan)
     ref_out, ref_lse = attention_reference(q, k, v, causal=True)
     torch.cuda.synchronize()
 
@@ -80,10 +83,11 @@ def test_single_token_single_key_corner_is_rejected() -> None:
     q = torch.randn(1, 1, 8, 256, device="cuda", dtype=torch.bfloat16) / 4
     k = torch.randn(1, 1, 1, 256, device="cuda", dtype=torch.bfloat16) / 4
     v = torch.randn(1, 1, 1, 256, device="cuda", dtype=torch.bfloat16) / 4
-    workspace = allocate_attention_workspace(q, k, v, causal=True)
+    plan = create_attention_plan(q, k, v, causal=True)
+    workspace = allocate_attention_workspace_for_plan(plan)
 
     with pytest.raises(ValueError, match="single-token single-key corner"):
-        b12x_attention_forward(q, k, v, workspace=workspace)
+        b12x_attention_forward(q, k, v, workspace=workspace, plan=plan)
 
 
 def test_exact_workspace_rejects_shape_mismatch() -> None:
@@ -92,7 +96,8 @@ def test_exact_workspace_rejects_shape_mismatch() -> None:
 
     q0, k0, v0 = _make_gqa_inputs((1, 16, 8, 256), kv_heads=1, seed=13)
     q1, k1, v1 = _make_gqa_inputs((1, 32, 8, 256), kv_heads=1, seed=17)
-    workspace = allocate_attention_workspace(q0, k0, v0, causal=True)
+    plan0 = create_attention_plan(q0, k0, v0, causal=True)
+    workspace = allocate_attention_workspace_for_plan(plan0)
 
-    with pytest.raises(ValueError, match="workspace shape mismatch"):
-        b12x_attention_forward(q1, k1, v1, workspace=workspace)
+    with pytest.raises(ValueError, match="attention plan mismatch"):
+        b12x_attention_forward(q1, k1, v1, workspace=workspace, plan=plan0)

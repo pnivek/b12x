@@ -14,9 +14,10 @@ import torch
 
 from b12x.attention.reference import attention_reference
 from b12x.integration.attention import (
-    allocate_attention_workspace,
+    allocate_attention_workspace_for_plan,
     b12x_attention_forward,
     clear_attention_caches,
+    create_attention_plan,
 )
 
 
@@ -110,10 +111,11 @@ def main() -> None:
             dtype=dtype,
             seed=idx + 1,
         )
-        workspace = allocate_attention_workspace(q, k, v, causal=True)
+        plan = create_attention_plan(q, k, v, causal=True)
+        workspace = allocate_attention_workspace_for_plan(plan)
 
         if args.check:
-            out, lse = b12x_attention_forward(q, k, v, workspace=workspace)
+            out, lse = b12x_attention_forward(q, k, v, workspace=workspace, plan=plan)
             ref_out, ref_lse = attention_reference(q, k, v, causal=True)
             max_abs = (out - ref_out).abs().max().item()
             max_lse_abs = (lse - ref_lse).abs().max().item()
@@ -126,7 +128,7 @@ def main() -> None:
             )
 
         times_ms = bench_events(
-            lambda: b12x_attention_forward(q, k, v, workspace=workspace),
+            lambda: b12x_attention_forward(q, k, v, workspace=workspace, plan=plan),
             warmup=args.warmup,
             iters=args.iters,
         )

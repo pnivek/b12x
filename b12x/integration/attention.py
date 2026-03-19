@@ -1,9 +1,9 @@
-"""Public attention entrypoints backed by the transplanted SM120 forward kernel."""
+"""Planner-backed public attention entrypoints for the transplanted SM120 kernel."""
 
 from __future__ import annotations
 
 import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -12,6 +12,9 @@ import torch
 
 from b12x.attention.forward import SM120ForwardKernel
 from b12x.cute.utils import current_cuda_stream, make_ptr
+
+_DEFAULT_PAGED_SPLIT_BUCKETS = (1, 2, 4, 8)
+_DEFAULT_MIN_PAGES_PER_SPLIT = 8
 
 
 def _torch_to_cutlass_dtype(dtype: torch.dtype) -> type[cutlass.Numeric]:
@@ -116,6 +119,23 @@ def _metadata_to_cpu_int_list(t: torch.Tensor, *, name: str) -> list[int]:
     if not t.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
     return [int(v) for v in t.detach().cpu().tolist()]
+
+
+def _cuda_device_index(device: torch.device) -> int:
+    if device.type != "cuda":
+        raise ValueError(f"expected CUDA device, got {device}")
+    return torch.cuda.current_device() if device.index is None else int(device.index)
+
+
+def _normalize_split_buckets(split_buckets: tuple[int, ...]) -> tuple[int, ...]:
+    if not split_buckets:
+        raise ValueError("split_buckets must be non-empty")
+    normalized = tuple(sorted(set(int(bucket) for bucket in split_buckets)))
+    if normalized[0] != 1:
+        raise ValueError(f"split_buckets must include 1, got {normalized}")
+    if any(bucket < 1 for bucket in normalized):
+        raise ValueError(f"split_buckets must be positive, got {normalized}")
+    return normalized
 
 
 def _validate_forward_inputs(
@@ -273,9 +293,155 @@ def _validate_paged_lengths(
             )
 
 
+def choose_paged_attention_num_splits(
+    cache_seqlens: torch.Tensor,
+    *,
+    page_size: int,
+    split_buckets: tuple[int, ...] = _DEFAULT_PAGED_SPLIT_BUCKETS,
+    min_pages_per_split: int = _DEFAULT_MIN_PAGES_PER_SPLIT,
+) -> int:
+    """Choose a split bucket deterministically from paged KV lengths."""
+    if min_pages_per_split < 1:
+        raise ValueError(f"min_pages_per_split must be >= 1, got {min_pages_per_split}")
+    buckets = _normalize_split_buckets(split_buckets)
+    cache_seqlens_list = _metadata_to_cpu_int_list(cache_seqlens, name="cache_seqlens")
+    max_pages = 0
+    for cache_len in cache_seqlens_list:
+        max_pages = max(max_pages, (cache_len + page_size - 1) // page_size)
+    chosen = 1
+    for bucket in buckets[1:]:
+        if max_pages >= bucket * min_pages_per_split:
+            chosen = bucket
+    return chosen
+
+
+def _validate_attention_inputs_against_plan(
+    *,
+    q_shape: tuple[int, ...],
+    k_shape: tuple[int, ...],
+    v_shape: tuple[int, ...],
+    device: torch.device,
+    dtype: torch.dtype,
+    plan: AttentionPlan,
+) -> None:
+    expected = (
+        plan.q_shape,
+        plan.k_shape,
+        plan.v_shape,
+        plan.device,
+        plan.dtype,
+    )
+    actual = (q_shape, k_shape, v_shape, device, dtype)
+    if expected != actual:
+        raise ValueError(
+            "attention plan mismatch: "
+            f"expected q/k/v/device/dtype={expected}, got {actual}"
+        )
+
+
+def _validate_paged_inputs_against_plan(
+    *,
+    q_shape: tuple[int, ...],
+    k_cache_shape: tuple[int, ...],
+    v_cache_shape: tuple[int, ...],
+    page_table_shape: tuple[int, ...],
+    cache_seqlens_shape: tuple[int, ...],
+    cu_seqlens_q_shape: tuple[int, ...],
+    device: torch.device,
+    dtype: torch.dtype,
+    plan: PagedAttentionPlan,
+) -> None:
+    expected = (
+        plan.q_shape,
+        plan.k_cache_shape,
+        plan.v_cache_shape,
+        plan.page_table_shape,
+        plan.cache_seqlens_shape,
+        plan.cu_seqlens_q_shape,
+        plan.device,
+        plan.dtype,
+    )
+    actual = (
+        q_shape,
+        k_cache_shape,
+        v_cache_shape,
+        page_table_shape,
+        cache_seqlens_shape,
+        cu_seqlens_q_shape,
+        device,
+        dtype,
+    )
+    if expected != actual:
+        raise ValueError(
+            "paged attention plan mismatch: "
+            f"expected q/k_cache/v_cache/page_table/cache_seqlens/cu_seqlens_q/device/dtype={expected}, "
+            f"got {actual}"
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class AttentionPlanKey:
+    q_shape: tuple[int, ...]
+    k_shape: tuple[int, ...]
+    v_shape: tuple[int, ...]
+    device_index: int
+    dtype: torch.dtype
+    causal: bool
+    tile_m: int
+    tile_n: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class PagedAttentionPlanKey:
+    q_shape: tuple[int, ...]
+    k_cache_shape: tuple[int, ...]
+    v_cache_shape: tuple[int, ...]
+    page_table_shape: tuple[int, ...]
+    cache_seqlens_shape: tuple[int, ...]
+    cu_seqlens_q_shape: tuple[int, ...]
+    device_index: int
+    dtype: torch.dtype
+    causal: bool
+    tile_m: int
+    tile_n: int
+    num_splits: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class AttentionPlan:
+    """Exact-shape launch contract for one contiguous attention shape."""
+
+    key: AttentionPlanKey
+    compiled: object = field(repr=False, compare=False)
+    cutlass_dtype: type[cutlass.Numeric] = field(repr=False, compare=False)
+
+    def __getattr__(self, name: str):
+        return getattr(self.key, name)
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device("cuda", self.key.device_index)
+
+
+@dataclass(frozen=True, kw_only=True)
+class PagedAttentionPlan:
+    """Exact-shape launch contract for one paged attention shape."""
+
+    key: PagedAttentionPlanKey
+    compiled: object = field(repr=False, compare=False)
+    cutlass_dtype: type[cutlass.Numeric] = field(repr=False, compare=False)
+
+    def __getattr__(self, name: str):
+        return getattr(self.key, name)
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device("cuda", self.key.device_index)
+
+
 @dataclass(kw_only=True)
 class AttentionWorkspace:
-    """Reusable exact-shape output buffers for `b12x_attention_forward`."""
+    """Reusable exact-shape output buffers for one contiguous attention plan."""
 
     q_shape: tuple[int, ...]
     k_shape: tuple[int, ...]
@@ -287,11 +453,12 @@ class AttentionWorkspace:
     tile_n: int
     output: torch.Tensor
     lse: torch.Tensor
+    plan_key: AttentionPlanKey | None = None
 
 
 @dataclass(kw_only=True)
 class PagedAttentionWorkspace:
-    """Reusable output buffers for one SGLang-style paged-attention launch shape."""
+    """Reusable output buffers for one paged attention plan."""
 
     q_shape: tuple[int, ...]
     k_cache_shape: tuple[int, ...]
@@ -307,6 +474,7 @@ class PagedAttentionWorkspace:
     lse: torch.Tensor
     split_output: torch.Tensor | None = None
     split_lse: torch.Tensor | None = None
+    plan_key: PagedAttentionPlanKey | None = None
 
 
 class _AttentionForwardLaunch:
@@ -522,7 +690,7 @@ class _PagedAttentionForwardLaunch:
 
 
 @functools.cache
-def _get_compiled_attention(
+def _compile_attention(
     q_shape: tuple[int, ...],
     k_shape: tuple[int, ...],
     v_shape: tuple[int, ...],
@@ -530,7 +698,6 @@ def _get_compiled_attention(
     causal: bool,
     tile_m: int,
     tile_n: int,
-    num_splits: int,
 ):
     cutlass_dtype = _torch_to_cutlass_dtype(dtype)
     launch = _AttentionForwardLaunch(
@@ -541,7 +708,6 @@ def _get_compiled_attention(
         causal=causal,
         tile_m=tile_m,
         tile_n=tile_n,
-        num_splits=num_splits,
     )
     return cute.compile(
         launch,
@@ -556,7 +722,7 @@ def _get_compiled_attention(
 
 
 @functools.cache
-def _get_compiled_paged_attention(
+def _compile_paged_attention(
     q_shape: tuple[int, ...],
     k_cache_shape: tuple[int, ...],
     v_cache_shape: tuple[int, ...],
@@ -598,50 +764,151 @@ def _get_compiled_paged_attention(
     )
 
 
+@functools.cache
+def _get_attention_plan(
+    q_shape: tuple[int, ...],
+    k_shape: tuple[int, ...],
+    v_shape: tuple[int, ...],
+    device_index: int,
+    dtype: torch.dtype,
+    causal: bool,
+    tile_m: int,
+    tile_n: int,
+) -> AttentionPlan:
+    return AttentionPlan(
+        key=AttentionPlanKey(
+            q_shape=q_shape,
+            k_shape=k_shape,
+            v_shape=v_shape,
+            device_index=device_index,
+            dtype=dtype,
+            causal=causal,
+            tile_m=tile_m,
+            tile_n=tile_n,
+        ),
+        compiled=_compile_attention(
+            q_shape,
+            k_shape,
+            v_shape,
+            dtype,
+            causal,
+            tile_m,
+            tile_n,
+        ),
+        cutlass_dtype=_torch_to_cutlass_dtype(dtype),
+    )
+
+
+@functools.cache
+def _get_paged_attention_plan(
+    q_shape: tuple[int, ...],
+    k_cache_shape: tuple[int, ...],
+    v_cache_shape: tuple[int, ...],
+    page_table_shape: tuple[int, ...],
+    cache_seqlens_shape: tuple[int, ...],
+    cu_seqlens_q_shape: tuple[int, ...],
+    device_index: int,
+    dtype: torch.dtype,
+    causal: bool,
+    tile_m: int,
+    tile_n: int,
+    num_splits: int,
+) -> PagedAttentionPlan:
+    return PagedAttentionPlan(
+        key=PagedAttentionPlanKey(
+            q_shape=q_shape,
+            k_cache_shape=k_cache_shape,
+            v_cache_shape=v_cache_shape,
+            page_table_shape=page_table_shape,
+            cache_seqlens_shape=cache_seqlens_shape,
+            cu_seqlens_q_shape=cu_seqlens_q_shape,
+            device_index=device_index,
+            dtype=dtype,
+            causal=causal,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            num_splits=num_splits,
+        ),
+        compiled=_compile_paged_attention(
+            q_shape,
+            k_cache_shape,
+            v_cache_shape,
+            page_table_shape,
+            cache_seqlens_shape,
+            cu_seqlens_q_shape,
+            dtype,
+            causal,
+            tile_m,
+            tile_n,
+            num_splits,
+        ),
+        cutlass_dtype=_torch_to_cutlass_dtype(dtype),
+    )
+
+
 def clear_attention_caches() -> None:
     """Clear global compile caches owned by the b12x attention integration."""
-    _get_compiled_attention.cache_clear()
-    _get_compiled_paged_attention.cache_clear()
+    _compile_attention.cache_clear()
+    _compile_paged_attention.cache_clear()
+    _get_attention_plan.cache_clear()
+    _get_paged_attention_plan.cache_clear()
 
 
 def _validate_workspace(
     workspace: AttentionWorkspace,
     *,
-    q_shape: tuple[int, ...],
-    k_shape: tuple[int, ...],
-    v_shape: tuple[int, ...],
-    device: torch.device,
-    dtype: torch.dtype,
-    causal: bool,
+    plan: AttentionPlan,
 ) -> None:
     expected = (
+        plan.q_shape,
+        plan.k_shape,
+        plan.v_shape,
+        plan.device,
+        plan.dtype,
+        plan.causal,
+        plan.tile_m,
+        plan.tile_n,
+    )
+    actual = (
         workspace.q_shape,
         workspace.k_shape,
         workspace.v_shape,
         workspace.device,
         workspace.dtype,
         workspace.causal,
+        workspace.tile_m,
+        workspace.tile_n,
     )
-    actual = (q_shape, k_shape, v_shape, device, dtype, causal)
     if expected != actual:
         raise ValueError(
             "workspace shape mismatch: "
-            f"expected q/k/v/device/dtype/causal={expected}, got {actual}"
+            f"expected q/k/v/device/dtype/causal/tile={expected}, got {actual}"
+        )
+    if workspace.plan_key is not None and workspace.plan_key != plan.key:
+        raise ValueError(
+            "workspace plan mismatch: "
+            f"expected {workspace.plan_key}, got {plan.key}"
         )
 
 
 def _validate_paged_workspace(
     workspace: PagedAttentionWorkspace,
     *,
-    q_shape: tuple[int, ...],
-    k_cache_shape: tuple[int, ...],
-    v_cache_shape: tuple[int, ...],
-    page_table_shape: tuple[int, ...],
-    device: torch.device,
-    dtype: torch.dtype,
-    causal: bool,
+    plan: PagedAttentionPlan,
 ) -> None:
     expected = (
+        plan.q_shape,
+        plan.k_cache_shape,
+        plan.v_cache_shape,
+        plan.page_table_shape,
+        plan.device,
+        plan.dtype,
+        plan.causal,
+        plan.tile_m,
+        plan.tile_n,
+        plan.num_splits,
+    )
+    actual = (
         workspace.q_shape,
         workspace.k_cache_shape,
         workspace.v_cache_shape,
@@ -649,20 +916,27 @@ def _validate_paged_workspace(
         workspace.device,
         workspace.dtype,
         workspace.causal,
+        workspace.tile_m,
+        workspace.tile_n,
+        workspace.num_splits,
     )
-    actual = (q_shape, k_cache_shape, v_cache_shape, page_table_shape, device, dtype, causal)
     if expected != actual:
         raise ValueError(
             "paged workspace shape mismatch: "
-            f"expected q/k_cache/v_cache/page_table/device/dtype/causal={expected}, got {actual}"
+            f"expected q/k_cache/v_cache/page_table/device/dtype/causal/tile/splits={expected}, got {actual}"
         )
     if workspace.num_splits < 1:
         raise ValueError(f"paged workspace num_splits must be >= 1, got {workspace.num_splits}")
-    if tuple(workspace.output.shape) != q_shape:
+    if workspace.plan_key is not None and workspace.plan_key != plan.key:
         raise ValueError(
-            f"paged workspace output shape mismatch: expected {q_shape}, got {tuple(workspace.output.shape)}"
+            "paged workspace plan mismatch: "
+            f"expected {workspace.plan_key}, got {plan.key}"
         )
-    expected_lse_shape = _paged_lse_storage_shape(q_shape)
+    if tuple(workspace.output.shape) != plan.q_shape:
+        raise ValueError(
+            f"paged workspace output shape mismatch: expected {plan.q_shape}, got {tuple(workspace.output.shape)}"
+        )
+    expected_lse_shape = _paged_lse_storage_shape(plan.q_shape)
     if tuple(workspace.lse.shape) != expected_lse_shape:
         raise ValueError(
             "paged workspace lse shape mismatch: "
@@ -672,8 +946,14 @@ def _validate_paged_workspace(
         if workspace.split_output is not None or workspace.split_lse is not None:
             raise ValueError("paged workspace with num_splits=1 must not carry split scratch buffers")
     else:
-        expected_split_output_shape = _split_paged_output_shape(q_shape, num_splits=workspace.num_splits)
-        expected_split_lse_shape = _split_paged_lse_storage_shape(q_shape, num_splits=workspace.num_splits)
+        expected_split_output_shape = _split_paged_output_shape(
+            plan.q_shape,
+            num_splits=workspace.num_splits,
+        )
+        expected_split_lse_shape = _split_paged_lse_storage_shape(
+            plan.q_shape,
+            num_splits=workspace.num_splits,
+        )
         if workspace.split_output is None or workspace.split_lse is None:
             raise ValueError("paged workspace with num_splits>1 requires split scratch buffers")
         if tuple(workspace.split_output.shape) != expected_split_output_shape:
@@ -688,104 +968,86 @@ def _validate_paged_workspace(
             )
 
 
-def _allocate_workspace(
-    *,
-    q_shape: tuple[int, ...],
-    k_shape: tuple[int, ...],
-    v_shape: tuple[int, ...],
-    device: torch.device,
-    dtype: torch.dtype,
-    causal: bool,
-    tile_m: int,
-    tile_n: int,
-) -> AttentionWorkspace:
-    output = torch.empty(q_shape, dtype=dtype, device=device)
-    lse = torch.empty(_lse_shape(q_shape), dtype=torch.float32, device=device)
+def allocate_attention_workspace_for_plan(plan: AttentionPlan) -> AttentionWorkspace:
+    """Allocate reusable scratch for one exact contiguous attention plan."""
+    output = torch.empty(plan.q_shape, dtype=plan.dtype, device=plan.device)
+    lse = torch.empty(_lse_shape(plan.q_shape), dtype=torch.float32, device=plan.device)
     return AttentionWorkspace(
-        q_shape=q_shape,
-        k_shape=k_shape,
-        v_shape=v_shape,
-        device=device,
-        dtype=dtype,
-        causal=causal,
-        tile_m=tile_m,
-        tile_n=tile_n,
+        q_shape=plan.q_shape,
+        k_shape=plan.k_shape,
+        v_shape=plan.v_shape,
+        device=plan.device,
+        dtype=plan.dtype,
+        causal=plan.causal,
+        tile_m=plan.tile_m,
+        tile_n=plan.tile_n,
         output=output,
         lse=lse,
+        plan_key=plan.key,
     )
 
 
-def _allocate_paged_workspace(
-    *,
-    q_shape: tuple[int, ...],
-    k_cache_shape: tuple[int, ...],
-    v_cache_shape: tuple[int, ...],
-    page_table_shape: tuple[int, ...],
-    device: torch.device,
-    dtype: torch.dtype,
-    causal: bool,
-    tile_m: int,
-    tile_n: int,
-    num_splits: int,
-) -> PagedAttentionWorkspace:
-    output = torch.empty(q_shape, dtype=dtype, device=device)
-    lse = torch.empty(_paged_lse_storage_shape(q_shape), dtype=torch.float32, device=device)
+def allocate_paged_attention_workspace_for_plan(plan: PagedAttentionPlan) -> PagedAttentionWorkspace:
+    """Allocate reusable scratch for one exact paged attention plan."""
+    output = torch.empty(plan.q_shape, dtype=plan.dtype, device=plan.device)
+    lse = torch.empty(_paged_lse_storage_shape(plan.q_shape), dtype=torch.float32, device=plan.device)
     split_output = None
     split_lse = None
-    if num_splits > 1:
+    if plan.num_splits > 1:
         split_output = torch.empty(
-            _split_paged_output_shape(q_shape, num_splits=num_splits),
-            dtype=dtype,
-            device=device,
+            _split_paged_output_shape(plan.q_shape, num_splits=plan.num_splits),
+            dtype=plan.dtype,
+            device=plan.device,
         )
         split_lse = torch.empty(
-            _split_paged_lse_storage_shape(q_shape, num_splits=num_splits),
+            _split_paged_lse_storage_shape(plan.q_shape, num_splits=plan.num_splits),
             dtype=torch.float32,
-            device=device,
+            device=plan.device,
         )
     return PagedAttentionWorkspace(
-        q_shape=q_shape,
-        k_cache_shape=k_cache_shape,
-        v_cache_shape=v_cache_shape,
-        page_table_shape=page_table_shape,
-        device=device,
-        dtype=dtype,
-        causal=causal,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        num_splits=num_splits,
+        q_shape=plan.q_shape,
+        k_cache_shape=plan.k_cache_shape,
+        v_cache_shape=plan.v_cache_shape,
+        page_table_shape=plan.page_table_shape,
+        device=plan.device,
+        dtype=plan.dtype,
+        causal=plan.causal,
+        tile_m=plan.tile_m,
+        tile_n=plan.tile_n,
+        num_splits=plan.num_splits,
         output=output,
         lse=lse,
         split_output=split_output,
         split_lse=split_lse,
+        plan_key=plan.key,
     )
 
 
-def allocate_attention_workspace(
+def create_attention_plan(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     *,
     causal: bool = True,
     tile_shape: tuple[int, int] | None = None,
-) -> AttentionWorkspace:
-    """Allocate one exact-shape workspace for `b12x_attention_forward`."""
+) -> AttentionPlan:
+    """Create one exact contiguous attention launch plan."""
     q_shape, k_shape, v_shape, device, dtype = _validate_forward_inputs(q, k, v)
     _, _, _, head_dim = _seq_dims(q_shape)
     tile_m, tile_n = tile_shape or _select_tile_shape(head_dim, causal=causal)
-    return _allocate_workspace(
-        q_shape=q_shape,
-        k_shape=k_shape,
-        v_shape=v_shape,
-        device=device,
-        dtype=dtype,
-        causal=causal,
-        tile_m=tile_m,
-        tile_n=tile_n,
+    return _get_attention_plan(
+        q_shape,
+        k_shape,
+        v_shape,
+        _cuda_device_index(device),
+        dtype,
+        causal,
+        tile_m,
+        tile_n,
     )
 
 
-def allocate_paged_attention_workspace(
+def create_paged_attention_plan(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -795,11 +1057,12 @@ def allocate_paged_attention_workspace(
     *,
     causal: bool = True,
     tile_shape: tuple[int, int] | None = None,
-    num_splits: int = 1,
-) -> PagedAttentionWorkspace:
-    """Allocate one exact workspace for the page-size-64 SGLang paged path."""
-    if num_splits < 1:
-        raise ValueError(f"num_splits must be >= 1, got {num_splits}")
+    num_splits: int | None = None,
+    split_buckets: tuple[int, ...] = _DEFAULT_PAGED_SPLIT_BUCKETS,
+    min_pages_per_split: int = _DEFAULT_MIN_PAGES_PER_SPLIT,
+) -> PagedAttentionPlan:
+    """Create one exact paged attention launch plan."""
+    buckets = _normalize_split_buckets(split_buckets)
     (
         q_shape,
         k_cache_shape,
@@ -824,24 +1087,85 @@ def allocate_paged_attention_workspace(
         cu_seqlens_q=cu_seqlens_q,
         causal=causal,
     )
+    if num_splits in (None, 0):
+        num_splits = choose_paged_attention_num_splits(
+            cache_seqlens,
+            page_size=page_size,
+            split_buckets=buckets,
+            min_pages_per_split=min_pages_per_split,
+        )
+    elif num_splits not in buckets:
+        raise ValueError(f"num_splits must be one of {buckets}, got {num_splits}")
     _, _, head_dim = q_shape
     tile_m, tile_n = tile_shape or _select_paged_tile_shape(
         head_dim,
         causal=causal,
         page_size=page_size,
     )
-    return _allocate_paged_workspace(
-        q_shape=q_shape,
-        k_cache_shape=k_cache_shape,
-        v_cache_shape=v_cache_shape,
-        page_table_shape=page_table_shape,
-        device=device,
-        dtype=dtype,
-        causal=causal,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        num_splits=num_splits,
+    return _get_paged_attention_plan(
+        q_shape,
+        k_cache_shape,
+        v_cache_shape,
+        page_table_shape,
+        tuple(int(dim) for dim in cache_seqlens.shape),
+        tuple(int(dim) for dim in cu_seqlens_q.shape),
+        _cuda_device_index(device),
+        dtype,
+        causal,
+        tile_m,
+        tile_n,
+        num_splits,
     )
+
+
+def allocate_attention_workspace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    causal: bool = True,
+    tile_shape: tuple[int, int] | None = None,
+) -> AttentionWorkspace:
+    """Allocate one exact-shape workspace for `b12x_attention_forward`."""
+    plan = create_attention_plan(
+        q,
+        k,
+        v,
+        causal=causal,
+        tile_shape=tile_shape,
+    )
+    return allocate_attention_workspace_for_plan(plan)
+
+
+def allocate_paged_attention_workspace(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    *,
+    causal: bool = True,
+    tile_shape: tuple[int, int] | None = None,
+    num_splits: int | None = None,
+    split_buckets: tuple[int, ...] = _DEFAULT_PAGED_SPLIT_BUCKETS,
+    min_pages_per_split: int = _DEFAULT_MIN_PAGES_PER_SPLIT,
+) -> PagedAttentionWorkspace:
+    """Allocate one exact workspace for the page-size-64 SGLang paged path."""
+    plan = create_paged_attention_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=causal,
+        tile_shape=tile_shape,
+        num_splits=num_splits,
+        split_buckets=split_buckets,
+        min_pages_per_split=min_pages_per_split,
+    )
+    return allocate_paged_attention_workspace_for_plan(plan)
 
 
 def _reduce_split_partials(workspace: PagedAttentionWorkspace) -> None:
@@ -861,18 +1185,32 @@ def b12x_attention_forward(
     v: torch.Tensor,
     *,
     workspace: AttentionWorkspace,
+    plan: AttentionPlan | None = None,
     softmax_scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Execute contiguous self-attention using the transplanted SM120 kernel."""
     q_shape, k_shape, v_shape, device, dtype = _validate_forward_inputs(q, k, v)
-    _validate_workspace(
-        workspace,
+    resolved_plan = plan or _get_attention_plan(
+        q_shape,
+        k_shape,
+        v_shape,
+        _cuda_device_index(workspace.device),
+        workspace.dtype,
+        workspace.causal,
+        workspace.tile_m,
+        workspace.tile_n,
+    )
+    _validate_attention_inputs_against_plan(
         q_shape=q_shape,
         k_shape=k_shape,
         v_shape=v_shape,
         device=device,
         dtype=dtype,
-        causal=workspace.causal,
+        plan=resolved_plan,
+    )
+    _validate_workspace(
+        workspace,
+        plan=resolved_plan,
     )
     _, seqlen_q, _, head_dim = _seq_dims(q_shape)
     _, seqlen_k, _, _ = _seq_dims(k_shape)
@@ -880,25 +1218,20 @@ def b12x_attention_forward(
         raise ValueError(
             "b12x attention does not currently support the single-token single-key corner "
             "(seqlen_q=1, seqlen_k=1)"
-        )
+    )
     if softmax_scale is None:
         softmax_scale = head_dim ** -0.5
 
-    compiled = _get_compiled_attention(
-        workspace.q_shape,
-        workspace.k_shape,
-        workspace.v_shape,
-        workspace.dtype,
-        workspace.causal,
-        workspace.tile_m,
-        workspace.tile_n,
-    )
-    cutlass_dtype = _torch_to_cutlass_dtype(dtype)
-    compiled(
-        make_ptr(cutlass_dtype, q.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass_dtype, k.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass_dtype, v.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass_dtype, workspace.output.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+    resolved_plan.compiled(
+        make_ptr(resolved_plan.cutlass_dtype, q.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(resolved_plan.cutlass_dtype, k.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(resolved_plan.cutlass_dtype, v.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(
+            resolved_plan.cutlass_dtype,
+            workspace.output.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
         make_ptr(cutlass.Float32, workspace.lse.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         float(softmax_scale),
         current_cuda_stream(),
@@ -915,6 +1248,7 @@ def b12x_paged_attention_forward(
     cu_seqlens_q: torch.Tensor,
     *,
     workspace: PagedAttentionWorkspace,
+    plan: PagedAttentionPlan | None = None,
     softmax_scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Execute the page-size-64 SGLang paged path with true in-kernel paged loads."""
@@ -934,15 +1268,34 @@ def b12x_paged_attention_forward(
         cache_seqlens,
         cu_seqlens_q,
     )
-    _validate_paged_workspace(
-        workspace,
+    resolved_plan = plan or _get_paged_attention_plan(
+        q_shape,
+        workspace.k_cache_shape,
+        workspace.v_cache_shape,
+        workspace.page_table_shape,
+        tuple(int(dim) for dim in cache_seqlens.shape),
+        tuple(int(dim) for dim in cu_seqlens_q.shape),
+        _cuda_device_index(workspace.device),
+        workspace.dtype,
+        workspace.causal,
+        workspace.tile_m,
+        workspace.tile_n,
+        workspace.num_splits,
+    )
+    _validate_paged_inputs_against_plan(
         q_shape=q_shape,
         k_cache_shape=k_cache_shape,
         v_cache_shape=v_cache_shape,
         page_table_shape=page_table_shape,
+        cache_seqlens_shape=tuple(int(dim) for dim in cache_seqlens.shape),
+        cu_seqlens_q_shape=tuple(int(dim) for dim in cu_seqlens_q.shape),
         device=device,
         dtype=dtype,
-        causal=workspace.causal,
+        plan=resolved_plan,
+    )
+    _validate_paged_workspace(
+        workspace,
+        plan=resolved_plan,
     )
     if workspace.tile_n != page_size:
         raise ValueError(
@@ -951,29 +1304,20 @@ def b12x_paged_attention_forward(
     if softmax_scale is None:
         softmax_scale = q_shape[2] ** -0.5
 
-    compiled = _get_compiled_paged_attention(
-        workspace.q_shape,
-        workspace.k_cache_shape,
-        workspace.v_cache_shape,
-        workspace.page_table_shape,
-        tuple(int(dim) for dim in cache_seqlens.shape),
-        tuple(int(dim) for dim in cu_seqlens_q.shape),
-        workspace.dtype,
-        workspace.causal,
-        workspace.tile_m,
-        workspace.tile_n,
-        workspace.num_splits,
-    )
-    cutlass_dtype = _torch_to_cutlass_dtype(dtype)
     kernel_output = workspace.output if workspace.num_splits == 1 else workspace.split_output
     kernel_lse = workspace.lse if workspace.num_splits == 1 else workspace.split_lse
     assert kernel_output is not None
     assert kernel_lse is not None
-    compiled(
-        make_ptr(cutlass_dtype, q.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass_dtype, k_cache.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass_dtype, v_cache.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass_dtype, kernel_output.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+    resolved_plan.compiled(
+        make_ptr(resolved_plan.cutlass_dtype, q.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(resolved_plan.cutlass_dtype, k_cache.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(resolved_plan.cutlass_dtype, v_cache.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(
+            resolved_plan.cutlass_dtype,
+            kernel_output.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
         make_ptr(cutlass.Float32, kernel_lse.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, cu_seqlens_q.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, cache_seqlens.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
@@ -987,11 +1331,20 @@ def b12x_paged_attention_forward(
 
 
 __all__ = [
+    "AttentionPlan",
+    "AttentionPlanKey",
     "AttentionWorkspace",
+    "PagedAttentionPlan",
+    "PagedAttentionPlanKey",
     "PagedAttentionWorkspace",
     "allocate_attention_workspace",
+    "allocate_attention_workspace_for_plan",
     "allocate_paged_attention_workspace",
+    "allocate_paged_attention_workspace_for_plan",
     "b12x_attention_forward",
     "b12x_paged_attention_forward",
+    "choose_paged_attention_num_splits",
     "clear_attention_caches",
+    "create_attention_plan",
+    "create_paged_attention_plan",
 ]

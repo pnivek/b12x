@@ -5,11 +5,13 @@ import torch
 
 from b12x.attention.reference import attention_reference, paged_attention_reference
 from b12x.integration.attention import (
-    allocate_attention_workspace,
-    allocate_paged_attention_workspace,
+    allocate_attention_workspace_for_plan,
+    allocate_paged_attention_workspace_for_plan,
     b12x_attention_forward,
     b12x_paged_attention_forward,
     clear_attention_caches,
+    create_attention_plan,
+    create_paged_attention_plan,
 )
 
 from .helpers import require_sm120
@@ -30,14 +32,15 @@ def test_contiguous_attention_replays_under_cuda_graph() -> None:
     q = torch.randn(1, 48, 8, 256, device="cuda", dtype=torch.bfloat16) / 4
     k = torch.randn(1, 48, 1, 256, device="cuda", dtype=torch.bfloat16) / 4
     v = torch.randn(1, 48, 1, 256, device="cuda", dtype=torch.bfloat16) / 4
-    workspace = allocate_attention_workspace(q, k, v, causal=True)
+    plan = create_attention_plan(q, k, v, causal=True)
+    workspace = allocate_attention_workspace_for_plan(plan)
 
-    b12x_attention_forward(q, k, v, workspace=workspace)
+    b12x_attention_forward(q, k, v, workspace=workspace, plan=plan)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        b12x_attention_forward(q, k, v, workspace=workspace)
+        b12x_attention_forward(q, k, v, workspace=workspace, plan=plan)
 
     graph.replay()
     torch.cuda.synchronize()
@@ -60,7 +63,7 @@ def test_paged_attention_replays_under_cuda_graph_with_dynamic_metadata(num_spli
         page_size=64,
         seed=73,
     )
-    workspace = allocate_paged_attention_workspace(
+    plan = create_paged_attention_plan(
         q,
         k_cache,
         v_cache,
@@ -70,6 +73,7 @@ def test_paged_attention_replays_under_cuda_graph_with_dynamic_metadata(num_spli
         causal=True,
         num_splits=num_splits,
     )
+    workspace = allocate_paged_attention_workspace_for_plan(plan)
 
     b12x_paged_attention_forward(
         q,
@@ -79,6 +83,7 @@ def test_paged_attention_replays_under_cuda_graph_with_dynamic_metadata(num_spli
         cache_seqlens,
         cu_seqlens_q,
         workspace=workspace,
+        plan=plan,
     )
     torch.cuda.synchronize()
 
@@ -92,6 +97,7 @@ def test_paged_attention_replays_under_cuda_graph_with_dynamic_metadata(num_spli
             cache_seqlens,
             cu_seqlens_q,
             workspace=workspace,
+            plan=plan,
         )
 
     ref_out_1, ref_lse_1 = paged_attention_reference(

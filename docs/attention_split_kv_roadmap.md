@@ -1,334 +1,577 @@
-# SM120 Paged Attention Roadmap
+# SM120 Paged Attention: Planner Roadmap
 
 ## Goal
 
-Build a real serving-grade SM120 paged-attention path in `b12x` for the Qwen-style full-attention case:
+Build a serving-grade SM120 paged-attention backend in `b12x` for the real Qwen full-attention path:
 
 - causal self-attention
 - `page_size=64`
 - `8q:1kv` GQA
 - `d=256`
 - `bf16` Q/K/V first
-- CUDA-graph-friendly
+- `fp8` KV later
+- CUDA-graph-first
 
-The immediate objective is to fix long-context scaling. The current kernel is correct, but structurally under-parallelized for this serving path.
+This backend should be shaped like a serving system, not like a generic attention library API.
 
-## Real Shape To Optimize
+## Current State
 
-Observed in SGLang/FlashInfer for Qwen TP=4:
+The current `b12x` paged path is mathematically correct and already has a working split-KV prototype, but it is still materially behind FlashInfer `fa2` on the long-context Qwen matrix.
 
-- `q_shape=(48, 8, 256)`
-- `k_cache_shape=(num_slots, 1, 256)` in the flat FlashInfer pool view
-- `v_cache_shape=(num_slots, 1, 256)`
-- `tp_q_heads=8`
-- `tp_k_heads=1`
-- `q_per_kv=8`
-- causal
-- `bf16` Q
-- `fp8` KV in production, but `bf16` KV is milestone 1
+Current best observed policy from the benchmark:
 
-For `b12x`, the first serving contract is:
+- use `num_splits=1` for `k <= 512`
+- use `num_splits=4` for `k >= 2048`
+
+Even with that oracle policy, `b12x` is still about `2.09x` slower than `fa2` geomean-wise on the graph-captured Qwen-like benchmark.
+
+That means the architecture is pointed in the right direction, but the runtime/kernel contract is still one generation behind a mature serving backend.
+
+## Synthesis
+
+The correct course is:
+
+- take FA2 as the runtime donor
+- take FA4 as the kernel-structure donor
+- follow the researcher’s implementation order
+
+### What FA2 Contributes
+
+FA2, as exposed through FlashInfer, provides the right serving shape:
+
+- explicit planner / wrapper state
+- exact workspace ownership
+- separate decode and prefill-or-extend surfaces
+- split-KV as a first-class serving knob
+- CUDA-graph-aware capture buckets
+
+That is the right runtime model for `b12x`.
+
+### What FA4 Contributes
+
+FA4 contributes the right internal kernel organization:
+
+- packed GQA as an internal layout
+- in-kernel paged KV addressing
+- factored scheduler / block-range / masking logic
+- partial-output plus combine-kernel structure for split attention
+
+That is the right kernel model for `b12x`.
+
+Important nuance:
+
+- SM90 FA4 is the donor for general kernel organization and packed GQA
+- SM100 FA4 is the better donor for split-KV plus combine behavior
+- the generic FA4 `interface.py` is not the runtime model to copy
+
+### What The Research Guidance Contributes
+
+The researcher’s order of operations is the right one:
+
+1. split-KV first
+2. split-bucket planner second
+3. decode-specialized kernel third
+4. constant-factor retuning after that
+
+That ordering should be preserved.
+
+## SM120 Interpretation
+
+The runtime must respect what SM120 is actually good at:
+
+- use TMA as the normal transport mechanism for paged KV
+- treat `page_size=64` as the primary serving contract
+- preserve packed GQA inside the CTA so one CTA can reuse one K/V stream for the whole `8q:1kv` group
+- use warp-level MMA and the existing producer / consumer kernel structure as the main compute template
+- avoid host-side gather bridges and host-side control flow inside captured regions
+
+The two important consequences are:
+
+- the planner should own split policy and workspace shape
+- the kernel should not infer launch semantics from packed tensor layout
+
+## Decisions Already Made
+
+These are now part of the intended design and should not be revisited casually:
+
+- keep packed GQA as the intra-CTA representation
+- do not recover parallelism by disabling packed GQA
+- support `page_size=64` first and reject other page sizes in the primary path
+- support `bf16` KV first and add `fp8` KV only after the serving architecture is stable
+- use true in-kernel paged loads only
+- use discrete split buckets, not one graph with masked-off work
+- reject unrealistic corner cases instead of graph-hostile host workarounds
+
+## Non-Goals
+
+These are explicitly out of scope for the first serving-grade path:
+
+- generic FlashAttention compatibility
+- training and backward
+- arbitrary page sizes
+- dense non-causal attention as the primary optimization target
+- local attention, block sparsity, `score_mod`, `mask_mod`, or learnable sinks
+- split-KV only in eager mode
+- page-gather fallback paths for graph mode
+
+## Real Serving Contract
+
+The runtime contract should be narrow and explicit:
 
 - `q: [total_q, q_heads, d]`
-- `k_cache, v_cache: [num_pages, page_size, kv_heads, d]`
+- `k_cache: [num_pages, page_size, kv_heads, d]`
+- `v_cache: [num_pages, page_size, kv_heads, d]`
 - `page_table: [batch, max_pages_per_request]`
 - `cache_seqlens: [batch]`
 - `cu_seqlens_q: [batch + 1]`
+- `workspace: exact-shape caller-owned buffers`
+- `plan: exact-shape runtime policy and launch contract`
 
-## Current Diagnosis
+The primary shape buckets are:
 
-The current paged kernel loses badly to FlashInfer `fa2` once context grows because:
+- decode: `q_len = 1`
+- extend: `q_len` small, with Qwen-like observed `q_len = 6`
 
-1. Packed GQA collapses control-plane head parallelism.
-2. There is no split-KV / split-K support.
-3. Decode shares the same prefill-style paged kernel shape.
+## What A Planner Means Here
 
-That combination leaves too few CTAs, and each CTA serially walks all K/V pages.
+The planner turns a serving problem description into a reusable launch contract.
 
-Relevant files:
+The planner should decide:
 
-- [forward.py](/home/luke/projects/b12x-research/rs-9/b12x/attention/forward.py)
-- [block_info.py](/home/luke/projects/b12x-research/rs-9/b12x/attention/block_info.py)
-- [tile_scheduler.py](/home/luke/projects/b12x-research/rs-9/b12x/attention/tile_scheduler.py)
-- [attention.py](/home/luke/projects/b12x-research/rs-9/b12x/integration/attention.py)
-- [benchmark_paged_attention.py](/home/luke/projects/b12x-research/rs-9/benchmarks/benchmark_paged_attention.py)
+- which kernel family to use
+- which tile family to use
+- which split bucket to use
+- which scratch buffers are required
+- which metadata tensors must exist
+- which launch dimensions are fixed for capture
 
-## Local Donors Inside `b12x`
+The planner should not do per-token or per-request work inside the captured region. The planner should instead freeze structure once and leave only metadata updates for replay.
 
-The MoE path already has mature patterns that should be reused where they fit:
+### Planner Inputs
 
-- exact workspace and workspace-pool contract:
-  - [tp_moe.py](/home/luke/projects/b12x-research/rs-9/b12x/integration/tp_moe.py)
-- graph-capture safety tests and caller-owned output discipline:
-  - [test_tp_moe_workspace_api.py](/home/luke/projects/b12x-research/rs-9/tests/test_tp_moe_workspace_api.py)
-- graph replay equivalence under changing inputs:
-  - [test_moe_equivalence.py](/home/luke/projects/b12x-research/rs-9/tests/test_moe_equivalence.py)
-- multi-layer workspace and graph helper patterns:
-  - [benchmark_moe.py](/home/luke/projects/b12x-research/rs-9/benchmarks/benchmark_moe.py)
+- mode: decode or extend
+- `bs`
+- `max_q`
+- `max_k`
+- `num_q_heads`
+- `num_kv_heads`
+- `head_dim`
+- `page_size`
+- dtypes
+- causal flag
+- graph mode flag
 
-These are the preferred local examples for:
+### Planner Outputs
 
-- exact-shape workspace allocation
-- workspace pools for non-graph flows
-- caller-owned output buffers for graph capture
-- capture/replay correctness tests
-- reusable benchmark harness structure
+- kernel family identifier
+- tile config
+- split bucket
+- exact output and LSE shapes
+- exact partial-output and partial-LSE shapes
+- exact reducer scratch shapes
+- exact metadata buffer shapes
+- compile key / cached executable selection
 
-## Guardrails
+### Suggested `b12x` Objects
 
-These are intentional constraints for the next phase:
+- `AttentionPlanKey`
+- `AttentionPlan`
+- `AttentionWorkspace`
+- `AttentionWorkspacePool`
+- `AttentionPlanCache`
 
-- Keep packed GQA as the intra-CTA representation.
-- Do not derive scheduler semantics from packed tensor shape.
-- Do not start by disabling packed GQA to recover head parallelism.
-- Do not start with a new scheduler; the existing split plumbing is already close.
-- Do not spend the first cycle on `Q_in_regs`, `num_stages=2`, or tile retuning. Those may help constants, but not the slope.
-- Do not build graph support around masked-off work inside one capture. Use discrete split buckets.
+The separation should mirror the mature MoE path:
 
-## Phase 0: Freeze The Baseline
+- workspaces own buffers
+- plans own policy and launch structure
+- pools cache exact-shape workspaces
+- runtime entrypoints resolve a plan plus a workspace and then run
 
-### TODO
+## Proposed Runtime Shape
 
-- Preserve the current benchmark as the baseline comparator.
-- Keep FlashInfer `fa2` comparison in [benchmark_paged_attention.py](/home/luke/projects/b12x-research/rs-9/benchmarks/benchmark_paged_attention.py).
-- Keep graph-capture + `100x` replay timing as the standard method.
-- Keep the Qwen-like matrix:
+The planner-backed runtime should expose two serving surfaces:
+
+- `paged_decode(...)`
+- `paged_extend(...)`
+
+Each surface should have:
+
+- an eager path
+- a graph-capture path
+- a graph-replay path
+
+Each surface should use the same underlying concepts:
+
+- exact-shape workspaces
+- split buckets
+- compiled kernels cached by specialization key
+- graph-stable metadata updates
+
+## Proposed Kernel Families
+
+### Family A: Main Paged Kernel
+
+Purpose:
+
+- extend
+- decode fallback
+- shared serving kernel for larger packed-M
+
+Characteristics:
+
+- TMA paged loads
+- packed GQA
+- split-KV support
+- writes either final output or split partials
+
+This is the direct evolution of the current `forward.py` kernel.
+
+### Family B: Combine Kernel
+
+Purpose:
+
+- reduce split partial outputs
+
+Characteristics:
+
+- compiled kernel, not Python/Torch reduction
+- consumes partial `O_i` and `LSE_i`
+- produces final `O` and `LSE`
+
+This should follow the FA4 split-combine idea, but be implemented in the `b12x` runtime style.
+
+### Family C: Decode Micro-M Kernel
+
+Purpose:
+
+- optimize `q_len=1`
+
+Characteristics:
+
+- smaller effective M
+- separate warp partitioning
+- separate producer / consumer balance
+- same paged-KV and split-KV planner contract
+
+This should be added after split-KV and the planner are stable.
+
+## Immediate Problems To Solve
+
+### Problem 1: Plannerless Runtime
+
+Right now the runtime still mixes:
+
+- structural decisions
+- workspace allocation logic
+- split policy
+- metadata handling
+- launch
+
+That is the main architectural gap relative to FA2.
+
+### Problem 2: Split-KV Still Uses A Runtime-Level Reducer
+
+The current split prototype proves the architecture, but the reduction still lives in the integration layer rather than as a compiled kernel. That is a useful prototype, not the end state.
+
+### Problem 3: Decode Still Shares The Extend Kernel Family
+
+This keeps the architecture simple, but it is not the final performance shape for `q_len=1`.
+
+## Roadmap
+
+## Phase 0: Stabilize The Current Baseline
+
+Objective:
+
+- lock the current benchmark, correctness tests, and split prototype in place
+
+TODO:
+
+- keep the FlashInfer `fa2` comparison in `benchmarks/benchmark_paged_attention.py`
+- keep graph-capture plus `100x` replay as the benchmark method
+- keep the Qwen-like matrix:
   - `bs=8`
   - `q in {1, 6}`
   - `k in {64, 512, 2048, 8192}`
   - `page_size=64`
   - `8q:1kv`
   - `d=256`
+- fix any new regressions in the contiguous runtime path before attention work fans out further
 
-### Exit Criteria
+Exit criteria:
 
-- Benchmark stays runnable on `CUDA_VISIBLE_DEVICES=7`.
-- We can compare every architectural change against the same graph-captured matrix.
+- the benchmark remains stable and reproducible on `CUDA_VISIBLE_DEVICES=7`
+- paged correctness and graph tests remain green
 
-## Phase 1: Clean Up The Control Plane
+## Phase 1: Introduce The Planner Layer
 
-Objective: make runtime scheduling reason about logical work, not packed storage layout.
+Objective:
 
-### TODO
+- separate structural decisions from per-call execution
 
-- Introduce explicit logical scheduler quantities in [forward.py](/home/luke/projects/b12x-research/rs-9/b12x/attention/forward.py):
+TODO:
+
+- define `AttentionPlanKey`, `AttentionPlan`, `AttentionWorkspace`, and `AttentionWorkspacePool`
+- refactor `b12x/integration/attention.py` so entrypoints resolve:
+  - plan
+  - workspace
+  - metadata views
+  - compiled kernels
+- make exact-shape workspaces explicit and caller-owned for graph mode
+- mirror the local MoE ownership discipline instead of FA-style implicit allocations
+- move split policy selection out of the raw launch path and into the plan
+
+File touchpoints:
+
+- `b12x/integration/attention.py`
+- `b12x/integration/tp_moe.py` as the local donor
+- tests under `tests/`
+
+Exit criteria:
+
+- workspace and plan are distinct objects
+- graph capture no longer depends on implicit allocation paths
+- launch code consumes a pre-resolved plan instead of deciding everything inline
+
+## Phase 2: Finish The Control-Plane Cleanup
+
+Objective:
+
+- make scheduling use logical work dimensions, not packed storage layout
+
+TODO:
+
+- compute scheduler quantities from explicit logical values:
   - `num_kv_heads`
   - `qhead_per_kvhead`
-  - `logical_q_rows = q_len * qhead_per_kvhead`
-  - `num_m_blocks = ceil_div(logical_q_rows, tile_m)`
-- Stop deriving scheduler `num_head` and related control-plane values from packed `mQ.shape`.
-- Keep `pack_gqa_layout(...)` as a layout transform only.
-- Audit every use of packed shapes in scheduling, tile selection, and block-range logic.
+  - `logical_q_rows`
+  - `logical_num_m_blocks`
+- audit every place where packed tensor shapes leak into launch semantics
+- keep `pack_gqa_layout(...)` purely as a layout transform
 
-### File Touchpoints
+File touchpoints:
 
-- [forward.py](/home/luke/projects/b12x-research/rs-9/b12x/attention/forward.py)
-- [pack_gqa.py](/home/luke/projects/b12x-research/rs-9/b12x/attention/pack_gqa.py)
-- [tile_scheduler.py](/home/luke/projects/b12x-research/rs-9/b12x/attention/tile_scheduler.py)
+- `b12x/attention/forward.py`
+- `b12x/attention/pack_gqa.py`
+- `b12x/attention/tile_scheduler.py`
 
-### Exit Criteria
+Exit criteria:
 
-- Scheduler arguments are built from explicit logical values.
-- Packed GQA no longer implicitly changes launch semantics except where intended.
-- Existing correctness tests still pass.
+- packed GQA no longer silently changes control-plane head cardinality
+- split heuristics and decode-vs-extend logic can reason in logical units
 
-## Phase 2: Enable Split-KV In The Existing Kernel
+## Phase 3: Convert Split-KV From Prototype To Planned Feature
 
-Objective: unlock N/page parallelism without rewriting the scheduler.
+Objective:
 
-### TODO
+- make split-KV a first-class planner choice
 
-- Add runtime `num_splits` to the paged public API in [attention.py](/home/luke/projects/b12x-research/rs-9/b12x/integration/attention.py).
-- Plumb `num_splits` into `TileSchedulerArguments` in [forward.py](/home/luke/projects/b12x-research/rs-9/b12x/attention/forward.py).
-- Set `is_split_kv = (num_splits > 1)`.
-- Stop hardcoding `num_splits=1`.
-- Pass split mode into `BlockInfo(...)` instead of hardcoding `False`.
-- In both load and MMA paths, unpack and use `split_idx` from `work_tile.tile_idx`.
-- Thread `split_idx` and `num_splits` into `get_n_block_min_max(...)`.
+TODO:
 
-### File Touchpoints
+- keep the existing split partitioning logic in `block_info.py`
+- define split buckets in the planner, starting with `{1, 2, 4, 8}`
+- store split bucket in the plan
+- make workspace sizing depend on split bucket
+- ensure graph capture is done separately per split bucket
+- remove any assumption that one workspace shape can cover all split counts in one graph
 
-- [attention.py](/home/luke/projects/b12x-research/rs-9/b12x/integration/attention.py)
-- [forward.py](/home/luke/projects/b12x-research/rs-9/b12x/attention/forward.py)
-- [block_info.py](/home/luke/projects/b12x-research/rs-9/b12x/attention/block_info.py)
+File touchpoints:
 
-### Exit Criteria
+- `b12x/integration/attention.py`
+- `b12x/attention/forward.py`
+- `b12x/attention/block_info.py`
 
-- Kernel launches with `num_splits > 1`.
-- Different splits cover different K/V page ranges.
-- Split and non-split modes match numerically after reduction.
+Exit criteria:
 
-## Phase 3: Implement Split Range Partitioning In `BlockInfo`
+- split bucket is a plan property, not an ad hoc runtime override
+- split and non-split paths share one serving contract
+- graph capture works cleanly for each supported bucket
 
-Objective: keep causal semantics correct while partitioning page work across splits.
+## Phase 4: Add A Compiled Combine Kernel
 
-### TODO
+Objective:
 
-- Implement real split-aware range selection in [block_info.py](/home/luke/projects/b12x-research/rs-9/b12x/attention/block_info.py).
-- Start from the global masked range, then carve out a split-local subrange.
-- Use contiguous chunks in reversed page order so split 0 gets the newest pages first.
-- Keep descending local `n_block` traversal within each split.
+- replace the runtime-level reduction with a true kernel stage
 
-Recommended first partition:
+TODO:
 
-```python
-global_min, global_max = masked_range(...)
-tiles = global_max - global_min
-chunk = ceil_div(tiles, num_splits)
+- define a compiled combine kernel for partial `O_i` and `LSE_i`
+- preserve the current per-split state contract if finalized `LSE` is sufficient
+- otherwise expose the minimum additional state needed for exact reduction
+- make combine part of the plan:
+  - no combine if `num_splits == 1`
+  - launch combine if `num_splits > 1`
 
-split_max = global_max - split_idx * chunk
-split_min = max(global_min, split_max - chunk)
-```
+File touchpoints:
 
-### Exit Criteria
+- `b12x/attention/forward.py`
+- `b12x/attention/softmax.py`
+- `b12x/integration/attention.py`
+- new combine-kernel file if needed
 
-- Causal masking still behaves correctly on right-aligned serving shapes.
-- Splits cover the global valid range exactly once with no gaps or overlap bugs.
-- Existing paged reference tests can be extended to split mode and pass.
+Exit criteria:
 
-## Phase 4: Add A Two-Pass Split Reducer
+- no Python/Torch reduction remains on the critical path
+- split combine is capture-safe
+- split-KV becomes a fully compiled path
 
-Objective: get a correct prototype quickly without disturbing the online-softmax kernel math.
+## Phase 5: Add Split-Bucket Heuristics
 
-### TODO
+Objective:
 
-- Add scratch buffers for per-split partial output and per-split LSE.
-- Pass 1:
-  - each split computes attention over only its assigned page range
-  - write `O_i` and `LSE_i` to scratch
-- Pass 2:
-  - reduce splits per row
-  - first attempt reducer formula:
+- choose split count in a way that matches serving and CUDA graph requirements
 
-```python
-LSE = logsumexp_i(LSE_i)
-O = Σ_i exp(LSE_i - LSE) * O_i
-```
+TODO:
 
-- Verify whether current `mLSE` is finalized row log-sum-exp after `Softmax.finalize()`.
-- If not, expose the right reduction state instead, such as `(m_i, l_i)` or unnormalized partial output.
+- implement a first page-count heuristic
+- implement a second occupancy-oriented heuristic if needed
+- choose the smallest power-of-two split count that creates enough CTAs while keeping enough pages per split
+- keep the heuristic planner-only and graph-safe
 
-### File Touchpoints
+Suggested first rule:
 
-- [forward.py](/home/luke/projects/b12x-research/rs-9/b12x/attention/forward.py)
-- [softmax.py](/home/luke/projects/b12x-research/rs-9/b12x/attention/softmax.py)
-- [attention.py](/home/luke/projects/b12x-research/rs-9/b12x/integration/attention.py)
-- tests under [tests](/home/luke/projects/b12x-research/rs-9/tests)
+- small page counts stay on `1`
+- medium page counts move to `2`
+- long page counts move to `4`
+- very long page counts can move to `8`
 
-### Exit Criteria
+Exit criteria:
 
-- Split and non-split outputs agree within current tolerances.
-- Reducer works under graph capture.
-- Benchmark shows the long-context slope improves materially.
+- short-context latency does not regress like forced split `4`
+- long-context slope improves materially over split `1`
+- split selection is deterministic from static inputs
 
-## Phase 5: Make Split Selection Graph-Safe
+## Phase 6: Add A Decode-Specialized Kernel Family
 
-Objective: choose split count without introducing graph-hostile control flow.
+Objective:
 
-### TODO
+- stop forcing `q_len=1` through a shared extend-oriented kernel shape
 
-- Add discrete split buckets, starting with `{1, 2, 4, 8}`.
-- Capture separate graphs per split bucket.
-- Use a simple first heuristic based on page count.
-- Second heuristic, if needed:
-  - choose the smallest power-of-two split count that gets total CTAs high enough
-  - keep a minimum number of pages per split so reduction overhead does not dominate
-- Reject or fall back for unsupported split choices rather than masking work inside one graph.
+TODO:
 
-### File Touchpoints
+- define a separate decode kernel family with smaller effective M
+- keep the same planner contract and same workspace discipline
+- let the planner choose between:
+  - main paged kernel
+  - decode micro-M kernel
+- keep the combine contract shared if possible
 
-- [attention.py](/home/luke/projects/b12x-research/rs-9/b12x/integration/attention.py)
-- future SGLang backend shim under [b12x/sglang](/home/luke/projects/b12x-research/rs-9/b12x/sglang)
+Exit criteria:
 
-### Exit Criteria
+- decode outperforms the main paged kernel on `q_len=1`
+- extend remains on the main kernel unless data justifies a second extend family
 
-- Capture and replay work for each split bucket.
-- Runtime chooses a bucket deterministically from static inputs.
-- No graph-time host control flow is required inside the captured region.
+## Phase 7: Tune Constants Only After The Architecture Stabilizes
 
-## Phase 6: Add Focused Tests
+Objective:
 
-Objective: keep the new architecture correct while it evolves.
+- reduce constants after the main slope problem is solved
 
-### TODO
+TODO:
 
-- Add split-KV correctness tests for paged causal attention.
-- Add cases for:
-  - decode `q=1`
-  - extend `q=6`
-  - `k in {64, 512, 2048, 8192}`
-  - `num_splits in {1, 2, 4, 8}`
-- Add graph-capture tests for the supported split buckets.
-- Keep the existing FlashInfer comparison benchmark as the performance regression test.
+- test `Q_in_regs=True` on the serving path
+- test `num_stages=2` for paged KV
+- re-evaluate tile choices after split buckets and decode specialization are in place
+- profile producer / consumer utilization with the new split policy
 
-### Exit Criteria
+Exit criteria:
 
-- Tests catch split-range bugs, reduction bugs, and graph incompatibilities.
-- Benchmarks report both absolute timings and `fa2/b12x` ratio on the Qwen matrix.
+- improvements stack on top of the split-KV slope improvement
+- no regression in graph capture or correctness
 
-## Phase 7: Only Then Tune Constants
+## Phase 8: Build The SGLang Backend Shim
 
-Objective: improve constants after the architecture is fixed.
+Objective:
 
-### TODO
+- connect the planner-backed `b12x` runtime to SGLang without waiting for generic API changes
 
-- Evaluate `Q_in_regs=True` on the paged serving path.
-- Evaluate `num_stages=2` for paged K/V.
-- Re-check tile choices after split-KV is working.
-- Re-run the full graph-captured benchmark matrix after every tuning change.
+TODO:
 
-### Exit Criteria
+- implement a dedicated SGLang attention backend for `b12x`
+- use SGLang’s existing backend lifecycle:
+  - `init_cuda_graph_state(...)`
+  - `init_forward_metadata(...)`
+  - `init_forward_metadata_capture_cuda_graph(...)`
+  - `init_forward_metadata_replay_cuda_graph(...)`
+- let the `b12x` backend own its internal planner
+- keep fallback to FlashInfer for unsupported cases
 
-- Improvements show up as better constants on top of the improved split-KV slope.
-- No regression on correctness or graph capture.
+The key point:
 
-## Phase 8: Decode-Specialized Kernel Family
+- SGLang does not provide a generic planner abstraction
+- `b12x` should therefore bring its own planner and expose it through SGLang’s metadata-oriented backend interface
 
-Objective: optimize the `q=1` fast path after the split-KV architecture is in place.
+Exit criteria:
 
-### TODO
+- Qwen full-attention layers can run through `b12x`
+- unsupported modes fall back cleanly
+- graph capture uses pre-resolved plans and exact workspaces
 
-- Add a separate decode-oriented kernel family for tiny packed M.
-- Do not try to force the current kernel into a micro-M shape; its structure is built around a larger M tile and current warp partitioning.
-- Reuse the same paged-KV and split-KV serving contract.
+## Phase 9: Add FP8 KV Cache Support
 
-### Exit Criteria
+Objective:
 
-- Decode path outperforms the shared paged kernel on `q=1`.
-- Extend path remains on the main kernel unless a separate path is justified.
+- reach the production-relevant Qwen serving path
 
-## Phase 9: FP8 KV Cache
+TODO:
 
-Objective: move from the milestone-1 `bf16` KV path to production-relevant mixed precision.
+- define mixed `bf16` Q and `fp8` KV contract
+- define per-page or per-tensor descale handling
+- thread descale metadata through the planner and workspace
+- preserve the same split and graph model
 
-### TODO
+Exit criteria:
 
-- Add mixed `bf16` Q + `fp8` KV support.
-- Define scale/descale handling in the public API.
-- Validate against the real Qwen serving path after the `bf16` split-KV architecture is stable.
+- `fp8` KV path matches reference within acceptable tolerance
+- graph capture still works
+- benchmark reports `bf16` and `fp8` results side by side
 
-### Exit Criteria
+## Validation Plan
 
-- `fp8` KV path matches reference within acceptable tolerance.
-- Graph capture remains intact.
-- Performance is measured on the same Qwen matrix.
+Every phase should be validated against the same core matrix:
 
-## Success Metrics
+- decode `q=1`
+- extend `q=6`
+- `k in {64, 512, 2048, 8192}`
+- `bs=8`
+- `page_size=64`
+- `8q:1kv`
+- `d=256`
+- graph capture plus at least `100x` replay timing
+- FlashInfer `fa2` comparison
 
-The kernel is on the right path when all of the following are true:
+Correctness should always include:
 
-- Long-context latency no longer scales almost linearly with page count.
-- `fa2/b12x` ratio materially improves at `k >= 512`.
-- Graph capture works for the supported split buckets.
-- Packed GQA remains enabled, but no longer silently dictates scheduler semantics.
-- The public serving contract stays narrow and explicit.
+- `max_abs`
+- cosine similarity
+- split-vs-nonsplit equivalence
+- graph replay equivalence
 
-## Immediate Next Tasks
+## Success Criteria
 
-- [ ] Refactor scheduler inputs in [forward.py](/home/luke/projects/b12x-research/rs-9/b12x/attention/forward.py) so logical dimensions are explicit and not inferred from packed layout.
-- [ ] Add `num_splits` to the paged API in [attention.py](/home/luke/projects/b12x-research/rs-9/b12x/integration/attention.py).
-- [ ] Plumb split mode into [forward.py](/home/luke/projects/b12x-research/rs-9/b12x/attention/forward.py) and [block_info.py](/home/luke/projects/b12x-research/rs-9/b12x/attention/block_info.py).
-- [ ] Implement split-aware `n_block` partitioning in [block_info.py](/home/luke/projects/b12x-research/rs-9/b12x/attention/block_info.py).
-- [ ] Add per-split scratch and a two-pass reducer.
-- [ ] Add split-KV correctness tests and graph-capture tests.
-- [ ] Re-run [benchmark_paged_attention.py](/home/luke/projects/b12x-research/rs-9/benchmarks/benchmark_paged_attention.py) against FlashInfer `fa2`.
+The architecture is on track when all of the following become true:
+
+- long-context latency is no longer close to linear in page count
+- split bucket policy beats any single fixed split count
+- decode and extend each have an intentional kernel family
+- the runtime is planner-backed rather than launch-heuristic-driven
+- no Python/Torch reduction remains in split-KV
+- SGLang integration fits cleanly through its backend lifecycle
+
+The architecture reaches milestone 1 when:
+
+- Qwen full-attention `bf16` paged decode and extend run through `b12x`
+- CUDA graph works on supported buckets
+- the long-context gap to `fa2` is substantially narrowed
+
+## Concrete Next Tasks
+
+- [ ] Refactor `b12x/integration/attention.py` to introduce explicit plan and workspace objects.
+- [ ] Fix any contiguous-path regression caused by the new split plumbing so both contiguous and paged paths have a consistent contract.
+- [ ] Finish the logical-dimension cleanup in `b12x/attention/forward.py`.
+- [ ] Make split bucket a planner property instead of a raw runtime argument.
+- [ ] Replace the current runtime split reducer with a compiled combine kernel.
+- [ ] Add split-bucket capture and replay tests.
+- [ ] Add a page-count heuristic for `{1, 2, 4, 8}`.
+- [ ] Re-run the FlashInfer comparison and record the new `fa2/b12x` ratios.
+- [ ] Start the decode-kernel design once the split-bucket planner is stable.
