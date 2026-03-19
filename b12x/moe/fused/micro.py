@@ -315,8 +315,8 @@ def _atomic_cas_global_i32(addr, compare, value, *, loc=None, ip=None):
     ))
 
 
-class MoEStaticKernel:
-    """Compact static MoE kernel for small routed working sets."""
+class MoEMicroKernel:
+    """Decode-focused compact MoE kernel with precompacted routing ids."""
 
     def __init__(
         self,
@@ -474,7 +474,7 @@ class MoEStaticKernel:
         self.sf_dtype = sfa_ptr.dtype
         self.a_layout = utils.LayoutEnum.from_tensor(packed_a)
         self.b_layout = utils.LayoutEnum.from_tensor(b_w13)
-        # Compact static always scatters into token-major row-major output.
+        # Micro decode always scatters into token-major row-major output.
         self.c_layout = utils.LayoutEnum.ROW_MAJOR
 
         self._setup_attributes()
@@ -520,7 +520,7 @@ class MoEStaticKernel:
             internal_type=cutlass.Int16,
         )
 
-        # Compact static schedules over (m_tile, intermediate_slice, local_expert_idx).
+        # Micro decode schedules over (m_tile, intermediate_slice, local_expert_idx).
         grid = (*self.cluster_shape_mn, max_active_clusters)
         self.kernel(
             a_input, topk_ids, topk_weights,
@@ -615,7 +615,7 @@ class MoEStaticKernel:
 
         @cute.struct
         class Storage:
-            ctrl: cute.struct.MemRange[cutlass.Int32, 2]
+            ctrl: cute.struct.MemRange[cutlass.Int32, 3]
             pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             up_pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             phase2_pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
@@ -712,7 +712,6 @@ class MoEStaticKernel:
         total_pairs = Int32(topk_ids.shape[0])
         num_topk = total_pairs // num_tokens
         expert_scale_stride = Int32(scale_storage.shape[0]) // num_experts
-        num_global_experts = Int32(global_to_local_expert.shape[0])
         flat_tid = Int32(bidz) * Int32(self.threads_per_cta) + Int32(tidx)
         flat_stride = Int32(gdim_z) * Int32(self.threads_per_cta)
         num_k_tiles = (cols + Int32(63)) // Int32(64)
@@ -722,12 +721,9 @@ class MoEStaticKernel:
         while i < num_experts:
             row_counts[i] = Int32(0)
             i += flat_stride
-        i = flat_tid
-        while i < num_global_experts:
-            global_to_local_expert[i] = Int32(-1)
-            i += flat_stride
         if flat_tid == Int32(0):
-            active_expert_count[Int32(0)] = Int32(0)
+            # Triton prepass has already populated the compact expert set.
+            pass
         scatter_total = num_tokens * cols
         j = flat_tid
         while j < scatter_total:
@@ -740,40 +736,15 @@ class MoEStaticKernel:
 
         pair_idx = Int32(bidz)
         while pair_idx < total_pairs:
-            expert_id = topk_ids[pair_idx].to(Int32)
             token_idx = pair_idx // num_topk
             weight = topk_weights[pair_idx].to(cutlass.Float32)
+
+            expert_id = Int32(0)
             local_expert_id = Int32(0)
             row = Int32(0)
             if is_cta_leader > Int32(0):
-                prior_local_expert_id = _atomic_cas_global_i32(
-                    get_ptr_as_int64(global_to_local_expert, expert_id),
-                    Int32(-1),
-                    Int32(-2),
-                )
-                if prior_local_expert_id == Int32(-1):
-                    local_expert_id = atomic_add_global_i32(
-                        get_ptr_as_int64(active_expert_count, Int32(0)),
-                        Int32(1),
-                    )
-                    weight_expert_ids[local_expert_id] = expert_id
-                    _st_global_release_i32(
-                        get_ptr_as_int64(global_to_local_expert, expert_id),
-                        local_expert_id,
-                    )
-                else:
-                    if prior_local_expert_id == Int32(-2):
-                        # TODO: revisit whether we can replace this with a
-                        # weaker ordering path once the compact publish
-                        # sequence is better characterized.
-                        _spin_wait_global_eq_i32(
-                            get_ptr_as_int64(global_to_local_expert, expert_id),
-                            Int32(-2),
-                        )
-                        prior_local_expert_id = _ld_global_acquire_i32(
-                            get_ptr_as_int64(global_to_local_expert, expert_id),
-                        )
-                    local_expert_id = prior_local_expert_id
+                local_expert_id = topk_ids[pair_idx].to(Int32)
+                expert_id = weight_expert_ids[local_expert_id].to(Int32)
                 row = atomic_add_global_i32(
                     get_ptr_as_int64(row_counts, local_expert_id),
                     Int32(1),
@@ -783,9 +754,11 @@ class MoEStaticKernel:
                 st_global_f32(get_ptr_as_int64(token_weights, map_idx), weight)
                 _st_shared_i32(ctrl_base_addr + Int32(0), local_expert_id)
                 _st_shared_i32(ctrl_base_addr + Int32(4), row)
+                _st_shared_i32(ctrl_base_addr + Int32(8), expert_id)
             cute.arch.sync_threads()
             local_expert_id = _ld_shared_i32(ctrl_base_addr + Int32(0))
             row = _ld_shared_i32(ctrl_base_addr + Int32(4))
+            expert_id = _ld_shared_i32(ctrl_base_addr + Int32(8))
 
             # Distribute quantization across ALL CTA threads, not just leader.
             # Each FP4 block (16 elements) is independent — perfect parallelism.
@@ -1538,4 +1511,4 @@ class MoEStaticKernel:
 
 
 
-__all__ = ["MoEStaticKernel"]
+__all__ = ["MoEMicroKernel"]
