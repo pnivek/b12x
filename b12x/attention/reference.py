@@ -5,6 +5,17 @@ from __future__ import annotations
 import torch
 
 
+def _causal_mask_right_aligned(
+    seqlen_q: int,
+    seqlen_k: int,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    q_idx = torch.arange(seqlen_q, device=device, dtype=torch.int32).view(seqlen_q, 1)
+    k_idx = torch.arange(seqlen_k, device=device, dtype=torch.int32).view(1, seqlen_k)
+    return k_idx > (q_idx + seqlen_k - seqlen_q)
+
+
 def attention_reference(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -58,10 +69,7 @@ def attention_reference(
 
     scores = torch.matmul(q_f, k_f.transpose(-1, -2)) * float(softmax_scale)
     if causal:
-        causal_mask = torch.triu(
-            torch.ones(seqlen_q, seqlen_k, device=scores.device, dtype=torch.bool),
-            diagonal=1,
-        )
+        causal_mask = _causal_mask_right_aligned(seqlen_q, seqlen_k, device=scores.device)
         scores = scores.masked_fill(causal_mask.view(1, 1, seqlen_q, seqlen_k), float("-inf"))
     probs = torch.softmax(scores, dim=-1)
     out = torch.matmul(probs, v_f).permute(0, 2, 1, 3).to(q.dtype)
@@ -70,4 +78,84 @@ def attention_reference(
     if squeeze_batch:
         out = out.squeeze(0)
         lse = lse.squeeze(0)
+    return out, lse
+
+
+def materialize_paged_kv_cache(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    *,
+    request_idx: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if k_cache.ndim != 4 or v_cache.ndim != 4:
+        raise ValueError("expected paged K/V caches with shape [num_pages, page_size, heads, dim]")
+    page_size = int(k_cache.shape[1])
+    cache_len = int(cache_seqlens[request_idx].item())
+    if cache_len == 0:
+        return k_cache[:0].reshape(0, k_cache.shape[2], k_cache.shape[3]), v_cache[:0].reshape(
+            0, v_cache.shape[2], v_cache.shape[3]
+        )
+    num_pages = (cache_len + page_size - 1) // page_size
+    page_ids = page_table[request_idx, :num_pages].to(torch.long)
+    k = k_cache.index_select(0, page_ids).reshape(num_pages * page_size, k_cache.shape[2], k_cache.shape[3])
+    v = v_cache.index_select(0, page_ids).reshape(num_pages * page_size, v_cache.shape[2], v_cache.shape[3])
+    return k[:cache_len], v[:cache_len]
+
+
+def paged_attention_reference(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    *,
+    softmax_scale: float | None = None,
+    causal: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference paged self-attention for the SGLang serving contract.
+
+    Inputs:
+    - `q`: `[total_q, q_heads, head_dim]`
+    - `k_cache`, `v_cache`: `[num_pages, page_size, kv_heads, head_dim]`
+    - `page_table`: `[batch, max_pages]`
+    - `cache_seqlens`: `[batch]`
+    - `cu_seqlens_q`: `[batch + 1]`
+
+    Returns:
+    - `out`: `[total_q, q_heads, head_dim]`
+    - `lse`: `[total_q, q_heads]` token-major float32
+    """
+    if q.ndim != 3:
+        raise ValueError(f"expected rank-3 q tensor, got rank {q.ndim}")
+    if cu_seqlens_q.ndim != 1 or cache_seqlens.ndim != 1:
+        raise ValueError("cu_seqlens_q and cache_seqlens must be rank-1 tensors")
+    total_q, q_heads, head_dim = q.shape
+    if softmax_scale is None:
+        softmax_scale = head_dim ** -0.5
+
+    out = torch.empty_like(q)
+    lse = torch.empty((total_q, q_heads), dtype=torch.float32, device=q.device)
+    q_offsets = [int(v) for v in cu_seqlens_q.detach().cpu().tolist()]
+    for request_idx, (q_start, q_end) in enumerate(zip(q_offsets[:-1], q_offsets[1:])):
+        if q_end == q_start:
+            continue
+        k, v = materialize_paged_kv_cache(
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens,
+            request_idx=request_idx,
+        )
+        out_cur, lse_cur = attention_reference(
+            q[q_start:q_end],
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+        )
+        out[q_start:q_end].copy_(out_cur)
+        lse[q_start:q_end].copy_(lse_cur.transpose(0, 1))
     return out, lse

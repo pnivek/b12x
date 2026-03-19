@@ -71,6 +71,41 @@ def test_workspace_pool_reuses_exact_shape_buffers() -> None:
     assert (lse1 - ref_lse).abs().max().item() <= 0.03
 
 
+def test_right_aligned_causal_multi_tile_shape_matches_reference() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    torch.manual_seed(19)
+    q = torch.randn(1, 6, 8, 256, device="cuda", dtype=torch.bfloat16) / 4
+    k = torch.randn(1, 33, 1, 256, device="cuda", dtype=torch.bfloat16) / 4
+    v = torch.randn(1, 33, 1, 256, device="cuda", dtype=torch.bfloat16) / 4
+    workspace = allocate_attention_workspace(q, k, v, causal=True)
+
+    out, lse = b12x_attention_forward(q, k, v, workspace=workspace)
+    ref_out, ref_lse = attention_reference(q, k, v, causal=True)
+    torch.cuda.synchronize()
+
+    assert not torch.isnan(out).any()
+    assert not torch.isnan(lse).any()
+    assert (out - ref_out).abs().max().item() <= 0.02
+    assert (lse - ref_lse).abs().max().item() <= 0.03
+    assert _cosine_similarity(out, ref_out) >= 0.99999
+
+
+def test_single_token_single_key_corner_is_rejected() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    torch.manual_seed(29)
+    q = torch.randn(1, 1, 8, 256, device="cuda", dtype=torch.bfloat16) / 4
+    k = torch.randn(1, 1, 1, 256, device="cuda", dtype=torch.bfloat16) / 4
+    v = torch.randn(1, 1, 1, 256, device="cuda", dtype=torch.bfloat16) / 4
+    workspace = allocate_attention_workspace(q, k, v, causal=True)
+
+    with pytest.raises(ValueError, match="single-token single-key corner"):
+        b12x_attention_forward(q, k, v, workspace=workspace)
+
+
 def test_exact_workspace_rejects_shape_mismatch() -> None:
     require_sm120()
     clear_attention_caches()

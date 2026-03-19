@@ -67,9 +67,10 @@ class Softmax(ParamsBase):
             row_max_cur = cute.arch.warp_reduction_max(row_max_cur, threads_in_group=4)
             row_max_prev = self.row_max[r]
             self.row_max[r] = row_max_cur
-
-            # The initial b12x serving slice always has at least one valid key
-            # per row, so we can skip the donor path's all-masked-row guards.
+            if cutlass.const_expr(check_inf):
+                row_max_cur = Float32(
+                    cutlass.select_(row_max_cur == -Float32.inf, 0.0, row_max_cur)
+                )
             row_max_cur_scaled = row_max_cur * self.scale_log2
             acc_S_row_exp = cute.math.exp2(
                 acc_S_row * self.scale_log2 - row_max_cur_scaled,
@@ -110,11 +111,15 @@ class Softmax(ParamsBase):
                     fastmath=True,
                 )
 
-            row_scale[r] = cute.arch.rcp_approx(self.row_sum[r]) * final_scale
             row_sum_cur = self.row_sum[r]
-            self.row_sum[r] = (
-                (self.row_max[r] * self.scale_log2 + cute.math.log2(row_sum_cur, fastmath=True))
-                * math.log(2.0)
+            row_sum_is_zero_or_nan = (row_sum_cur == 0.0) | (row_sum_cur != row_sum_cur)
+            safe_row_sum = Float32(cutlass.select_(row_sum_is_zero_or_nan, 1.0, row_sum_cur))
+            row_scale[r] = cute.arch.rcp_approx(safe_row_sum) * final_scale
+            row_lse = (
+                self.row_max[r] * self.scale_log2 + cute.math.log2(safe_row_sum, fastmath=True)
+            ) * math.log(2.0)
+            self.row_sum[r] = Float32(
+                cutlass.select_(row_sum_is_zero_or_nan, -Float32.inf, row_lse)
             )
         return row_scale
 

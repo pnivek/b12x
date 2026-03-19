@@ -65,6 +65,12 @@ def _make_inputs(
     return q, k, v
 
 
+def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
+    a_f = a.to(torch.float32).reshape(-1)
+    b_f = b.to(torch.float32).reshape(-1)
+    return torch.nn.functional.cosine_similarity(a_f, b_f, dim=0).item()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch", type=int, default=1)
@@ -111,10 +117,12 @@ def main() -> None:
             ref_out, ref_lse = attention_reference(q, k, v, causal=True)
             max_abs = (out - ref_out).abs().max().item()
             max_lse_abs = (lse - ref_lse).abs().max().item()
+            cos = _cosine_similarity(out, ref_out)
             print(
                 f"check s={seqlen}: "
                 f"out_max_abs={max_abs:.5f} "
-                f"lse_max_abs={max_lse_abs:.5f}"
+                f"lse_max_abs={max_lse_abs:.5f} "
+                f"cos={cos:.8f}"
             )
 
         times_ms = bench_events(
