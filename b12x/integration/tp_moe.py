@@ -21,9 +21,10 @@ _LEVEL_TILE_N = 128
 _DYNAMIC_SLICE_CHUNK = 2
 
 
-@dataclass
+@dataclass(kw_only=True)
 class TPMoEWorkspace:
     """Reusable scratch buffers for one exact `b12x_moe_fp4` launch shape."""
+    implementation: str
     state_E: int
     weight_E: int
     max_rows: int
@@ -32,45 +33,48 @@ class TPMoEWorkspace:
     num_topk: int
     device: torch.device
     dtype: torch.dtype
-    # Expert maps
-    expert_counts: torch.Tensor       # [E] int32
-    active_experts: torch.Tensor      # [E] int32 active local expert ids in scheduler order
-    active_expert_count: torch.Tensor  # [1] int32 active expert count
-    active_row_counts: torch.Tensor   # [E] int32 compact row counts aligned with active_experts
-    weight_expert_ids: torch.Tensor   # [E] int32 local expert id -> global weight expert id
-    global_to_local_expert: torch.Tensor  # [weight_E] int32 global -> local id map
-    expert_write_rows: torch.Tensor | None  # [E] int32 dynamic-only route/pack cursors
-    expert_tile_base: torch.Tensor | None   # [E + 1] int32 dynamic-only compact tile prefix
-    token_map: torch.Tensor           # static: [E, max_rows], dynamic: [rows_padded]
-    token_weights_map: torch.Tensor   # static: [E, max_rows], dynamic: [rows_padded]
-    # Packed FP4 activation buffers consumed by compute
-    packed_input: torch.Tensor        # static: [E, max_rows, k//2], dynamic: [1, rows_padded, k//2]
-    packed_input_scale: torch.Tensor  # static: [E, rows_pad, cols_pad], dynamic: [rows_padded, cols_pad]
-    # Static-only scheduler proxy tensor. Dynamic does not use this scratch.
-    scheduler_out: torch.Tensor | None
-    # Pre-expanded scale tensors (filled at allocation time)
-    input_gs: torch.Tensor            # [weight_E] float32
-    down_input_scale: torch.Tensor    # [weight_E] float32
-    barrier_count: torch.Tensor       # [1] int32 — static resident-grid barrier
-    barrier_epoch: torch.Tensor       # [1] int32 — static resident-grid barrier
-    pair_head: torch.Tensor           # [1] int32 — dynamic routed-pair allocator
-    producers_done_count: torch.Tensor  # [1] int32 — dynamic producer completion
-    all_work_published: torch.Tensor  # [1] int32 — dynamic terminal publication flag
-    task_head: torch.Tensor           # [1] int32 — dynamic task consumer head
-    task_tail: torch.Tensor           # [1] int32 — dynamic task producer tail
-    task_ready: torch.Tensor          # [max_tasks] int32 — per-task publication flags
-    task_expert: torch.Tensor         # [max_tasks] int32
-    task_m_tile: torch.Tensor         # [max_tasks] int32 (dynamic: physical tile index)
-    task_slice_begin: torch.Tensor    # [max_tasks] int32
-    task_slice_count: torch.Tensor    # [max_tasks] int32
-    task_valid_rows: torch.Tensor     # [max_tasks] int32
-    tile_write_count: torch.Tensor    # static: [E * max_m_tiles], dynamic: [max_phys_tiles]
-    # Pre-computed views (cached to avoid per-call Python overhead)
-    packed_a_view: object = None      # packed_input permuted + fp4 view
-    sfa_ptr: object = None            # CuTe pointer for scale factors
-    packed_a_flat: torch.Tensor | None = None  # flat uint8 backing packed_input
-    scale_flat: torch.Tensor | None = None     # flat uint8 backing packed_input_scale
-    packed_a_storage_ptr: object = None  # legacy CuTe pointer for packed_input backing storage
+    expert_counts: torch.Tensor
+    token_map: torch.Tensor
+    token_weights_map: torch.Tensor
+    packed_input: torch.Tensor
+    packed_input_scale: torch.Tensor
+    barrier_count: torch.Tensor
+    barrier_epoch: torch.Tensor
+    packed_a_view: object = None
+    sfa_ptr: object = None
+    packed_a_flat: torch.Tensor | None = None
+    scale_flat: torch.Tensor | None = None
+    packed_a_storage_ptr: object = None
+
+
+@dataclass(kw_only=True)
+class TPCompactStaticWorkspace(TPMoEWorkspace):
+    active_experts: torch.Tensor
+    active_expert_count: torch.Tensor
+    active_row_counts: torch.Tensor
+    weight_expert_ids: torch.Tensor
+    global_to_local_expert: torch.Tensor
+    scheduler_out: torch.Tensor
+
+
+@dataclass(kw_only=True)
+class TPDynamicWorkspace(TPMoEWorkspace):
+    expert_write_rows: torch.Tensor
+    expert_tile_base: torch.Tensor
+    input_gs: torch.Tensor
+    down_input_scale: torch.Tensor
+    pair_head: torch.Tensor
+    producers_done_count: torch.Tensor
+    all_work_published: torch.Tensor
+    task_head: torch.Tensor
+    task_tail: torch.Tensor
+    task_ready: torch.Tensor
+    task_expert: torch.Tensor
+    task_m_tile: torch.Tensor
+    task_slice_begin: torch.Tensor
+    task_slice_count: torch.Tensor
+    task_valid_rows: torch.Tensor
+    tile_write_count: torch.Tensor
     input_gs_src_ptr: int = 0
     down_input_scale_src_ptr: int = 0
 
@@ -241,7 +245,7 @@ def _get_cached_static_execution_args(
     a: torch.Tensor,
     flat_ids: torch.Tensor,
     flat_weights: torch.Tensor,
-    s: TPMoEWorkspace,
+    s: TPCompactStaticWorkspace,
     wv: _WeightViews,
     input_gs: torch.Tensor,
     w1_alpha: torch.Tensor,
@@ -392,8 +396,8 @@ def _dynamic_task_geometry(E: int, n: int, max_rows: int) -> tuple[int, int, int
     return max_m_tiles, gate_tile_cnt, max_tasks
 
 
-def _refresh_workspace_scales(
-    workspace: TPMoEWorkspace,
+def _refresh_dynamic_workspace_scales(
+    workspace: TPDynamicWorkspace,
     a1_gscale: torch.Tensor,
     a2_gscale: torch.Tensor,
     *,
@@ -412,131 +416,7 @@ def _refresh_workspace_scales(
         workspace.down_input_scale_src_ptr = a2_src_ptr if input_scales_static else 0
 
 
-def _alloc_workspace(
-    implementation: str,
-    state_E: int,
-    weight_E: int,
-    k: int,
-    n: int,
-    num_topk: int,
-    device: torch.device,
-    dtype: torch.dtype,
-    a1_gscale: torch.Tensor,
-    a2_gscale: torch.Tensor,
-    *,
-    max_rows: int,
-    input_scales_static: bool,
-) -> TPMoEWorkspace:
-    cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
-    dynamic_tiles, _, dynamic_max_tasks = _dynamic_task_geometry(state_E, n, max_rows)
-    dynamic_rows_padded = dynamic_tiles * _LEVEL_TILE_M
-    static_rows_pad_k = align_up(max_rows, 128)
-    static_max_m_tiles = max(1, max_rows // _LEVEL_TILE_M)
-    static_gate_tile_cnt = max(1, (n + _LEVEL_TILE_N - 1) // _LEVEL_TILE_N)
-    static_slice_groups = max(1, (static_gate_tile_cnt + _DYNAMIC_SLICE_CHUNK - 1) // _DYNAMIC_SLICE_CHUNK)
-    static_max_tasks = state_E * static_max_m_tiles * static_slice_groups
-
-    workspace = TPMoEWorkspace(
-        state_E=state_E,
-        weight_E=weight_E,
-        max_rows=max_rows,
-        k=k,
-        n=n,
-        num_topk=num_topk,
-        device=device,
-        dtype=dtype,
-        expert_counts=torch.zeros(state_E, dtype=torch.int32, device=device),
-        active_experts=torch.empty(state_E, dtype=torch.int32, device=device),
-        active_expert_count=torch.zeros(1, dtype=torch.int32, device=device),
-        active_row_counts=torch.zeros(state_E, dtype=torch.int32, device=device),
-        weight_expert_ids=torch.arange(state_E, dtype=torch.int32, device=device),
-        global_to_local_expert=torch.empty(weight_E, dtype=torch.int32, device=device),
-        expert_write_rows=(
-            torch.zeros(state_E, dtype=torch.int32, device=device)
-            if implementation == "dynamic"
-            else None
-        ),
-        expert_tile_base=(
-            torch.zeros(state_E + 1, dtype=torch.int32, device=device)
-            if implementation == "dynamic"
-            else None
-        ),
-        token_map=(
-            torch.zeros(dynamic_rows_padded, dtype=torch.int32, device=device)
-            if implementation == "dynamic"
-            else torch.zeros(state_E, max_rows, dtype=torch.int32, device=device)
-        ),
-        token_weights_map=(
-            torch.zeros(dynamic_rows_padded, dtype=torch.float32, device=device)
-            if implementation == "dynamic"
-            else torch.zeros(state_E, max_rows, dtype=torch.float32, device=device)
-        ),
-        packed_input=(
-            torch.empty(1, dynamic_rows_padded, k // 2, dtype=torch.uint8, device=device)
-            if implementation == "dynamic"
-            else torch.empty(state_E, max_rows, k // 2, dtype=torch.uint8, device=device)
-        ),
-        packed_input_scale=(
-            torch.empty(dynamic_rows_padded, cols_pad_k, dtype=torch.uint8, device=device)
-            if implementation == "dynamic"
-            else torch.empty(state_E, static_rows_pad_k, cols_pad_k, dtype=torch.uint8, device=device)
-        ),
-        scheduler_out=(
-            _alloc_unique_ld_tensor((max_rows, n, state_E), dtype=dtype, device=device)
-            if implementation == "static"
-            else None
-        ),
-        input_gs=torch.empty(weight_E, dtype=torch.float32, device=device),
-        down_input_scale=torch.empty(weight_E, dtype=torch.float32, device=device),
-        barrier_count=torch.zeros(1, dtype=torch.int32, device=device),
-        barrier_epoch=torch.zeros(1, dtype=torch.int32, device=device),
-        pair_head=torch.zeros(1, dtype=torch.int32, device=device),
-        producers_done_count=torch.zeros(1, dtype=torch.int32, device=device),
-        all_work_published=torch.zeros(1, dtype=torch.int32, device=device),
-        task_head=torch.zeros(1, dtype=torch.int32, device=device),
-        task_tail=torch.zeros(1, dtype=torch.int32, device=device),
-        task_ready=torch.zeros(
-            dynamic_max_tasks if implementation == "dynamic" else static_max_tasks,
-            dtype=torch.int32,
-            device=device,
-        ),
-        task_expert=torch.zeros(
-            dynamic_max_tasks if implementation == "dynamic" else static_max_tasks,
-            dtype=torch.int32,
-            device=device,
-        ),
-        task_m_tile=torch.zeros(
-            dynamic_max_tasks if implementation == "dynamic" else static_max_tasks,
-            dtype=torch.int32,
-            device=device,
-        ),
-        task_slice_begin=torch.zeros(
-            dynamic_max_tasks if implementation == "dynamic" else static_max_tasks,
-            dtype=torch.int32,
-            device=device,
-        ),
-        task_slice_count=torch.zeros(
-            dynamic_max_tasks if implementation == "dynamic" else static_max_tasks,
-            dtype=torch.int32,
-            device=device,
-        ),
-        task_valid_rows=torch.zeros(
-            dynamic_max_tasks if implementation == "dynamic" else static_max_tasks,
-            dtype=torch.int32,
-            device=device,
-        ),
-        tile_write_count=torch.zeros(
-            dynamic_tiles if implementation == "dynamic" else state_E * static_max_m_tiles,
-            dtype=torch.int32,
-            device=device,
-        ),
-    )
-    _refresh_workspace_scales(
-        workspace,
-        a1_gscale,
-        a2_gscale,
-        input_scales_static=input_scales_static,
-    )
+def _finalize_workspace_views(workspace: TPMoEWorkspace) -> None:
     sf_dtype = cutlass.Float8E4M3FN
     workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0).view(torch.float4_e2m1fn_x2)
     workspace.packed_a_flat = workspace.packed_input.view(-1)
@@ -553,6 +433,89 @@ def _alloc_workspace(
         cute.AddressSpace.gmem,
         assumed_align=16,
     )
+
+
+def _alloc_workspace(
+    implementation: str,
+    state_E: int,
+    weight_E: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    a1_gscale: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    *,
+    max_rows: int,
+    input_scales_static: bool,
+) -> TPMoEWorkspace:
+    cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    common_kwargs = dict(
+        implementation=implementation,
+        state_E=state_E,
+        weight_E=weight_E,
+        max_rows=max_rows,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        device=device,
+        dtype=dtype,
+        expert_counts=torch.zeros(state_E, dtype=torch.int32, device=device),
+        barrier_count=torch.zeros(1, dtype=torch.int32, device=device),
+        barrier_epoch=torch.zeros(1, dtype=torch.int32, device=device),
+    )
+
+    if implementation == "static":
+        static_rows_pad_k = align_up(max_rows, 128)
+        workspace = TPCompactStaticWorkspace(
+            **common_kwargs,
+            token_map=torch.zeros(state_E, max_rows, dtype=torch.int32, device=device),
+            token_weights_map=torch.zeros(state_E, max_rows, dtype=torch.float32, device=device),
+            packed_input=torch.empty(state_E, max_rows, k // 2, dtype=torch.uint8, device=device),
+            packed_input_scale=torch.empty(state_E, static_rows_pad_k, cols_pad_k, dtype=torch.uint8, device=device),
+            active_experts=torch.empty(state_E, dtype=torch.int32, device=device),
+            active_expert_count=torch.zeros(1, dtype=torch.int32, device=device),
+            active_row_counts=torch.zeros(state_E, dtype=torch.int32, device=device),
+            weight_expert_ids=torch.arange(state_E, dtype=torch.int32, device=device),
+            global_to_local_expert=torch.empty(weight_E, dtype=torch.int32, device=device),
+            scheduler_out=_alloc_unique_ld_tensor((max_rows, n, state_E), dtype=dtype, device=device),
+        )
+        _finalize_workspace_views(workspace)
+        return workspace
+
+    dynamic_tiles, _, dynamic_max_tasks = _dynamic_task_geometry(state_E, n, max_rows)
+    dynamic_rows_padded = dynamic_tiles * _LEVEL_TILE_M
+    workspace = TPDynamicWorkspace(
+        **common_kwargs,
+        token_map=torch.zeros(dynamic_rows_padded, dtype=torch.int32, device=device),
+        token_weights_map=torch.zeros(dynamic_rows_padded, dtype=torch.float32, device=device),
+        packed_input=torch.empty(1, dynamic_rows_padded, k // 2, dtype=torch.uint8, device=device),
+        packed_input_scale=torch.empty(dynamic_rows_padded, cols_pad_k, dtype=torch.uint8, device=device),
+        expert_write_rows=torch.zeros(state_E, dtype=torch.int32, device=device),
+        expert_tile_base=torch.zeros(state_E + 1, dtype=torch.int32, device=device),
+        input_gs=torch.empty(weight_E, dtype=torch.float32, device=device),
+        down_input_scale=torch.empty(weight_E, dtype=torch.float32, device=device),
+        pair_head=torch.zeros(1, dtype=torch.int32, device=device),
+        producers_done_count=torch.zeros(1, dtype=torch.int32, device=device),
+        all_work_published=torch.zeros(1, dtype=torch.int32, device=device),
+        task_head=torch.zeros(1, dtype=torch.int32, device=device),
+        task_tail=torch.zeros(1, dtype=torch.int32, device=device),
+        task_ready=torch.zeros(dynamic_max_tasks, dtype=torch.int32, device=device),
+        task_expert=torch.zeros(dynamic_max_tasks, dtype=torch.int32, device=device),
+        task_m_tile=torch.zeros(dynamic_max_tasks, dtype=torch.int32, device=device),
+        task_slice_begin=torch.zeros(dynamic_max_tasks, dtype=torch.int32, device=device),
+        task_slice_count=torch.zeros(dynamic_max_tasks, dtype=torch.int32, device=device),
+        task_valid_rows=torch.zeros(dynamic_max_tasks, dtype=torch.int32, device=device),
+        tile_write_count=torch.zeros(dynamic_tiles, dtype=torch.int32, device=device),
+    )
+    _refresh_dynamic_workspace_scales(
+        workspace,
+        a1_gscale,
+        a2_gscale,
+        input_scales_static=input_scales_static,
+    )
+    _finalize_workspace_views(workspace)
     return workspace
 
 
@@ -620,24 +583,21 @@ def _resolve_workspace_layout(
     num_tokens: int,
     weight_E: int,
     num_topk: int,
-) -> tuple[str, bool, int, int]:
+) -> tuple[str, int, int]:
     routed_rows = num_tokens * num_topk
     implementation = select_tp_moe_backend(
         num_tokens=num_tokens,
         num_topk=num_topk,
     )
-    use_compact_static = implementation == "static"
-    state_E = weight_E
-    state_max_rows = ((routed_rows + 127) // 128) * 128
-    if use_compact_static:
-        state_E = max(1, routed_rows)
-        state_max_rows = max(1, routed_rows)
-    return implementation, use_compact_static, state_E, state_max_rows
+    if implementation == "static":
+        return implementation, max(1, routed_rows), max(1, routed_rows)
+    return implementation, weight_E, ((routed_rows + 127) // 128) * 128
 
 
 def _validate_workspace(
     workspace: TPMoEWorkspace,
     *,
+    implementation: str,
     state_E: int,
     weight_E: int,
     max_rows: int,
@@ -648,6 +608,7 @@ def _validate_workspace(
     dtype: torch.dtype,
 ) -> None:
     expected = (
+        implementation,
         state_E,
         weight_E,
         max_rows,
@@ -658,6 +619,7 @@ def _validate_workspace(
         dtype,
     )
     actual = (
+        workspace.implementation,
         workspace.state_E,
         workspace.weight_E,
         workspace.max_rows,
@@ -670,9 +632,13 @@ def _validate_workspace(
     if actual != expected:
         raise ValueError(
             "workspace shape mismatch: "
-            f"expected {(state_E, weight_E, max_rows, k, n, num_topk, device, dtype)}, "
+            f"expected {(implementation, state_E, weight_E, max_rows, k, n, num_topk, device, dtype)}, "
             f"got {actual}"
         )
+    if implementation == "static" and not isinstance(workspace, TPCompactStaticWorkspace):
+        raise TypeError("expected a TPCompactStaticWorkspace for the compact static backend")
+    if implementation == "dynamic" and not isinstance(workspace, TPDynamicWorkspace):
+        raise TypeError("expected a TPDynamicWorkspace for the dynamic backend")
 
 
 def _workspace_pool_key(
@@ -721,6 +687,7 @@ def _resolve_workspace(
     if isinstance(workspace, TPMoEWorkspace):
         _validate_workspace(
             workspace,
+            implementation=implementation,
             state_E=state_E,
             weight_E=weight_E,
             max_rows=max_rows,
@@ -730,12 +697,13 @@ def _resolve_workspace(
             device=device,
             dtype=dtype,
         )
-        _refresh_workspace_scales(
-            workspace,
-            a1_gscale,
-            a2_gscale,
-            input_scales_static=input_scales_static,
-        )
+        if isinstance(workspace, TPDynamicWorkspace):
+            _refresh_dynamic_workspace_scales(
+                workspace,
+                a1_gscale,
+                a2_gscale,
+                input_scales_static=input_scales_static,
+            )
         return workspace
 
     if not isinstance(workspace, TPMoEWorkspacePool):
@@ -775,12 +743,13 @@ def _resolve_workspace(
         workspace.workspaces[key] = resolved
         return resolved
 
-    _refresh_workspace_scales(
-        resolved,
-        a1_gscale,
-        a2_gscale,
-        input_scales_static=input_scales_static,
-    )
+    if isinstance(resolved, TPDynamicWorkspace):
+        _refresh_dynamic_workspace_scales(
+            resolved,
+            a1_gscale,
+            a2_gscale,
+            input_scales_static=input_scales_static,
+        )
     return resolved
 
 
@@ -805,7 +774,7 @@ def allocate_tp_moe_workspace(
     weight_E = w1_fp4.shape[0]
     n = w2_fp4.shape[2] * 2
     num_topk = topk_ids.shape[1]
-    impl, _, state_E, state_max_rows = _resolve_workspace_layout(
+    impl, state_E, state_max_rows = _resolve_workspace_layout(
         num_tokens=m,
         weight_E=weight_E,
         num_topk=num_topk,
@@ -1232,7 +1201,7 @@ def b12x_moe_fp4(
         or (a1_gscale.numel() == 1 and a2_gscale.numel() == 1)
     )
 
-    impl, use_compact_static, state_E, state_max_rows = _resolve_workspace_layout(
+    impl, state_E, state_max_rows = _resolve_workspace_layout(
         num_tokens=m,
         weight_E=weight_E,
         num_topk=num_topk,
@@ -1275,7 +1244,6 @@ def b12x_moe_fp4(
             )
         return chunk_output
 
-    compact_static_path = impl == "static" and use_compact_static
     s = _resolve_workspace(
         workspace,
         implementation=impl,
@@ -1296,7 +1264,8 @@ def b12x_moe_fp4(
     # must be fetched per-call rather than cached per-device.
     stream = current_cuda_stream()
 
-    if compact_static_path:
+    if impl == "static":
+        assert isinstance(s, TPCompactStaticWorkspace)
         flat_ids = _flatten_routing_ids(topk_ids)
         flat_weights = _flatten_routing_weights(topk_weights)
 
@@ -1315,6 +1284,7 @@ def b12x_moe_fp4(
         w2_alpha = wv.w2_alpha
         down_input_scale = _prepare_expert_scale(a2_gscale, weight_E)
     else:
+        assert isinstance(s, TPDynamicWorkspace)
         wv = _get_weight_views(
             w1_fp4,
             w1_blockscale,
@@ -1376,7 +1346,7 @@ def b12x_moe_fp4(
         )
     else:
         static_mac = None
-        if use_compact_static and routed_rows < 40:
+        if routed_rows < 40:
             # Tiny compact launches have very little FC2 tile work, so capping
             # resident clusters avoids idle CTA participation in the barrier phases.
             static_mac = min(_get_impl_mac("static"), 64)

@@ -52,6 +52,7 @@ def test_workspace_pool_handles_chunked_calls(monkeypatch: pytest.MonkeyPatch) -
         topk_ids,
         input_scales_static=True,
     )
+    assert isinstance(exact_workspace, tp_moe.TPCompactStaticWorkspace)
     expected = b12x_moe_fp4(
         x,
         weights.w13_input_scale_per_expert,
@@ -180,6 +181,7 @@ def test_dynamic_workspace_uses_compact_storage() -> None:
         topk_ids,
         input_scales_static=True,
     )
+    assert isinstance(workspace, tp_moe.TPDynamicWorkspace)
 
     n = spec.intermediate_size // spec.tp_size
     max_phys_tiles, _, max_tasks = tp_moe._dynamic_task_geometry(
@@ -190,13 +192,12 @@ def test_dynamic_workspace_uses_compact_storage() -> None:
     rows_padded = max_phys_tiles * tp_moe._LEVEL_TILE_M
     cols_pad_k = tp_moe.align_up(spec.hidden_size // tp_moe._NVFP4_BLOCK_SIZE, 4)
 
-    assert workspace.scheduler_out is None
-    assert workspace.expert_write_rows is not None
-    assert workspace.expert_tile_base is not None
     assert tuple(workspace.token_map.shape) == (rows_padded,)
     assert tuple(workspace.token_weights_map.shape) == (rows_padded,)
     assert tuple(workspace.packed_input.shape) == (1, rows_padded, spec.hidden_size // 2)
     assert tuple(workspace.packed_input_scale.shape) == (rows_padded, cols_pad_k)
+    assert tuple(workspace.expert_write_rows.shape) == (spec.num_experts,)
+    assert tuple(workspace.expert_tile_base.shape) == (spec.num_experts + 1,)
     assert tuple(workspace.tile_write_count.shape) == (max_phys_tiles,)
     assert tuple(workspace.task_ready.shape) == (max_tasks,)
     assert tp_moe.select_tp_moe_backend(num_tokens=x.shape[0], num_topk=spec.top_k) == "dynamic"
