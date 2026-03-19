@@ -85,6 +85,7 @@ _WEIGHT_CACHE: Dict[Tuple[int, int, int], _WeightViews] = {}
 _STATIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _DYNAMIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _MAC_CACHE: Dict[Tuple[int, str], int] = {}  # (device_idx, impl) → max_active_clusters
+_PLAIN_PARAM_CACHE: Dict[Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtype, torch.dtype, int], torch.Tensor] = {}
 _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = _LEVEL_TILE_M
 _STATIC_COMPACT_CUTOVER_PAIRS_CACHE: int | None = None
 _DYNAMIC_MULTICTA_CACHE: bool | None = None
@@ -154,14 +155,29 @@ def _flatten_routing_weights(topk_weights: torch.Tensor) -> torch.Tensor:
 
 def _prepare_expert_scale(scale: torch.Tensor, weight_E: int) -> torch.Tensor:
     if scale.numel() == 1:
-        return scale.expand(weight_E).contiguous()
+        return scale.expand(weight_E).to(torch.float32).contiguous()
     if scale.numel() != weight_E:
         raise ValueError(f"expected expert scale with {weight_E} elements, got {scale.numel()}")
-    if scale.dtype != torch.float32:
-        return scale.to(torch.float32)
-    if not scale.is_contiguous():
-        return scale.contiguous()
-    return scale
+    return _get_plain_cuda_tensor(scale, dtype=torch.float32)
+
+
+def _get_plain_cuda_tensor(t: torch.Tensor, *, dtype: torch.dtype | None = None) -> torch.Tensor:
+    target_dtype = t.dtype if dtype is None else dtype
+    key = (
+        t.data_ptr(),
+        tuple(t.shape),
+        tuple(t.stride()),
+        t.dtype,
+        target_dtype,
+        int(t._version),
+    )
+    cached = _PLAIN_PARAM_CACHE.get(key)
+    if cached is not None:
+        return cached
+    plain = torch.empty(tuple(t.shape), dtype=target_dtype, device=t.device)
+    plain.copy_(t.to(target_dtype) if t.dtype != target_dtype else t)
+    _PLAIN_PARAM_CACHE[key] = plain
+    return plain
 
 
 def _get_cached_static_execution_args(
@@ -330,8 +346,8 @@ def _get_state(
         packed_input_scale=torch.empty(E, rows_pad_k, cols_pad_k, dtype=torch.uint8, device=device),
         scheduler_out=_alloc_unique_ld_tensor((max_rows, n, E), dtype=dtype, device=device),
         scatter_output=torch.zeros(m, k, dtype=dtype, device=device),
-        input_gs=a1_gscale.expand(E).contiguous(),
-        down_input_scale=a2_gscale.expand(E).contiguous(),
+        input_gs=torch.empty(E, dtype=torch.float32, device=device),
+        down_input_scale=torch.empty(E, dtype=torch.float32, device=device),
         barrier_count=torch.zeros(1, dtype=torch.int32, device=device),
         barrier_epoch=torch.zeros(1, dtype=torch.int32, device=device),
         pair_head=torch.zeros(1, dtype=torch.int32, device=device),
@@ -349,6 +365,8 @@ def _get_state(
         input_gs_src_ptr=a1_gscale.data_ptr() if input_scales_static else 0,
         down_input_scale_src_ptr=a2_gscale.data_ptr() if input_scales_static else 0,
     )
+    state.input_gs.copy_(a1_gscale.expand(E))
+    state.down_input_scale.copy_(a2_gscale.expand(E))
     # Pre-compute constant views
     sf_dtype = cutlass.Float8E4M3FN
     state.packed_a_view = state.packed_input.permute(1, 2, 0).view(torch.float4_e2m1fn_x2)
@@ -407,8 +425,8 @@ def _get_weight_views(
     views = _WeightViews(
         w13=w13, down=down,
         w13_sf=w13_sf, down_sf=down_sf,
-        w1_alpha=w1_alphas.contiguous(),
-        w2_alpha=w2_alphas.contiguous(),
+        w1_alpha=_get_plain_cuda_tensor(w1_alphas),
+        w2_alpha=_get_plain_cuda_tensor(w2_alphas),
     )
     views.w13_fp4 = w13.view(torch.float4_e2m1fn_x2)
     views.down_fp4 = down.view(torch.float4_e2m1fn_x2)
