@@ -49,7 +49,6 @@ class TPMoEWorkspace:
 
 @dataclass(kw_only=True)
 class TPCompactStaticWorkspace(TPMoEWorkspace):
-    active_experts: torch.Tensor
     active_expert_count: torch.Tensor
     weight_expert_ids: torch.Tensor
     global_to_local_expert: torch.Tensor
@@ -272,7 +271,7 @@ def _get_cached_static_execution_args(
         s.barrier_count, s.barrier_epoch,
         wv.w13_fp4, wv.sfb_w13_ptr,
         wv.down_fp4, wv.sfb_down_ptr,
-        s.expert_counts, s.active_experts, s.active_expert_count, s.weight_expert_ids, s.global_to_local_expert,
+        s.expert_counts, s.active_expert_count, s.weight_expert_ids, s.global_to_local_expert,
         input_gs, w1_alpha, w2_alpha, down_input_scale,
         scatter_output, s.token_map, s.token_weights_map,
         mac, stream,
@@ -443,7 +442,6 @@ def _alloc_workspace(
             token_weights_map=torch.zeros(state_E, max_rows, dtype=torch.float32, device=device),
             packed_input=torch.empty(state_E, max_rows, k // 2, dtype=torch.uint8, device=device),
             packed_input_scale=torch.empty(state_E, static_rows_pad_k, cols_pad_k, dtype=torch.uint8, device=device),
-            active_experts=torch.empty(state_E, dtype=torch.int32, device=device),
             active_expert_count=torch.zeros(1, dtype=torch.int32, device=device),
             weight_expert_ids=torch.arange(state_E, dtype=torch.int32, device=device),
             global_to_local_expert=torch.empty(weight_E, dtype=torch.int32, device=device),
@@ -886,9 +884,6 @@ def _get_static_kernel(
     row_counts_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (state_E,), assumed_align=4,
     )
-    active_experts_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (state_E,), assumed_align=4,
-    )
     active_expert_count_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (1,), assumed_align=4,
     )
@@ -927,7 +922,7 @@ def _get_static_kernel(
         barrier_count_fake, barrier_epoch_fake,
         b_w13_fake, sfb_w13_fake,
         b_down_fake, sfb_down_fake,
-        row_counts_fake, active_experts_fake, active_expert_count_fake, weight_expert_ids_fake, global_to_local_expert_fake,
+        row_counts_fake, active_expert_count_fake, weight_expert_ids_fake, global_to_local_expert_fake,
         input_gs_fake, alpha_fake, down_alpha_fake, global_scale_fake,
         scatter_fake, token_map_fake, token_weights_fake,
         mac, current_cuda_stream(),
