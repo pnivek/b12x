@@ -1765,7 +1765,7 @@ def create_paged_attention_plan(
         max_pages=max_pages,
         tile_shape=tile_shape,
     )
-    if auto_num_splits and kv_dtype == _FP8_KV_DTYPE and mode == "decode" and num_splits > 1:
+    if False and auto_num_splits and kv_dtype == _FP8_KV_DTYPE and mode == "decode" and num_splits > 1:
         num_splits = _promote_fp8_paged_splits_for_occupancy(
             initial_splits=num_splits,
             split_buckets=buckets,
