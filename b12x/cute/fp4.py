@@ -711,6 +711,38 @@ def bfloat2_mul(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
+def broadcast_f32_to_bfloat2(x: Float32, *, loc=None, ip=None) -> Uint32:
+    """Pack one float32 value into both lanes of a bf16x2 register."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(x).ir_value(loc=loc, ip=ip)],
+            "cvt.rn.satfinite.bf16x2.f32 $0, $1, $1;",
+            "=r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def pack_f32x2_to_bfloat2(x0: Float32, x1: Float32, *, loc=None, ip=None) -> Uint32:
+    """Pack 2 float32 values into one bf16x2 register."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(x0).ir_value(loc=loc, ip=ip), Float32(x1).ir_value(loc=loc, ip=ip)],
+            "cvt.rn.satfinite.bf16x2.f32 $0, $2, $1;",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def bfloat2_add(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
     """Add two BFloat2 values element-wise: (a.x+b.x, a.y+b.y)."""
     return Uint32(
@@ -724,6 +756,89 @@ def bfloat2_add(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
+
+
+@dsl_user_op
+def fp8x4_e4m3_to_bfloat2x2(packed: Uint32, *, loc=None, ip=None) -> Tuple[Uint32, Uint32]:
+    """Widen 4 packed E4M3 bytes into 2 packed bf16x2 registers exactly."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Uint32(packed).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 low;
+            .reg .b32 q, out0, out1, sign0, sign1, mant0, mant1, tmp, bias, bias_f32;
+            prmt.b32 q, $2, 0, 0x1302;
+
+            and.b32 sign0, q, 0x80008000;
+            shr.u32 tmp, q, 4;
+            and.b32 mant0, tmp, 0x07F007F0;
+            or.b32 out0, mant0, sign0;
+
+            shl.b32 tmp, q, 8;
+            and.b32 sign1, tmp, 0x80008000;
+            shl.b32 tmp, q, 4;
+            and.b32 mant1, tmp, 0x07F007F0;
+            or.b32 out1, mant1, sign1;
+
+            mov.b32 bias_f32, 0x7B800000;
+            cvt.rn.bf16.f32 low, bias_f32;
+            mov.b32 bias, {low, low};
+
+            mul.bf16x2 $0, out0, bias;
+            mul.bf16x2 $1, out1, bias;
+        }
+        """,
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(lo), Uint32(hi)
+
+
+@dsl_user_op
+def byte_perm(a: Uint32, b: Uint32, selector: Int32, *, loc=None, ip=None) -> Uint32:
+    """PTX byte permutation helper."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Uint32(a).ir_value(loc=loc, ip=ip),
+                Uint32(b).ir_value(loc=loc, ip=ip),
+                Int32(selector).ir_value(loc=loc, ip=ip),
+            ],
+            "prmt.b32 $0, $1, $2, $3;",
+            "=r,r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def frag_layout_swizzle_16b_to_8b(x: Uint32) -> Uint32:
+    tmp = cute.arch.shuffle_sync_bfly(x, offset=1)
+    x = byte_perm(x, tmp, Int32(0x5410 if cute.arch.lane_idx() & 0x1 == 0 else 0x3276))
+    tmp = cute.arch.shuffle_sync_bfly(x, offset=2)
+    x = byte_perm(x, tmp, Int32(0x5410 if cute.arch.lane_idx() & 0x2 == 0 else 0x3276))
+    return x
+
+
+@cute.jit
+def frag_layout_swizzle_16b_to_8b_trans(x: Uint32) -> Uint32:
+    tmp = cute.arch.shuffle_sync_bfly(x, offset=4)
+    x = byte_perm(x, tmp, Int32(0x6420 if cute.arch.lane_idx() & 0x4 == 0 else 0x3175))
+    tmp = cute.arch.shuffle_sync_bfly(x, offset=8)
+    x = byte_perm(x, tmp, Int32(0x5410 if cute.arch.lane_idx() & 0x8 == 0 else 0x3276))
+    tmp = cute.arch.shuffle_sync_bfly(x, offset=16)
+    x = byte_perm(x, tmp, Int32(0x5410 if cute.arch.lane_idx() & 0x10 == 0 else 0x3276))
+    return x
 
 
 @dsl_user_op
@@ -860,12 +975,13 @@ def fp8_e4m3_to_f32(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
             [Uint32(fp8_val).ir_value(loc=loc, ip=ip)],
             """
             {
-                .reg .pred p_zero;
-                .reg .u32 exp_u, mant_u;
+                .reg .pred p_zero, p_neg;
+                .reg .u32 sign_u, exp_u, mant_u;
                 .reg .s32 exp_s;
-                .reg .f32 exp_f, mant_f, fp8_float;
+                .reg .f32 exp_f, mant_f, fp8_float, fp8_neg;
 
                 setp.eq.u32 p_zero, $1, 0;
+                and.b32 sign_u, $1, 0x80;
                 and.b32 mant_u, $1, 7;
                 shr.b32 exp_u, $1, 3;
                 and.b32 exp_u, exp_u, 15;
@@ -875,6 +991,9 @@ def fp8_e4m3_to_f32(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
                 cvt.rn.f32.u32 mant_f, mant_u;
                 fma.rn.f32 mant_f, mant_f, 0f3E000000, 0f3F800000;
                 mul.f32 fp8_float, exp_f, mant_f;
+                neg.f32 fp8_neg, fp8_float;
+                setp.ne.u32 p_neg, sign_u, 0;
+                selp.f32 fp8_float, fp8_neg, fp8_float, p_neg;
                 selp.f32 $0, 0f00000000, fp8_float, p_zero;
             }
             """,
