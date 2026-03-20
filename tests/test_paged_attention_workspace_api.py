@@ -346,9 +346,10 @@ def test_uniform_extend_plan_uses_paged_direct_scheduler() -> None:
     assert plan.mode == "extend"
     assert plan.kv_dtype == torch.float8_e4m3fn
     assert plan.kernel_family == "main"
-    assert plan.tile_m == 32
+    assert plan.tile_m == 48
     assert plan.tile_n == 64
-    assert plan.num_compute_warps == 2
+    assert plan.num_splits == 16
+    assert plan.num_compute_warps == 3
     assert plan.q_in_regs is False
     assert plan.paged_direct_q_seqlen == 6
 

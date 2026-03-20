@@ -220,20 +220,6 @@ def _select_paged_kernel_config(
             num_stages=1,
             q_in_regs=True,
         )
-    if (
-        mode == "extend"
-        and head_dim == 256
-        and kv_dtype == _FP8_KV_DTYPE
-        and max_pages >= 256
-    ):
-        return PagedKernelConfig(
-            kernel_family="main",
-            tile_m=48,
-            tile_n=tile_n,
-            num_compute_warps=3,
-            num_stages=1,
-            q_in_regs=True,
-        )
     return PagedKernelConfig(
         kernel_family="main",
         tile_m=32 if head_dim == 256 else tile_m,
@@ -1770,6 +1756,7 @@ def create_paged_attention_plan(
         else 0
     )
     paged_direct_q_seqlen = uniform_q_seqlen if 0 < uniform_q_seqlen <= 8 else 0
+    q_rows_per_batch = paged_direct_q_seqlen * (q_shape[1] // k_cache_shape[2])
     kernel_config = _select_paged_kernel_config(
         head_dim,
         kv_dtype=kv_dtype,
@@ -1779,6 +1766,26 @@ def create_paged_attention_plan(
         max_pages=max_pages,
         tile_shape=tile_shape,
     )
+    if (
+        tile_shape is None
+        and kv_dtype == _FP8_KV_DTYPE
+        and mode == "extend"
+        and head_dim == 256
+        and max_pages >= 128
+        and 32 < q_rows_per_batch <= 48
+    ):
+        kernel_config = PagedKernelConfig(
+            kernel_family="main",
+            tile_m=48,
+            tile_n=64,
+            num_compute_warps=3,
+            num_stages=1,
+            q_in_regs=False,
+        )
+        if auto_num_splits and max_pages >= 512 and 24 in buckets:
+            num_splits = 24
+        elif auto_num_splits and 16 in buckets:
+            num_splits = 16
     if auto_num_splits and kv_dtype == _FP8_KV_DTYPE and mode == "decode" and num_splits > 1:
         num_splits = _promote_fp8_paged_splits_for_occupancy(
             initial_splits=num_splits,
