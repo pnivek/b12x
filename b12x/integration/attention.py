@@ -1077,6 +1077,8 @@ class _PagedAttentionCombineLaunch:
         self._dtype = _torch_to_cutlass_dtype(dtype)
         _, _, _, head_dim = split_output_shape
         num_threads = min(128, max(32, ((head_dim + 63) // 64) * 32))
+        if head_dim == 256 and num_splits >= 24:
+            num_threads = 64
         if not PagedAttentionCombineKernel.can_implement(
             self._dtype,
             self._dtype,
