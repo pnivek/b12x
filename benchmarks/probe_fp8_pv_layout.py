@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import pathlib
+import sys
 from dataclasses import dataclass
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import cuda.bindings.driver as cuda
 import cutlass
