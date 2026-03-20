@@ -319,11 +319,6 @@ class SM120ForwardKernel:
             if const_expr(self.kv_is_fp8)
             else None
         )
-        self.sK_raw_packed_layout = (
-            cute.recast_layout(cutlass.Uint32.width, self.kv_dtype.width, self.sK_raw_layout)
-            if const_expr(self.kv_is_fp8)
-            else None
-        )
         self.sV_raw_layout = (
             cute.make_layout((self.tile_n, self.tile_hdimv, self.num_stages))
             if const_expr(self.kv_is_fp8)
@@ -735,7 +730,11 @@ class SM120ForwardKernel:
         gmem_tiled_copy_KV = cpasync.CopyBulkTensorTileG2SOp()
         gmem_tiled_copy_O = cpasync.CopyBulkTensorTileS2GOp()
         sK_tma_layout = (
-            cute.select(self.sK_raw_packed_layout, mode=[0, 1])
+            cute.recast_layout(
+                cutlass.Uint32.width,
+                self.kv_dtype.width,
+                cute.select(self.sK_raw_layout, mode=[0, 1]),
+            )
             if const_expr(self.use_tma_K and self.kv_is_fp8)
             else cute.select(self.sK_layout, mode=[0, 1])
         )
