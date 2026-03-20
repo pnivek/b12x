@@ -678,7 +678,9 @@ class SM120ForwardKernel:
         self.num_mma_regs = 248
         self.num_producer_regs = 80
         self.use_tma_Q = True
-        self.use_tma_KV = mK.element_type in [cutlass.Float16, cutlass.BFloat16]
+        self.use_tma_KV = mK.element_type in [cutlass.Float16, cutlass.BFloat16] or (
+            self.kv_is_fp8 and const_expr(mPageTable is not None) and mPageTable.shape[1] > 2
+        )
         self.use_tma_O = False
         if const_expr(not self.use_tma_KV and self.dtype != cutlass.BFloat16):
             assert mFp8Lut is not None, "FP8 KV path requires an FP8 lookup table"
@@ -724,10 +726,20 @@ class SM120ForwardKernel:
         gmem_tiled_copy_Q = cpasync.CopyBulkTensorTileG2SOp()
         gmem_tiled_copy_KV = cpasync.CopyBulkTensorTileG2SOp()
         gmem_tiled_copy_O = cpasync.CopyBulkTensorTileS2GOp()
+        sK_tma_layout = (
+            cute.select(self.sK_raw_layout, mode=[0, 1])
+            if const_expr(self.kv_is_fp8)
+            else cute.select(self.sK_layout, mode=[0, 1])
+        )
+        sV_tma_layout = (
+            cute.select(self.sV_raw_layout, mode=[0, 1])
+            if const_expr(self.kv_is_fp8)
+            else cute.select(self.sV_layout, mode=[0, 1])
+        )
         self.tma_copy_bytes = {
             "Q": cute.size_in_bytes(mQ.element_type, self.sQ_layout),
-            "K": cute.size_in_bytes(mK.element_type, cute.select(self.sK_layout, mode=[0, 1])),
-            "V": cute.size_in_bytes(mV.element_type, cute.select(self.sV_layout, mode=[0, 1])),
+            "K": cute.size_in_bytes(mK.element_type, sK_tma_layout),
+            "V": cute.size_in_bytes(mV.element_type, sV_tma_layout),
         }
         if const_expr(mPageTable is not None):
             assert mK.shape[0] == self.tile_n, "paged TMA path requires page_size == tile_n"
@@ -786,14 +798,14 @@ class SM120ForwardKernel:
             tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
                 gmem_tiled_copy_KV,
                 mK,
-                cute.select(self.sK_layout, mode=[0, 1]),
+                sK_tma_layout,
                 (self.tile_n, self.tile_hdim),
                 1,
             )
             tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
                 gmem_tiled_copy_KV,
                 mV,
-                cute.select(self.sV_layout, mode=[0, 1]),
+                sV_tma_layout,
                 (self.tile_n, self.tile_hdimv),
                 1,
             )
@@ -1206,11 +1218,19 @@ class SM120ForwardKernel:
                 gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
             if const_expr(self.use_tma_KV):
                 load_K, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_K, 0, cute.make_layout(1), gK, sK
+                    tma_atom_K,
+                    0,
+                    cute.make_layout(1),
+                    gK,
+                    sKRaw if const_expr(self.kv_is_fp8) else sK,
                 )
                 load_K = copy_utils.tma_producer_copy_fn(load_K, pipeline_k)
                 load_V, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_V, 0, cute.make_layout(1), gV, sV
+                    tma_atom_V,
+                    0,
+                    cute.make_layout(1),
+                    gV,
+                    sVRaw if const_expr(self.kv_is_fp8) else sV,
                 )
                 load_V = copy_utils.tma_producer_copy_fn(load_V, pipeline_v)
 
