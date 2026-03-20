@@ -88,6 +88,8 @@ def materialize_paged_kv_cache(
     cache_seqlens: torch.Tensor,
     *,
     request_idx: int,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if k_cache.ndim != 4 or v_cache.ndim != 4:
         raise ValueError("expected paged K/V caches with shape [num_pages, page_size, heads, dim]")
@@ -101,7 +103,15 @@ def materialize_paged_kv_cache(
     page_ids = page_table[request_idx, :num_pages].to(torch.long)
     k = k_cache.index_select(0, page_ids).reshape(num_pages * page_size, k_cache.shape[2], k_cache.shape[3])
     v = v_cache.index_select(0, page_ids).reshape(num_pages * page_size, v_cache.shape[2], v_cache.shape[3])
-    return k[:cache_len], v[:cache_len]
+    k = k[:cache_len]
+    v = v[:cache_len]
+    if k.dtype == torch.float8_e4m3fn:
+        scale = 1.0 if k_descale is None else k_descale[request_idx].view(1, -1, 1)
+        k = (k.float() * scale).to(torch.bfloat16)
+    if v.dtype == torch.float8_e4m3fn:
+        scale = 1.0 if v_descale is None else v_descale[request_idx].view(1, -1, 1)
+        v = (v.float() * scale).to(torch.bfloat16)
+    return k, v
 
 
 def paged_attention_reference(
@@ -112,6 +122,8 @@ def paged_attention_reference(
     cache_seqlens: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     *,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
     softmax_scale: float | None = None,
     causal: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -148,6 +160,8 @@ def paged_attention_reference(
             page_table,
             cache_seqlens,
             request_idx=request_idx,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         out_cur, lse_cur = attention_reference(
             q[q_start:q_end],

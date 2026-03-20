@@ -81,6 +81,44 @@ def _make_paged_inputs(
     return q, k_cache, v_cache, page_table, cache_seqlens_t, cu_seqlens_q
 
 
+def _quantize_paged_kv_cache_e4m3(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch, max_pages = page_table.shape
+    _, _page_size, kv_heads, _head_dim = k_cache.shape
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    k_quant = torch.empty_like(k_cache, dtype=torch.float8_e4m3fn)
+    v_quant = torch.empty_like(v_cache, dtype=torch.float8_e4m3fn)
+    k_descale = torch.ones((batch, kv_heads), dtype=torch.float32, device=k_cache.device)
+    v_descale = torch.ones((batch, kv_heads), dtype=torch.float32, device=v_cache.device)
+    for request_idx in range(batch):
+        cache_len = int(cache_seqlens[request_idx].item())
+        num_pages = (cache_len + k_cache.shape[1] - 1) // k_cache.shape[1]
+        if num_pages == 0:
+            continue
+        page_ids = page_table[request_idx, :num_pages].to(torch.long)
+        k_pages = k_cache.index_select(0, page_ids).to(torch.float32)
+        v_pages = v_cache.index_select(0, page_ids).to(torch.float32)
+        k_scale = k_pages.abs().amax(dim=(0, 1, 3)) / finfo.max
+        v_scale = v_pages.abs().amax(dim=(0, 1, 3)) / finfo.max
+        k_scale = torch.where(k_scale > 0, k_scale, torch.ones_like(k_scale))
+        v_scale = torch.where(v_scale > 0, v_scale, torch.ones_like(v_scale))
+        k_descale[request_idx] = k_scale
+        v_descale[request_idx] = v_scale
+        k_quant[page_ids] = (k_pages / k_scale.view(1, 1, kv_heads, 1)).clamp(
+            min=finfo.min,
+            max=finfo.max,
+        ).to(torch.float8_e4m3fn)
+        v_quant[page_ids] = (v_pages / v_scale.view(1, 1, kv_heads, 1)).clamp(
+            min=finfo.min,
+            max=finfo.max,
+        ).to(torch.float8_e4m3fn)
+    return k_quant.contiguous(), v_quant.contiguous(), k_descale.contiguous(), v_descale.contiguous()
+
+
 @pytest.mark.parametrize("num_splits", [1, 4])
 def test_paged_workspace_matches_reference_for_qwen_like_extend_shape(num_splits: int) -> None:
     require_sm120()
@@ -166,6 +204,65 @@ def test_paged_plan_exposes_logical_gqa_dimensions() -> None:
     assert plan.num_compute_warps == 2
     assert plan.num_stages == 1
     assert plan.q_in_regs is False
+    assert plan.kv_dtype == torch.bfloat16
+
+
+def test_paged_workspace_matches_reference_for_fp8_kv_cache() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[6, 5, 7, 4],
+        cache_seqlens=[97, 81, 113, 68],
+        page_size=64,
+        seed=123,
+    )
+    k_fp8, v_fp8, k_descale, v_descale = _quantize_paged_kv_cache_e4m3(
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+    )
+    plan = create_paged_attention_plan(
+        q,
+        k_fp8,
+        v_fp8,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+        num_splits=1,
+    )
+    workspace = allocate_paged_attention_workspace_for_plan(plan)
+    out, lse = b12x_paged_attention_forward(
+        q,
+        k_fp8,
+        v_fp8,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        workspace=workspace,
+        plan=plan,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    ref_out, ref_lse = paged_attention_reference(
+        q,
+        k_fp8,
+        v_fp8,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=True,
+    )
+    torch.cuda.synchronize()
+
+    assert plan.kv_dtype == torch.float8_e4m3fn
+    assert (out - ref_out).abs().max().item() <= 0.05
+    assert (lse - ref_lse).abs().max().item() <= 0.05
+    assert _cosine_similarity(out, ref_out) >= 0.9999
 
 
 def test_paged_mode_inference_distinguishes_decode_from_extend() -> None:
