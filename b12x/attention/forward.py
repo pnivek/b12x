@@ -124,6 +124,23 @@ def convert_fp8_fragment_to_bf16(
 
 
 @cute.jit
+def convert_fp8_word_fragment_to_bf16_transposed(dst: cute.Tensor, src: cute.Tensor):
+    src_u8 = cute.flatten(layout_utils.transpose_view(cute.recast_tensor(src, cutlass.Uint8)))
+    dst_u32 = cute.recast_tensor(dst, cutlass.Uint32)
+    num_packed = cute.size(dst_u32.shape) // 2
+    for i in cutlass.range_constexpr(num_packed):
+        packed = (
+            cutlass.Uint32(src_u8[4 * i + 0])
+            | (cutlass.Uint32(src_u8[4 * i + 1]) << cutlass.Uint32(8))
+            | (cutlass.Uint32(src_u8[4 * i + 2]) << cutlass.Uint32(16))
+            | (cutlass.Uint32(src_u8[4 * i + 3]) << cutlass.Uint32(24))
+        )
+        bf2_lo, bf2_hi = fp8x4_e4m3_to_bfloat2x2(packed)
+        dst_u32[2 * i + 0] = bf2_lo
+        dst_u32[2 * i + 1] = bf2_hi
+
+
+@cute.jit
 def copy_flattened(src: cute.Tensor, dst: cute.Tensor):
     src_flat = cute.flatten(src)
     dst_flat = cute.flatten(dst)
@@ -179,7 +196,12 @@ def warp_mma_gemm_rs_fp8(
     for k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
         if const_expr(k < cute.size(tCrA.shape[2]) - 1):
             copy_flattened(tCsBRaw[None, None, k + 1], tCrB_raw_copy_view[None, None, k + 1])
-        convert_fp8_fragment_to_bf16(tCrB[None, None, k], tCrBRaw[None, None, k], transpose)
+        if const_expr(transpose):
+            convert_fp8_word_fragment_to_bf16_transposed(
+                tCrB[None, None, k], tCrBRaw[None, None, k]
+            )
+        else:
+            convert_fp8_fragment_to_bf16(tCrB[None, None, k], tCrBRaw[None, None, k], transpose)
         cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
 
 
@@ -1453,11 +1475,9 @@ class SM120ForwardKernel:
         thr_mma_pv = tiled_mma_pv.get_slice(tidx)
         tSrQ = thr_mma_qk.make_fragment_A(thr_mma_qk.partition_A(sQ))
         tSrK = thr_mma_qk.make_fragment_B(thr_mma_qk.partition_B(sK[None, None, 0]))
-        sVtRaw = layout_utils.transpose_view(sVRaw) if const_expr(self.kv_is_fp8) else None
+        sVRawU32 = cute.recast_tensor(sVRaw, cutlass.Uint32) if const_expr(self.kv_is_fp8) else None
+        sVtRawU32 = layout_utils.transpose_view(sVRawU32) if const_expr(self.kv_is_fp8) else None
         sKRawU8 = cute.recast_tensor(sKRaw, cutlass.Uint8) if const_expr(self.kv_is_fp8) else None
-        sVtRawU8 = (
-            cute.recast_tensor(sVtRaw, cutlass.Uint8) if const_expr(self.kv_is_fp8) else None
-        )
         tSrKRaw = (
             cute.make_fragment_like(cute.recast_tensor(tSrK, cutlass.Uint8), cutlass.Uint8)
             if const_expr(self.kv_is_fp8)
@@ -1465,7 +1485,7 @@ class SM120ForwardKernel:
         )
         tOrVt = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sVt[None, None, 0]))
         tOrVtRaw = (
-            cute.make_fragment_like(cute.recast_tensor(tOrVt, cutlass.Uint8), cutlass.Uint8)
+            cute.make_fragment_like(cute.recast_tensor(tOrVt, cutlass.Uint32), cutlass.Uint32)
             if const_expr(self.kv_is_fp8)
             else None
         )
@@ -1491,7 +1511,7 @@ class SM120ForwardKernel:
         smem_copy_atom_VRaw = (
             cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(),
-                cutlass.Uint8,
+                cutlass.Uint32,
             )
             if const_expr(self.kv_is_fp8)
             else None
@@ -1513,7 +1533,9 @@ class SM120ForwardKernel:
         tSsK = smem_thr_copy_K.partition_S(sK)
         tOsVt = smem_thr_copy_V.partition_S(sVt)
         tSsKRaw = smem_thr_copy_KRaw.partition_S(sKRawU8) if const_expr(self.kv_is_fp8) else None
-        tOsVtRaw = smem_thr_copy_VRaw.partition_S(sVtRawU8) if const_expr(self.kv_is_fp8) else None
+        tOsVtRaw = (
+            smem_thr_copy_VRaw.partition_S(sVtRawU32) if const_expr(self.kv_is_fp8) else None
+        )
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
