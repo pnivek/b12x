@@ -1399,6 +1399,7 @@ class SM120ForwardKernel:
         pipeline_k.consumer_wait(kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state))
         if const_expr(self.use_tma_K and self.kv_is_fp8):
             cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.sync_threads()
         acc_shape_S = thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
         acc_S = cute.make_fragment(acc_shape_S, Float32)
         acc_S.fill(0.0)
