@@ -341,40 +341,6 @@ def test_long_decode_plan_falls_back_to_main_kernel_family() -> None:
     assert plan.q_in_regs is False
 
 
-def test_long_fp8_decode_plan_selects_decode_micro_kernel_family() -> None:
-    require_sm120()
-    clear_attention_caches()
-
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
-        q_seqlens=[1],
-        cache_seqlens=[8192],
-        page_size=64,
-        seed=145,
-    )
-    k_fp8, v_fp8, _, _ = _quantize_paged_kv_cache_e4m3(
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-    )
-    plan = create_paged_attention_plan(
-        q,
-        k_fp8,
-        v_fp8,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        causal=True,
-    )
-
-    assert plan.mode == "decode"
-    assert plan.kernel_family == "decode_micro"
-    assert plan.tile_m == 16
-    assert plan.tile_n == 64
-    assert plan.num_compute_warps == 1
-    assert plan.q_in_regs is True
-
-
 def test_paged_workspace_pool_reuses_plan_exact_shape() -> None:
     require_sm120()
     clear_attention_caches()

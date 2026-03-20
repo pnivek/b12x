@@ -181,7 +181,6 @@ class PagedKernelConfig:
 def _select_paged_kernel_config(
     head_dim: int,
     *,
-    kv_dtype: torch.dtype,
     causal: bool,
     page_size: int,
     mode: Literal["decode", "extend"],
@@ -198,9 +197,7 @@ def _select_paged_kernel_config(
         tile_m, tile_n = tile_shape
     elif head_dim <= 128:
         tile_m, tile_n = (128, 64)
-    elif mode == "decode" and head_dim == 256 and (
-        max_pages <= 4 or (kv_dtype == _FP8_KV_DTYPE and max_pages >= 128)
-    ):
+    elif mode == "decode" and head_dim == 256 and max_pages <= 4:
         tile_m, tile_n = (16, 64)
     elif head_dim == 256:
         tile_m, tile_n = (64, 64)
@@ -209,9 +206,7 @@ def _select_paged_kernel_config(
             f"unsupported head_dim={head_dim} for the current b12x paged attention path"
         )
 
-    if mode == "decode" and head_dim == 256 and (
-        max_pages <= 4 or (kv_dtype == _FP8_KV_DTYPE and max_pages >= 128)
-    ):
+    if mode == "decode" and head_dim == 256 and max_pages <= 4:
         return PagedKernelConfig(
             kernel_family="decode_micro",
             tile_m=tile_m,
@@ -1692,7 +1687,6 @@ def create_paged_attention_plan(
     _, _, head_dim = q_shape
     kernel_config = _select_paged_kernel_config(
         head_dim,
-        kv_dtype=kv_dtype,
         causal=causal,
         page_size=page_size,
         mode=mode,
