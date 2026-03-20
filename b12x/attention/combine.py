@@ -126,12 +126,11 @@ class PagedAttentionCombineKernel:
             cute.struct.MemRange[Float32, self.num_splits + 1],
             16,
         ]
-        shared_bytes = int(math.ceil(((self.num_splits + 1) * 4) / 16) * 16)
         grid = (total_q, num_heads, 1)
         self.kernel(mO_partial, mLSE_partial, mO, mLSE, SharedStorage).launch(
             grid=grid,
             block=[self.num_threads, 1, 1],
-            smem=shared_bytes,
+            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
