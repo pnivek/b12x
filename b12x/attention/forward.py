@@ -1285,14 +1285,15 @@ class SM120ForwardKernel:
                 )
                 gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
             if const_expr(self.use_tma_K):
-                load_K, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_K,
-                    0,
-                    cute.make_layout(1),
-                    gK,
-                    sKRawU32 if const_expr(self.kv_is_fp8) else sK,
-                )
-                load_K = copy_utils.tma_producer_copy_fn(load_K, pipeline_k)
+                if const_expr(not self.kv_is_fp8):
+                    load_K, _, _ = copy_utils.tma_get_copy_fn(
+                        tma_atom_K,
+                        0,
+                        cute.make_layout(1),
+                        gK,
+                        sK,
+                    )
+                    load_K = copy_utils.tma_producer_copy_fn(load_K, pipeline_k)
             if const_expr(self.use_tma_V):
                 load_V, _, _ = copy_utils.tma_get_copy_fn(
                     tma_atom_V, 0, cute.make_layout(1), gV, sV
@@ -1313,7 +1314,24 @@ class SM120ForwardKernel:
                 src_idx = mPageTable[batch_idx, n_block] if const_expr(mPageTable is not None) else n_block
                 pipeline_k.producer_acquire(kv_producer_state)
                 if const_expr(self.use_tma_K):
-                    load_K(src_idx=src_idx, producer_state=kv_producer_state)
+                    if const_expr(self.kv_is_fp8):
+                        load_K_page, _, _ = copy_utils.tma_get_copy_fn(
+                            tma_atom_K,
+                            0,
+                            cute.make_layout(1),
+                            mK[None, None, head_idx_kv, src_idx],
+                            sKRawU32[
+                                None,
+                                None,
+                                kv_producer_state.index if const_expr(self.num_stages > 1) else 0,
+                            ],
+                            single_stage=True,
+                        )
+                        load_K_page(
+                            tma_bar_ptr=pipeline_k.producer_get_barrier(kv_producer_state),
+                        )
+                    else:
+                        load_K(src_idx=src_idx, producer_state=kv_producer_state)
                 else:
                     self.load_paged_kv_stage_raw(
                         mK,
