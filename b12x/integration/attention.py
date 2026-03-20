@@ -1677,6 +1677,15 @@ def create_paged_attention_plan(
         max_pages=max_pages,
         tile_shape=tile_shape,
     )
+    if kv_dtype == _FP8_KV_DTYPE and kernel_config.kernel_family == "main" and head_dim == 256:
+        kernel_config = PagedKernelConfig(
+            kernel_family=kernel_config.kernel_family,
+            tile_m=kernel_config.tile_m,
+            tile_n=kernel_config.tile_n,
+            num_compute_warps=1,
+            num_stages=kernel_config.num_stages,
+            q_in_regs=kernel_config.q_in_regs,
+        )
     return _get_paged_attention_plan(
         q_shape,
         k_cache_shape,
