@@ -34,6 +34,7 @@ class TileSchedulerArguments(ParamsBase):
     mCuSeqlensQ: cute.Tensor | None = None
     mSeqUsedQ: cute.Tensor | None = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
+    direct_q_rows_per_batch: Int32 = 0
     element_size: cutlass.Constexpr[int] = 2
     is_persistent: cutlass.Constexpr[bool] = False
     lpt: cutlass.Constexpr[bool] = False
@@ -347,7 +348,12 @@ class SingleTileDecodeScheduler:
         @staticmethod
         def create(args: TileSchedulerArguments, *, loc=None, ip=None):
             del loc, ip
-            num_blocks_per_batch = cute.ceil_div(args.qhead_per_kvhead_packgqa, args.tile_shape_mn[0])
+            q_rows_per_batch = (
+                args.direct_q_rows_per_batch
+                if args.direct_q_rows_per_batch > 0
+                else args.qhead_per_kvhead_packgqa
+            )
+            num_blocks_per_batch = cute.ceil_div(q_rows_per_batch, args.tile_shape_mn[0])
             return SingleTileDecodeScheduler.Params(
                 args.num_head,
                 args.num_batch,
