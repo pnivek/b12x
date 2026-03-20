@@ -199,7 +199,7 @@ def _select_paged_kernel_config(
     elif head_dim <= 128:
         tile_m, tile_n = (128, 64)
     elif mode == "decode" and head_dim == 256 and (
-        max_pages <= 4 or kv_dtype == _FP8_KV_DTYPE
+        max_pages <= 4 or (kv_dtype == _FP8_KV_DTYPE and max_pages >= 128)
     ):
         tile_m, tile_n = (16, 64)
     elif head_dim == 256:
@@ -210,7 +210,7 @@ def _select_paged_kernel_config(
         )
 
     if mode == "decode" and head_dim == 256 and (
-        max_pages <= 4 or kv_dtype == _FP8_KV_DTYPE
+        max_pages <= 4 or (kv_dtype == _FP8_KV_DTYPE and max_pages >= 128)
     ):
         return PagedKernelConfig(
             kernel_family="decode_micro",
