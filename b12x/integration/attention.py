@@ -225,6 +225,12 @@ def _select_paged_kernel_config(
     )
 
 
+def _select_paged_combine_tile_k(head_dim: int, *, num_splits: int, kv_dtype: torch.dtype) -> int:
+    if kv_dtype == _FP8_KV_DTYPE and num_splits == 24 and head_dim % 64 == 0:
+        return 64
+    return 32
+
+
 def _normalize_tensor_shape(t: torch.Tensor) -> tuple[int, ...]:
     return tuple(int(dim) for dim in t.shape)
 
@@ -1169,6 +1175,7 @@ def _compile_paged_attention_combine(
     lse_shape: tuple[int, ...],
     dtype: torch.dtype,
     num_splits: int,
+    tile_k: int,
 ):
     cutlass_dtype = _torch_to_cutlass_dtype(dtype)
     launch = _PagedAttentionCombineLaunch(
@@ -1178,6 +1185,7 @@ def _compile_paged_attention_combine(
         lse_shape=lse_shape,
         dtype=dtype,
         num_splits=num_splits,
+        tile_k=tile_k,
     )
     return cute.compile(
         launch,
@@ -1329,6 +1337,7 @@ def _get_paged_attention_plan(
                 _paged_lse_storage_shape(q_shape),
                 dtype,
                 num_splits,
+                _select_paged_combine_tile_k(q_shape[2], num_splits=num_splits, kv_dtype=kv_dtype),
             )
             if num_splits > 1
             else None

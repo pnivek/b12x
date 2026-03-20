@@ -64,7 +64,7 @@ class PagedAttentionCombineKernel:
             return False
         if num_splits <= 1 or num_splits > 24:
             return False
-        if tile_k != 32:
+        if tile_k not in [32, 64]:
             return False
         if num_threads != 32:
             return False
@@ -139,6 +139,7 @@ class PagedAttentionCombineKernel:
         lane, _, _ = cute.arch.thread_idx()
         row_idx, head_idx, k_block = cute.arch.block_idx()
         k_idx = k_block * self.tile_k + lane
+        k_idx_hi = k_idx + cute.arch.WARP_SIZE
 
         lse_max = -Float32.inf
         lse_sum = Float32.zero
@@ -171,8 +172,17 @@ class PagedAttentionCombineKernel:
             mLSE[head_idx, row_idx] = final_lse
 
         accum = Float32.zero
+        accum_hi = Float32.zero
         if k_idx < self.head_dim:
             for split_idx in cutlass.range_constexpr(self.num_splits):
                 weight = cute.arch.shuffle_sync(split_weight[split_idx], Int32(0))
                 accum += weight * mO_partial[split_idx, row_idx, head_idx, k_idx].to(Float32)
             mO[row_idx, head_idx, k_idx] = accum.to(self.dtype)
+        if const_expr(self.tile_k > cute.arch.WARP_SIZE):
+            if k_idx_hi < self.head_dim:
+                for split_idx in cutlass.range_constexpr(self.num_splits):
+                    weight = cute.arch.shuffle_sync(split_weight[split_idx], Int32(0))
+                    accum_hi += (
+                        weight * mO_partial[split_idx, row_idx, head_idx, k_idx_hi].to(Float32)
+                    )
+                mO[row_idx, head_idx, k_idx_hi] = accum_hi.to(self.dtype)
