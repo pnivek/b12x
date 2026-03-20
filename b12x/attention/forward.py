@@ -267,7 +267,10 @@ class SM120ForwardKernel:
             raise TypeError("K and V tensors must have the same data type")
         if const_expr(mQ_type not in [cutlass.Float16, cutlass.BFloat16]):
             raise TypeError("Q/O tensors must be Float16 or BFloat16")
-        if const_expr(mK_type not in [cutlass.Float16, cutlass.BFloat16, cutlass.Float8E4M3FN]):
+        k_type_valid = mK_type in [cutlass.Float16, cutlass.BFloat16, cutlass.Float8E4M3FN]
+        if const_expr(self.kv_is_fp8):
+            k_type_valid = k_type_valid or (mK_type == cutlass.Uint8)
+        if const_expr(not k_type_valid):
             raise TypeError("K/V tensors must be Float16, BFloat16, or Float8E4M3FN")
         if const_expr(mLSE_type not in [None, Float32]):
             raise TypeError("LSE tensor must be Float32")
@@ -286,7 +289,9 @@ class SM120ForwardKernel:
         if const_expr(mFp8Lut_type not in [None, Float32]):
             raise TypeError("fp8 LUT tensor must be Float32")
         assert mQ_type == self.dtype
-        assert mK_type == self.kv_dtype
+        assert mK_type == self.kv_dtype or (
+            self.kv_is_fp8 and mK_type == cutlass.Uint8
+        )
 
     def _setup_attributes(self):
         sQ_layout_atom, sK_layout_atom, sV_layout_atom, sO_layout_atom, sP_layout_atom = (
@@ -715,6 +720,11 @@ class SM120ForwardKernel:
             mO = pack_gqa_layout(mO, self.qhead_per_kvhead, nheads_kv, head_idx=2)
             if const_expr(mLSE is not None):
                 mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
+        mK_tma_src = (
+            cute.recast_tensor(mK, cutlass.Uint8)
+            if const_expr(self.use_tma_K and self.kv_is_fp8)
+            else mK
+        )
 
         gmem_tiled_copy_Q = cpasync.CopyBulkTensorTileG2SOp()
         gmem_tiled_copy_KV = cpasync.CopyBulkTensorTileG2SOp()
@@ -726,7 +736,7 @@ class SM120ForwardKernel:
         )
         self.tma_copy_bytes = {
             "Q": cute.size_in_bytes(mQ.element_type, self.sQ_layout),
-            "K": cute.size_in_bytes(mK.element_type, sK_tma_layout),
+            "K": cute.size_in_bytes(mK_tma_src.element_type, sK_tma_layout),
             "V": cute.size_in_bytes(mV.element_type, cute.select(self.sV_layout, mode=[0, 1])),
         }
         if const_expr(mPageTable is not None):
@@ -781,11 +791,10 @@ class SM120ForwardKernel:
         if const_expr(self.use_tma_K):
             tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
                 gmem_tiled_copy_KV,
-                mK,
+                mK_tma_src,
                 sK_tma_layout,
                 (self.tile_n, self.tile_hdim),
                 1,
-                internal_type=cutlass.Uint8 if const_expr(self.kv_is_fp8) else None,
             )
         if const_expr(self.use_tma_V):
             tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
