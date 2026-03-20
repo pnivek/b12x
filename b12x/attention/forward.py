@@ -382,11 +382,11 @@ class SM120ForwardKernel:
         # m16n8k32 MMA for 2x K-throughput. Slight accuracy trade-off
         # (cos ~0.9978 vs ~0.9999 for the BF16 dequant path).
         # Requires tile_n divisible by 32.
-        #   mxfp8_pv=None  -> auto-enable when FP8 KV and tile_n % 32 == 0
-        #   mxfp8_pv=True  -> force enable (asserts requirements)
+        #   mxfp8_pv=None  -> default off (use BF16 dequant path)
+        #   mxfp8_pv=True  -> force enable turbo (asserts requirements)
         #   mxfp8_pv=False -> force disable (use BF16 dequant path)
         if mxfp8_pv is None:
-            self.use_mxfp8_pv = self.kv_is_fp8 and (tile_n % 32 == 0)
+            self.use_mxfp8_pv = False
         elif mxfp8_pv:
             assert self.kv_is_fp8, "mxfp8_pv requires FP8 KV cache"
             assert tile_n % 32 == 0, "mxfp8_pv requires tile_n divisible by 32"
