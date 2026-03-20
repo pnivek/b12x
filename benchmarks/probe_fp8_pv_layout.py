@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import itertools
+import json
 import pathlib
 import sys
 from dataclasses import dataclass
@@ -18,7 +18,6 @@ from cutlass.cute.runtime import from_dlpack
 from b12x.attention import layout_utils
 from b12x.attention import utils
 from b12x.attention.forward import SM120ForwardKernel, copy_flattened
-from b12x.cute.fp4 import byte_perm
 
 
 def _to_cute_tensor(x: torch.Tensor, dtype) -> cute.Tensor:
@@ -27,29 +26,19 @@ def _to_cute_tensor(x: torch.Tensor, dtype) -> cute.Tensor:
     return tensor
 
 
-def _selector_from_perm(perm: tuple[int, int, int, int]) -> int:
-    selector = 0
-    for idx, src in enumerate(perm):
-        selector |= int(src) << (4 * idx)
-    return selector
-
-
-def _default_selectors() -> list[int]:
-    return [_selector_from_perm(perm) for perm in itertools.permutations(range(4))]
-
-
 @dataclass(frozen=True)
 class ProbeConfig:
     source_mode: str
     copy_tiling: str
 
 
-class Fp8PvLayoutProbeKernel:
+class Fp8PvLayoutDumpKernel:
     tile_m = 48
     tile_n = 64
     head_dim = 256
     num_compute_warps = 3
     num_threads = num_compute_warps * 32
+    max_dump_bytes = 1024
 
     def __init__(self, *, source_mode: str, copy_tiling: str):
         if source_mode not in {"word_direct", "word_transpose"}:
@@ -74,18 +63,23 @@ class Fp8PvLayoutProbeKernel:
     def __call__(
         self,
         mVRaw: cute.Tensor,
-        mMismatch: cute.Tensor,
-        mSelector: cute.Tensor,
+        mRefBytes: cute.Tensor,
+        mCandBytes: cute.Tensor,
+        mNumBytes: cute.Tensor,
         stream: cuda.CUstream,
     ):
+        self.kernel_spec.num_threads = (self.kernel_spec.num_compute_warps + 1) * 32
+        self.kernel_spec.num_mma_threads = self.kernel_spec.num_compute_warps * 32
+        self.kernel_spec.num_producer_threads = 32
+        self.kernel_spec.num_Q_load_threads = self.kernel_spec.num_mma_threads
+        self.kernel_spec.num_epilogue_threads = self.kernel_spec.num_mma_threads
         self.kernel_spec._setup_attributes()
-        shared_storage = self.kernel_spec._get_shared_storage_cls()
         _, tiled_mma_pv = self.kernel_spec._get_tiled_mma()
         self.kernel(
             mVRaw,
-            mMismatch,
-            mSelector,
-            shared_storage,
+            mRefBytes,
+            mCandBytes,
+            mNumBytes,
             self.kernel_spec.sV_layout,
             self.kernel_spec.sV_raw_layout,
             tiled_mma_pv,
@@ -99,22 +93,24 @@ class Fp8PvLayoutProbeKernel:
     def kernel(
         self,
         mVRaw: cute.Tensor,
-        mMismatch: cute.Tensor,
-        mSelector: cute.Tensor,
-        SharedStorage: cutlass.Constexpr,
+        mRefBytes: cute.Tensor,
+        mCandBytes: cute.Tensor,
+        mNumBytes: cute.Tensor,
         sV_layout: cutlass.Constexpr,
         sV_raw_layout: cutlass.Constexpr,
         tiled_mma_pv: cutlass.Constexpr,
     ):
         tidx = cute.arch.thread_idx()[0]
         smem = cutlass.utils.SmemAllocator()
-        storage = smem.allocate(SharedStorage)
-        sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
-        sVRaw = storage.sV_raw.get_tensor(
-            cute.make_layout(
-                (self.tile_n, self.head_dim, 1),
-                stride=(self.head_dim, 1, self.tile_n * self.head_dim),
-            )
+        sV = smem.allocate_tensor(
+            element_type=cutlass.BFloat16,
+            layout=sV_layout,
+            byte_alignment=1024,
+        )
+        sVRaw = smem.allocate_tensor(
+            element_type=cutlass.Float8E4M3FN,
+            layout=sV_raw_layout,
+            byte_alignment=1024,
         )
         total_elems = self.tile_n * self.head_dim
         for idx_iter in cutlass.range_constexpr(cute.ceil_div(total_elems, self.num_threads)):
@@ -125,11 +121,15 @@ class Fp8PvLayoutProbeKernel:
                 sVRaw[row, col, 0] = mVRaw[row, col]
         cute.arch.sync_threads()
 
+        for idx in cutlass.range_constexpr(self.max_dump_bytes):
+            mRefBytes[tidx, idx] = Int32(-1)
+            mCandBytes[tidx, idx] = Int32(-1)
+        mNumBytes[tidx] = Int32(0)
+
         thr_mma_pv = tiled_mma_pv.get_slice(tidx)
         sVt = layout_utils.transpose_view(sV)
         tOrVt = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sVt[None, None, 0]))
 
-        # Known-good byte path from the current kernel.
         sVtRaw = layout_utils.transpose_view(sVRaw)
         sVtRawU8 = cute.recast_tensor(sVtRaw, cutlass.Uint8)
         ref_copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Uint8)
@@ -137,9 +137,8 @@ class Fp8PvLayoutProbeKernel:
         tRefRaw = cute.make_fragment_like(cute.recast_tensor(tOrVt, cutlass.Uint8), cutlass.Uint8)
         tRefCopyView = ref_copy.retile(tRefRaw)
         tRefSrc = ref_copy.partition_S(sVtRawU8)
-        copy_flattened(tRefSrc[None, None, 0], tRefCopyView[None, None, 0])
+        copy_flattened(tRefSrc[None, None, None, 0], tRefCopyView[None, None, 0])
 
-        # Candidate word path to be fixed with per-word prmt.
         sVRawU32 = cute.recast_tensor(sVRaw, cutlass.Uint32)
         if const_expr(self.source_mode == "word_transpose"):
             sCand = layout_utils.transpose_view(sVRawU32)
@@ -150,61 +149,111 @@ class Fp8PvLayoutProbeKernel:
             cand_copy = utils.make_tiled_copy_A(cand_copy_atom, tiled_mma_pv).get_slice(tidx)
         else:
             cand_copy = utils.make_tiled_copy_B(cand_copy_atom, tiled_mma_pv).get_slice(tidx)
-        tCandRaw = cute.make_fragment_like(cute.recast_tensor(tOrVt, cutlass.Uint32), cutlass.Uint32)
-        tCandCopyView = cand_copy.retile(tCandRaw)
+        tCandWords = cute.make_fragment_like(cute.recast_tensor(tOrVt, cutlass.Uint32), cutlass.Uint32)
+        tCandCopyView = cand_copy.retile(tCandWords)
         tCandSrc = cand_copy.partition_S(sCand)
-        copy_flattened(tCandSrc[None, None, 0], tCandCopyView[None, None, 0])
+        copy_flattened(tCandSrc[None, None, None, 0], tCandCopyView[None, None, 0])
 
-        selector = Int32(mSelector[0])
-        cand_words = cute.flatten(tCandRaw)
-        cand_bytes = cute.flatten(cute.recast_tensor(tCandRaw, cutlass.Uint8))
         ref_bytes = cute.flatten(tRefRaw)
-
-        for word_idx in cutlass.range_constexpr(cute.size(cand_words.shape)):
-            cand_words[word_idx] = byte_perm(cand_words[word_idx], cand_words[word_idx], selector)
-
-        local_mismatch = Int32(0)
-        for idx in cutlass.range_constexpr(cute.size(ref_bytes.shape)):
-            if cand_bytes[idx] != ref_bytes[idx]:
-                local_mismatch += Int32(1)
-        mMismatch[tidx] = local_mismatch
+        cand_bytes = cute.flatten(cute.recast_tensor(tCandWords, cutlass.Uint8))
+        num_bytes = cute.size(ref_bytes.shape)
+        mNumBytes[tidx] = Int32(num_bytes)
+        for idx in cutlass.range_constexpr(self.max_dump_bytes):
+            if idx < num_bytes:
+                mRefBytes[tidx, idx] = Int32(ref_bytes[idx])
+                mCandBytes[tidx, idx] = Int32(cand_bytes[idx])
 
 
-def run_probe(config: ProbeConfig, selectors: list[int]) -> list[tuple[int, int]]:
+def run_probe(config: ProbeConfig) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     device = torch.device("cuda")
-    raw = torch.arange(64 * 256, device=device, dtype=torch.uint8).view(64, 256)
-    v_raw = raw.view(torch.float8_e4m3fn)
-    mismatch = torch.empty(96, device=device, dtype=torch.int32)
-    selector_buf = torch.empty(1, device=device, dtype=torch.int32)
-    kernel = Fp8PvLayoutProbeKernel(
+    linear_ids = torch.arange(64 * 256, device=device, dtype=torch.int32).view(64, 256)
+    kernel = Fp8PvLayoutDumpKernel(
         source_mode=config.source_mode,
         copy_tiling=config.copy_tiling,
     )
+    ref_planes = []
+    cand_planes = []
+    ref_bytes = torch.empty(
+        kernel.num_threads,
+        kernel.max_dump_bytes,
+        device=device,
+        dtype=torch.int32,
+    )
+    cand_bytes = torch.empty_like(ref_bytes)
+    num_bytes = torch.empty(kernel.num_threads, device=device, dtype=torch.int32)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    raw0 = ((linear_ids >> 0) & 0xFF).to(torch.uint8).contiguous()
     compiled = cute.compile(
         kernel,
-        _to_cute_tensor(v_raw, cutlass.Float8E4M3FN),
-        _to_cute_tensor(mismatch, cutlass.Int32),
-        _to_cute_tensor(selector_buf, cutlass.Int32),
+        _to_cute_tensor(raw0.view(torch.float8_e4m3fn), cutlass.Float8E4M3FN),
+        _to_cute_tensor(ref_bytes, cutlass.Int32),
+        _to_cute_tensor(cand_bytes, cutlass.Int32),
+        _to_cute_tensor(num_bytes, cutlass.Int32),
         stream,
     )
-
-    results: list[tuple[int, int]] = []
-    for selector in selectors:
-        selector_buf.fill_(selector)
+    for plane in range(4):
+        raw_plane = ((linear_ids >> (8 * plane)) & 0xFF).to(torch.uint8).contiguous()
         compiled(
-            _to_cute_tensor(v_raw, cutlass.Float8E4M3FN),
-            _to_cute_tensor(mismatch, cutlass.Int32),
-            _to_cute_tensor(selector_buf, cutlass.Int32),
+            _to_cute_tensor(raw_plane.view(torch.float8_e4m3fn), cutlass.Float8E4M3FN),
+            _to_cute_tensor(ref_bytes, cutlass.Int32),
+            _to_cute_tensor(cand_bytes, cutlass.Int32),
+            _to_cute_tensor(num_bytes, cutlass.Int32),
             stream,
         )
         torch.cuda.synchronize()
-        results.append((selector, int(mismatch.sum().item())))
-    return results
+        ref_planes.append(ref_bytes.cpu())
+        cand_planes.append(cand_bytes.cpu())
+
+    ref_ids = torch.zeros_like(ref_planes[0], dtype=torch.int64)
+    cand_ids = torch.zeros_like(cand_planes[0], dtype=torch.int64)
+    for plane in range(4):
+        ref_ids |= (ref_planes[plane].to(torch.int64) & 0xFF) << (8 * plane)
+        cand_ids |= (cand_planes[plane].to(torch.int64) & 0xFF) << (8 * plane)
+    return ref_ids, cand_ids, num_bytes.cpu()
+
+
+def _thread_report(
+    *,
+    thread_idx: int,
+    ref_row: torch.Tensor,
+    cand_row: torch.Tensor,
+    num_bytes: int,
+) -> dict[str, object]:
+    ref = [int(v) for v in ref_row[:num_bytes].tolist()]
+    cand = [int(v) for v in cand_row[:num_bytes].tolist()]
+    cand_pos = {value: idx for idx, value in enumerate(cand)}
+    cand_pos_for_ref = [cand_pos.get(value, -1) for value in ref]
+    return {
+        "thread": thread_idx,
+        "num_bytes": num_bytes,
+        "ref_ids": ref,
+        "cand_ids": cand,
+        "cand_pos_for_ref": cand_pos_for_ref,
+    }
+
+
+def _summarize_reports(reports: list[dict[str, object]]) -> dict[str, object]:
+    active = [report for report in reports if int(report["num_bytes"]) > 0]
+    perfect = [
+        int(report["thread"])
+        for report in active
+        if report["cand_pos_for_ref"] == list(range(int(report["num_bytes"])))
+    ]
+    first_bad = None
+    for report in active:
+        identity = list(range(int(report["num_bytes"])))
+        if report["cand_pos_for_ref"] != identity:
+            first_bad = int(report["thread"])
+            break
+    return {
+        "active_threads": len(active),
+        "perfect_threads": perfect,
+        "first_mismatched_thread": first_bad,
+    }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Probe FP8 PV raw-fragment byte layouts.")
+    parser = argparse.ArgumentParser(description="Dump FP8 PV raw-fragment byte IDs per thread.")
     parser.add_argument(
         "--source-mode",
         choices=["word_direct", "word_transpose", "all"],
@@ -215,11 +264,14 @@ def main() -> None:
         choices=["A", "B", "all"],
         default="all",
     )
-    parser.add_argument("--topk", type=int, default=8)
+    parser.add_argument(
+        "--output",
+        type=pathlib.Path,
+        default=pathlib.Path("probe_fp8_pv_layout.json"),
+    )
     args = parser.parse_args()
 
     torch.cuda.init()
-    selectors = _default_selectors()
     configs: list[ProbeConfig] = []
     source_modes = ["word_direct", "word_transpose"] if args.source_mode == "all" else [args.source_mode]
     copy_tilings = ["A", "B"] if args.copy_tiling == "all" else [args.copy_tiling]
@@ -227,11 +279,32 @@ def main() -> None:
         for copy_tiling in copy_tilings:
             configs.append(ProbeConfig(source_mode=source_mode, copy_tiling=copy_tiling))
 
+    payload: dict[str, object] = {}
     for config in configs:
-        results = sorted(run_probe(config, selectors), key=lambda item: item[1])
-        print(f"== source={config.source_mode} copy={config.copy_tiling} ==")
-        for selector, mismatches in results[: args.topk]:
-            print(f"selector=0x{selector:04x} mismatches={mismatches}")
+        ref_bytes, cand_bytes, num_bytes = run_probe(config)
+        reports = [
+            _thread_report(
+                thread_idx=thread_idx,
+                ref_row=ref_bytes[thread_idx],
+                cand_row=cand_bytes[thread_idx],
+                num_bytes=int(num_bytes[thread_idx].item()),
+            )
+            for thread_idx in range(ref_bytes.shape[0])
+        ]
+        key = f"source={config.source_mode},copy={config.copy_tiling}"
+        payload[key] = {
+            "summary": _summarize_reports(reports),
+            "threads": reports,
+        }
+        summary = payload[key]["summary"]
+        print(
+            f"{key} "
+            f"active_threads={summary['active_threads']} "
+            f"first_mismatched_thread={summary['first_mismatched_thread']}"
+        )
+
+    args.output.write_text(json.dumps(payload, indent=2))
+    print(f"wrote {args.output}")
 
 
 if __name__ == "__main__":
