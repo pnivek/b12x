@@ -484,7 +484,7 @@ def choose_paged_attention_num_splits(
             return 1
         if max_pages <= 4:
             return 4 if 4 in buckets else buckets[-1]
-        if max_pages <= 32:
+        if max_pages <= 128:
             return 8 if 8 in buckets else buckets[-1]
         return 16 if 16 in buckets else buckets[-1]
     chosen = 1
