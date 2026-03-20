@@ -69,9 +69,6 @@ class Fp8PvLayoutProbeKernel:
             num_compute_warps=self.num_compute_warps,
             Q_in_regs=False,
         )
-        self.kernel_spec._setup_attributes()
-        self.shared_storage = self.kernel_spec._get_shared_storage_cls()
-        _, self.tiled_mma_pv = self.kernel_spec._get_tiled_mma()
 
     @cute.jit
     def __call__(
@@ -81,14 +78,17 @@ class Fp8PvLayoutProbeKernel:
         mSelector: cute.Tensor,
         stream: cuda.CUstream,
     ):
+        self.kernel_spec._setup_attributes()
+        shared_storage = self.kernel_spec._get_shared_storage_cls()
+        _, tiled_mma_pv = self.kernel_spec._get_tiled_mma()
         self.kernel(
             mVRaw,
             mMismatch,
             mSelector,
-            self.shared_storage,
+            shared_storage,
             self.kernel_spec.sV_layout,
             self.kernel_spec.sV_raw_layout,
-            self.tiled_mma_pv,
+            tiled_mma_pv,
         ).launch(
             grid=(1, 1, 1),
             block=[self.num_threads, 1, 1],
