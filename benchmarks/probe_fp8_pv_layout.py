@@ -69,6 +69,7 @@ class Fp8PvLayoutProbeKernel:
             num_compute_warps=self.num_compute_warps,
             Q_in_regs=False,
         )
+        self.kernel_spec._setup_attributes()
         self.shared_storage = self.kernel_spec._get_shared_storage_cls()
         _, self.tiled_mma_pv = self.kernel_spec._get_tiled_mma()
 
