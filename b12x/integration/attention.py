@@ -914,6 +914,7 @@ class _PagedAttentionForwardLaunch:
             num_splits=num_splits,
             num_compute_warps=num_compute_warps,
             Q_in_regs=self._q_in_regs,
+            decode_direct_scheduler=mode == "decode",
         )
         assert head_dim == head_dim_k
 

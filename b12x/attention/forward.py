@@ -39,6 +39,7 @@ from b12x.attention.block_info import BlockInfo
 from b12x.attention.pack_gqa import PackGQA, pack_gqa_layout
 from b12x.attention.named_barrier import NamedBarrierFwd
 from b12x.attention.tile_scheduler import (
+    SingleTileDecodeScheduler,
     SingleTileScheduler,
     SingleTileVarlenScheduler,
     TileSchedulerArguments,
@@ -207,6 +208,7 @@ class SM120ForwardKernel:
         has_aux_tensors: bool = False,
         mma_pv_is_rs: bool = True,
         paged_kv_non_tma: bool = False,
+        decode_direct_scheduler: bool = False,
     ):
         self.dtype = dtype
         self.kv_dtype = dtype if kv_dtype is None else kv_dtype
@@ -245,6 +247,7 @@ class SM120ForwardKernel:
             "SM120 paged KV cp.async path does not support irregular head dim"
         )
         self.kv_is_fp8 = self.kv_dtype == cutlass.Float8E4M3FN
+        self.decode_direct_scheduler = decode_direct_scheduler
 
     def _check_type(
         self,
@@ -737,9 +740,13 @@ class SM120ForwardKernel:
             (self.tile_m, self.tile_hdim),
         )
         TileScheduler = (
-            SingleTileVarlenScheduler
-            if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None)
-            else SingleTileScheduler
+            SingleTileDecodeScheduler
+            if const_expr(self.decode_direct_scheduler)
+            else (
+                SingleTileVarlenScheduler
+                if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None)
+                else SingleTileScheduler
+            )
         )
         tile_sched_args = TileSchedulerArguments(
             num_block=logical_num_block,
@@ -976,14 +983,23 @@ class SM120ForwardKernel:
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
-        SeqlenInfoCls = partial(
-            SeqlenInfoQK.create,
-            seqlen_q_static=logical_seqlen_q_static,
-            seqlen_k_static=logical_seqlen_k_static,
-            mCuSeqlensQ=mCuSeqlensQ,
-            mCuSeqlensK=mCuSeqlensK,
-            mSeqUsedQ=mSeqUsedQ,
-            mSeqUsedK=mSeqUsedK,
+        SeqlenInfoCls = (
+            partial(
+                SeqlenInfoQK.create_decode,
+                seqlen_q_static=logical_seqlen_q_static,
+                seqlen_k_static=logical_seqlen_k_static,
+                mSeqUsedK=mSeqUsedK,
+            )
+            if const_expr(self.decode_direct_scheduler)
+            else partial(
+                SeqlenInfoQK.create,
+                seqlen_q_static=logical_seqlen_q_static,
+                seqlen_k_static=logical_seqlen_k_static,
+                mCuSeqlensQ=mCuSeqlensQ,
+                mCuSeqlensK=mCuSeqlensK,
+                mSeqUsedQ=mSeqUsedQ,
+                mSeqUsedK=mSeqUsedK,
+            )
         )
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
