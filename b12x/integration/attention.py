@@ -1748,6 +1748,15 @@ def create_paged_attention_plan(
         max_pages=max_pages,
         tile_shape=tile_shape,
     )
+    if kv_dtype == _FP8_KV_DTYPE and head_dim == 256 and kernel_config.kernel_family == "main":
+        kernel_config = PagedKernelConfig(
+            kernel_family="main",
+            tile_m=16,
+            tile_n=64,
+            num_compute_warps=1,
+            num_stages=1,
+            q_in_regs=True,
+        )
     if auto_num_splits and kv_dtype == _FP8_KV_DTYPE and mode == "decode" and num_splits > 1:
         num_splits = _promote_fp8_paged_splits_for_occupancy(
             initial_splits=num_splits,
