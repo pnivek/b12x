@@ -71,6 +71,20 @@ class PagedAttentionCombineKernel:
             return False
         return True
 
+    def _get_shared_storage_cls(self):
+        split_weight_struct = cute.struct.Align[
+            cute.struct.MemRange[Float32, self.num_splits],
+            16,
+        ]
+        final_lse_struct = cute.struct.Align[cute.struct.MemRange[Float32, 1], 16]
+
+        @cute.struct
+        class SharedStorage:
+            split_weight: split_weight_struct
+            final_lse: final_lse_struct
+
+        return SharedStorage
+
     @cute.jit
     def __call__(
         self,
@@ -122,10 +136,7 @@ class PagedAttentionCombineKernel:
 
         total_q = mO.shape[0]
         num_heads = mO.shape[1]
-        SharedStorage = cute.struct.Align[
-            cute.struct.MemRange[Float32, self.num_splits + 1],
-            16,
-        ]
+        SharedStorage = self._get_shared_storage_cls()
         grid = (total_q, num_heads, 1)
         self.kernel(mO_partial, mLSE_partial, mO, mLSE, SharedStorage).launch(
             grid=grid,
@@ -149,9 +160,9 @@ class PagedAttentionCombineKernel:
         row_idx, head_idx, _ = cute.arch.block_idx()
 
         smem = cutlass.utils.SmemAllocator()
-        scratch = smem.allocate(SharedStorage).get_tensor(
-            cute.make_layout((self.num_splits + 1,))
-        )
+        storage = smem.allocate(SharedStorage)
+        split_weight = storage.split_weight.get_tensor(cute.make_layout((self.num_splits,)))
+        final_lse = storage.final_lse.get_tensor(cute.make_layout((1,)))
 
         lse_max = -Float32.inf
         lse_sum = Float32.zero
@@ -166,28 +177,28 @@ class PagedAttentionCombineKernel:
                     (lse_val - lse_max_cur) * utils.LOG2_E,
                     fastmath=True,
                 )
-                scratch[split_idx] = weight
+                split_weight[split_idx] = weight
                 lse_sum += weight
             if lse_sum == 0.0:
                 for split_idx in cutlass.range_constexpr(self.num_splits):
-                    scratch[split_idx] = 0.0
-                scratch[self.num_splits] = -Float32.inf
+                    split_weight[split_idx] = 0.0
+                final_lse[0] = -Float32.inf
             else:
                 inv_lse_sum = 1.0 / lse_sum
                 for split_idx in cutlass.range_constexpr(self.num_splits):
-                    scratch[split_idx] *= inv_lse_sum
-                scratch[self.num_splits] = cute.math.log(lse_sum, fastmath=True) + lse_max_cur
+                    split_weight[split_idx] *= inv_lse_sum
+                final_lse[0] = cute.math.log(lse_sum, fastmath=True) + lse_max_cur
 
         cute.arch.sync_threads()
         if tidx == 0:
-            mLSE[head_idx, row_idx] = scratch[self.num_splits]
+            mLSE[head_idx, row_idx] = final_lse[0]
 
         for idx_iter in cutlass.range_constexpr(cute.ceil_div(self.head_dim, self.num_threads)):
             k_idx = tidx + idx_iter * self.num_threads
             if k_idx < self.head_dim:
                 accum = Float32.zero
                 for split_idx in cutlass.range_constexpr(self.num_splits):
-                    accum += scratch[split_idx] * mO_partial[
+                    accum += split_weight[split_idx] * mO_partial[
                         split_idx, row_idx, head_idx, k_idx
                     ].to(Float32)
                 mO[row_idx, head_idx, k_idx] = accum.to(self.dtype)
