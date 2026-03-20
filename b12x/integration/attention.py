@@ -197,7 +197,7 @@ def _select_paged_kernel_config(
         tile_m, tile_n = tile_shape
     elif head_dim <= 128:
         tile_m, tile_n = (128, 64)
-    elif mode == "decode" and head_dim == 256 and (max_pages <= 4 or max_pages > 32):
+    elif mode == "decode" and head_dim == 256 and max_pages <= 4:
         tile_m, tile_n = (16, 64)
     elif head_dim == 256:
         tile_m, tile_n = (64, 64)
@@ -206,7 +206,7 @@ def _select_paged_kernel_config(
             f"unsupported head_dim={head_dim} for the current b12x paged attention path"
         )
 
-    if mode == "decode" and head_dim == 256 and (max_pages <= 4 or max_pages > 32):
+    if mode == "decode" and head_dim == 256 and max_pages <= 4:
         return PagedKernelConfig(
             kernel_family="decode_micro",
             tile_m=tile_m,
