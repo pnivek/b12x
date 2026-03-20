@@ -66,24 +66,9 @@ class PagedAttentionCombineKernel:
             return False
         if tile_k != 32:
             return False
-        required_threads = max(32, math.ceil(head_dim / tile_k) * 32)
-        if num_threads % 32 != 0 or num_threads < required_threads or num_threads > 256:
+        if num_threads != 32:
             return False
         return True
-
-    def _get_shared_storage_cls(self):
-        split_weight_struct = cute.struct.Align[
-            cute.struct.MemRange[Float32, self.num_splits],
-            16,
-        ]
-        final_lse_struct = cute.struct.Align[cute.struct.MemRange[Float32, 1], 16]
-
-        @cute.struct
-        class SharedStorage:
-            split_weight: split_weight_struct
-            final_lse: final_lse_struct
-
-        return SharedStorage
 
     @cute.jit
     def __call__(
@@ -136,12 +121,10 @@ class PagedAttentionCombineKernel:
 
         total_q = mO.shape[0]
         num_heads = mO.shape[1]
-        SharedStorage = self._get_shared_storage_cls()
-        grid = (total_q, num_heads, 1)
-        self.kernel(mO_partial, mLSE_partial, mO, mLSE, SharedStorage).launch(
+        grid = (total_q, num_heads, cute.ceil_div(self.head_dim, self.tile_k))
+        self.kernel(mO_partial, mLSE_partial, mO, mLSE).launch(
             grid=grid,
             block=[self.num_threads, 1, 1],
-            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
@@ -152,21 +135,17 @@ class PagedAttentionCombineKernel:
         mLSE_partial: cute.Tensor,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
-        SharedStorage: cutlass.Constexpr,
     ):
-        tidx, _, _ = cute.arch.thread_idx()
-        lane = cute.arch.lane_idx()
-        warp_idx = cute.arch.warp_idx()
-        row_idx, head_idx, _ = cute.arch.block_idx()
-
-        smem = cutlass.utils.SmemAllocator()
-        storage = smem.allocate(SharedStorage)
-        split_weight = storage.split_weight.get_tensor(cute.make_layout((self.num_splits,)))
-        final_lse = storage.final_lse.get_tensor(cute.make_layout((1,)))
+        lane, _, _ = cute.arch.thread_idx()
+        row_idx, head_idx, k_block = cute.arch.block_idx()
+        k_idx = k_block * self.tile_k + lane
 
         lse_max = -Float32.inf
         lse_sum = Float32.zero
-        if warp_idx == 0 and lane == 0:
+        final_lse = -Float32.inf
+        split_weight = cute.make_rmem_tensor((self.num_splits,), Float32)
+
+        if lane == 0:
             for split_idx in cutlass.range_constexpr(self.num_splits):
                 lse_val = mLSE_partial[split_idx, head_idx, row_idx]
                 lse_max = max(lse_max, lse_val)
@@ -180,25 +159,20 @@ class PagedAttentionCombineKernel:
                 split_weight[split_idx] = weight
                 lse_sum += weight
             if lse_sum == 0.0:
-                for split_idx in cutlass.range_constexpr(self.num_splits):
-                    split_weight[split_idx] = 0.0
-                final_lse[0] = -Float32.inf
+                final_lse = -Float32.inf
             else:
                 inv_lse_sum = 1.0 / lse_sum
                 for split_idx in cutlass.range_constexpr(self.num_splits):
                     split_weight[split_idx] *= inv_lse_sum
-                final_lse[0] = cute.math.log(lse_sum, fastmath=True) + lse_max_cur
+                final_lse = cute.math.log(lse_sum, fastmath=True) + lse_max_cur
 
-        cute.arch.sync_threads()
-        if tidx == 0:
-            mLSE[head_idx, row_idx] = final_lse[0]
+        final_lse = cute.arch.shuffle_sync(final_lse, Int32(0))
+        if k_block == 0 and lane == 0:
+            mLSE[head_idx, row_idx] = final_lse
 
-        for idx_iter in cutlass.range_constexpr(cute.ceil_div(self.head_dim, self.num_threads)):
-            k_idx = tidx + idx_iter * self.num_threads
-            if k_idx < self.head_dim:
-                accum = Float32.zero
-                for split_idx in cutlass.range_constexpr(self.num_splits):
-                    accum += split_weight[split_idx] * mO_partial[
-                        split_idx, row_idx, head_idx, k_idx
-                    ].to(Float32)
-                mO[row_idx, head_idx, k_idx] = accum.to(self.dtype)
+        accum = Float32.zero
+        if k_idx < self.head_dim:
+            for split_idx in cutlass.range_constexpr(self.num_splits):
+                weight = cute.arch.shuffle_sync(split_weight[split_idx], Int32(0))
+                accum += weight * mO_partial[split_idx, row_idx, head_idx, k_idx].to(Float32)
+            mO[row_idx, head_idx, k_idx] = accum.to(self.dtype)
