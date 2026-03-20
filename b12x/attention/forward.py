@@ -145,10 +145,9 @@ def warp_mma_gemm_fp8(
     transpose: cutlass.Constexpr = False,
 ):
     tCrA_copy_view = smem_thr_copy_A.retile(tCrA)
-    tCrB_raw_copy_view = smem_thr_copy_B_raw.retile(tCrBRaw)
     if const_expr(not A_in_regs):
         cute.copy(smem_thr_copy_A, tCsA[None, None, 0], tCrA_copy_view[None, None, 0])
-    copy_flattened(tCsBRaw[None, None, 0], tCrB_raw_copy_view[None, None, 0])
+    convert_fp8_fragment_to_bf16(tCrB[None, None, 0], tCsBRaw[None, None, 0], transpose)
     for k in cutlass.range_constexpr(cute.size(tCsA.shape[2])):
         if k < cute.size(tCsA.shape[2]) - 1:
             if const_expr(not A_in_regs):
@@ -157,8 +156,7 @@ def warp_mma_gemm_fp8(
                     tCsA[None, None, k + 1],
                     tCrA_copy_view[None, None, k + 1],
                 )
-            copy_flattened(tCsBRaw[None, None, k + 1], tCrB_raw_copy_view[None, None, k + 1])
-        convert_fp8_fragment_to_bf16(tCrB[None, None, k], tCrBRaw[None, None, k], transpose)
+            convert_fp8_fragment_to_bf16(tCrB[None, None, k + 1], tCsBRaw[None, None, k + 1], transpose)
         cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
 
 
@@ -173,12 +171,10 @@ def warp_mma_gemm_rs_fp8(
     smem_thr_copy_B_raw: cute.TiledCopy,
     transpose: cutlass.Constexpr = False,
 ):
-    tCrB_raw_copy_view = smem_thr_copy_B_raw.retile(tCrBRaw)
-    copy_flattened(tCsBRaw[None, None, 0], tCrB_raw_copy_view[None, None, 0])
+    convert_fp8_fragment_to_bf16(tCrB[None, None, 0], tCsBRaw[None, None, 0], transpose)
     for k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
         if const_expr(k < cute.size(tCrA.shape[2]) - 1):
-            copy_flattened(tCsBRaw[None, None, k + 1], tCrB_raw_copy_view[None, None, k + 1])
-        convert_fp8_fragment_to_bf16(tCrB[None, None, k], tCrBRaw[None, None, k], transpose)
+            convert_fp8_fragment_to_bf16(tCrB[None, None, k + 1], tCsBRaw[None, None, k + 1], transpose)
         cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
 
 
