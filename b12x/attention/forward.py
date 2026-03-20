@@ -1276,7 +1276,6 @@ class SM120ForwardKernel:
         batch_idx: Int32,
         head_idx: Int32,
         m_block: Int32,
-        tidx: Int32,
         mask_fn: Callable,
         aux_tensors=None,
         fastdiv_mods=None,
@@ -1556,7 +1555,6 @@ class SM120ForwardKernel:
                     batch_idx,
                     head_idx,
                     m_block,
-                    tidx,
                     partial(mask_fn, mask_seqlen=True),
                     aux_tensors=aux_tensors,
                     is_first_n_block=True,
@@ -1603,7 +1601,6 @@ class SM120ForwardKernel:
                             batch_idx,
                             head_idx,
                             m_block,
-                            tidx,
                             partial(mask_fn, mask_seqlen=False),
                             aux_tensors=aux_tensors,
                         )
@@ -1646,7 +1643,6 @@ class SM120ForwardKernel:
                         batch_idx,
                         head_idx,
                         m_block,
-                        tidx,
                         partial(mask_fn, mask_seqlen=False),
                         aux_tensors=aux_tensors,
                     )
