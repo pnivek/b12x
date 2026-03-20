@@ -544,8 +544,11 @@ def choose_paged_attention_num_splits(
             return 1
         if max_pages <= 4:
             return 4 if 4 in buckets else buckets[-1]
-        if kv_dtype == _FP8_KV_DTYPE and max_pages >= 256 and 16 in buckets:
-            return 16
+        if kv_dtype == _FP8_KV_DTYPE:
+            if max_pages >= 512 and 24 in buckets:
+                return 24
+            if max_pages >= 256 and 16 in buckets:
+                return 16
         return 8 if 8 in buckets else buckets[-1]
     chosen = 1
     for bucket in buckets[1:]:

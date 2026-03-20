@@ -696,7 +696,7 @@ def test_mode_aware_split_bucket_selection_matches_planner_policy() -> None:
             mode="extend",
             kv_dtype=torch.float8_e4m3fn,
         )
-        == 16
+        == 24
     )
     assert (
         choose_paged_attention_num_splits(
