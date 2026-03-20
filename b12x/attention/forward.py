@@ -666,7 +666,7 @@ class SM120ForwardKernel:
         self.num_producer_threads = self.num_threads_per_warp
         self.num_Q_load_threads = self.num_mma_threads
         self.num_epilogue_threads = self.num_mma_threads
-        self.num_mma_regs = 192 if self.kv_is_fp8 else 248
+        self.num_mma_regs = 248
         self.num_producer_regs = 80
         self.use_tma_Q = True
         self.use_tma_KV = mK.element_type in [cutlass.Float16, cutlass.BFloat16]
