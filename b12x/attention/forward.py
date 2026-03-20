@@ -269,7 +269,7 @@ class SM120ForwardKernel:
             raise TypeError("Q/O tensors must be Float16 or BFloat16")
         k_type_valid = mK_type in [cutlass.Float16, cutlass.BFloat16, cutlass.Float8E4M3FN]
         if const_expr(self.kv_is_fp8):
-            k_type_valid = k_type_valid or (mK_type == cutlass.Uint8)
+            k_type_valid = k_type_valid or (mK_type == cutlass.Uint8) or (mK_type == cutlass.Uint32)
         if const_expr(not k_type_valid):
             raise TypeError("K/V tensors must be Float16, BFloat16, or Float8E4M3FN")
         if const_expr(mLSE_type not in [None, Float32]):
@@ -290,7 +290,7 @@ class SM120ForwardKernel:
             raise TypeError("fp8 LUT tensor must be Float32")
         assert mQ_type == self.dtype
         assert mK_type == self.kv_dtype or (
-            self.kv_is_fp8 and mK_type == cutlass.Uint8
+            self.kv_is_fp8 and mK_type in (cutlass.Uint8, cutlass.Uint32)
         )
 
     def _setup_attributes(self):
@@ -316,6 +316,11 @@ class SM120ForwardKernel:
         )
         self.sK_raw_layout = (
             cute.make_layout((self.tile_n, self.tile_hdim, self.num_stages))
+            if const_expr(self.kv_is_fp8)
+            else None
+        )
+        self.sK_raw_packed_layout = (
+            cute.recast_layout(cutlass.Uint32.width, self.kv_dtype.width, self.sK_raw_layout)
             if const_expr(self.kv_is_fp8)
             else None
         )
@@ -721,7 +726,7 @@ class SM120ForwardKernel:
             if const_expr(mLSE is not None):
                 mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
         mK_tma_src = (
-            cute.recast_tensor(mK, cutlass.Uint8)
+            cute.recast_tensor(mK, cutlass.Uint32)
             if const_expr(self.use_tma_K and self.kv_is_fp8)
             else mK
         )
@@ -730,7 +735,7 @@ class SM120ForwardKernel:
         gmem_tiled_copy_KV = cpasync.CopyBulkTensorTileG2SOp()
         gmem_tiled_copy_O = cpasync.CopyBulkTensorTileS2GOp()
         sK_tma_layout = (
-            cute.select(self.sK_raw_layout, mode=[0, 1])
+            cute.select(self.sK_raw_packed_layout, mode=[0, 1])
             if const_expr(self.use_tma_K and self.kv_is_fp8)
             else cute.select(self.sK_layout, mode=[0, 1])
         )
@@ -793,7 +798,10 @@ class SM120ForwardKernel:
                 gmem_tiled_copy_KV,
                 mK_tma_src,
                 sK_tma_layout,
-                (self.tile_n, self.tile_hdim),
+                (
+                    self.tile_n,
+                    self.tile_hdim // 4 if const_expr(self.kv_is_fp8) else self.tile_hdim,
+                ),
                 1,
             )
         if const_expr(self.use_tma_V):
@@ -1195,7 +1203,14 @@ class SM120ForwardKernel:
             if const_expr(mPageTable is not None):
                 mK_cur = mK[None, None, head_idx_kv, None]
                 mV_cur = mV[None, None, head_idx_kv, None]
-                gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (0, 0, None))
+                gK = cute.local_tile(
+                    mK_cur,
+                    (
+                        self.tile_n,
+                        self.tile_hdim // 4 if const_expr(self.use_tma_K and self.kv_is_fp8) else self.tile_hdim,
+                    ),
+                    (0, 0, None),
+                )
                 gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (0, 0, None))
             else:
                 mK_cur = (
@@ -1208,7 +1223,14 @@ class SM120ForwardKernel:
                     if const_expr(cute.rank(mV) == 4)
                     else mV[None, None, head_idx_kv]
                 )
-                gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0))
+                gK = cute.local_tile(
+                    mK_cur,
+                    (
+                        self.tile_n,
+                        self.tile_hdim // 4 if const_expr(self.use_tma_K and self.kv_is_fp8) else self.tile_hdim,
+                    ),
+                    (None, 0),
+                )
                 gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
             if const_expr(self.use_tma_K):
                 load_K, _, _ = copy_utils.tma_get_copy_fn(
@@ -1216,7 +1238,7 @@ class SM120ForwardKernel:
                     0,
                     cute.make_layout(1),
                     gK,
-                    cute.recast_tensor(sKRaw, cutlass.Uint8) if const_expr(self.kv_is_fp8) else sK,
+                    cute.recast_tensor(sKRaw, cutlass.Uint32) if const_expr(self.kv_is_fp8) else sK,
                 )
                 load_K = copy_utils.tma_producer_copy_fn(load_K, pipeline_k)
             if const_expr(self.use_tma_V):
