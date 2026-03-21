@@ -17,3 +17,4 @@ uv.lock
 run_*.log
 results*.tsv
 experiments/
+probe.*.json
