@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -15,6 +16,7 @@ from b12x.attention.combine import PagedAttentionCombineKernel
 from b12x.attention.forward import SM120ForwardKernel
 from b12x.cute.utils import current_cuda_stream, make_ptr
 
+_ATTN_TURBO = os.environ.get("B12X_ATTN", "").upper() == "TURBO"
 _DEFAULT_PAGED_SPLIT_BUCKETS = (1, 2, 4, 8, 16, 24, 32)
 _DEFAULT_MIN_PAGES_PER_SPLIT = 8
 _FP8_KV_DTYPE = torch.float8_e4m3fn
@@ -687,6 +689,11 @@ class _PagedAttentionForwardLaunch:
             num_compute_warps=num_compute_warps,
             Q_in_regs=self._q_in_regs,
             paged_direct_q_seqlen=paged_direct_q_seqlen,
+            mxfp8_pv=True if (
+                _ATTN_TURBO
+                and self._kv_dtype == cutlass.Float8E4M3FN
+                and tile_n % 32 == 0
+            ) else None,
         )
         assert head_dim == head_dim_k
 
@@ -1189,7 +1196,7 @@ def _resolve_paged_attention_workspace(
             "workspace must be a PagedAttentionWorkspace or PagedAttentionWorkspacePool"
         )
 
-    stream_key = int(torch.cuda.current_stream(plan.device).cuda_stream)
+    stream_key = int(torch.cuda.current_stream(plan.device).stream_id)
     key = (stream_key, plan.key)
     resolved = workspace.workspaces.get(key)
     if resolved is None:

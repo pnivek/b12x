@@ -25,6 +25,52 @@ def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 10])
+@pytest.mark.parametrize(
+    "q_heads,kv_heads",
+    [(24, 4), (12, 2), (6, 1)],
+    ids=["gqa6-24h", "gqa6-12h", "gqa6-1kv"],
+)
+def test_paged_decode_small_gqa_ratio(
+    batch_size: int, q_heads: int, kv_heads: int
+) -> None:
+    """Decode with GQA ratio 6 — tile_m (128) doesn't divide packed Q rows,
+    so Q must use the non-TMA async-copy path."""
+    require_sm120()
+    clear_attention_caches()
+
+    q_seqlens = [1] * batch_size
+    cache_seqlens_vals = [64 + i * 31 for i in range(batch_size)]
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=q_seqlens,
+        cache_seqlens=cache_seqlens_vals,
+        page_size=64,
+        q_heads=q_heads,
+        kv_heads=kv_heads,
+        head_dim=128,
+        seed=42,
+    )
+    plan = create_paged_attention_plan(
+        q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q,
+        causal=True, mode="decode", num_splits=1,
+    )
+    workspace = allocate_paged_attention_workspace_for_plan(plan)
+
+    output, lse = b12x_paged_attention_forward(
+        q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q,
+        workspace=workspace, plan=plan,
+    )
+    torch.cuda.synchronize()
+
+    ref_out, ref_lse = paged_attention_reference(
+        q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q, causal=True,
+    )
+    assert (output - ref_out).abs().max().item() <= 0.02
+    assert _cosine_similarity(output, ref_out) >= 0.99999
+
+
+@torch.inference_mode()
 @pytest.mark.parametrize("num_splits", [1, 4])
 def test_paged_attention_replays_under_cuda_graph_with_dynamic_metadata(num_splits: int) -> None:
     require_sm120()

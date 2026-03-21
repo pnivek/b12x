@@ -674,7 +674,7 @@ def _resolve_workspace(
             "workspace must be a TPMoEWorkspace or TPMoEWorkspacePool"
         )
 
-    stream_key = int(torch.cuda.current_stream(device).cuda_stream)
+    stream_key = int(torch.cuda.current_stream(device).stream_id)
     key = _workspace_pool_key(
         implementation,
         stream_key=stream_key,
@@ -1640,7 +1640,7 @@ def _get_route_workspace(
 
     if isinstance(workspace, TPMoEWorkspacePool):
         key = (
-            int(torch.cuda.current_stream(device=device).cuda_stream),
+            int(torch.cuda.current_stream(device=device).stream_id),
             device.index,
             m,
             num_experts,

@@ -56,6 +56,49 @@ class PackGQA:
         return tPrPtr
 
     @cute.jit
+    def load_Q(
+        self,
+        mQ: cute.Tensor,
+        sQ: cute.Tensor,
+        gmem_tiled_copy: cute.TiledCopy,
+        tidx: cutlass.Int32,
+        block: cutlass.Int32,
+        seqlen: cutlass.Int32,
+    ):
+        gmem_thr_copy = gmem_tiled_copy.get_slice(tidx)
+        cQ = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
+        tQsQ = gmem_thr_copy.partition_D(sQ)
+        tQcQ = gmem_thr_copy.partition_S(cQ)
+        t0QcQ = gmem_thr_copy.get_slice(0).partition_S(cQ)
+        tQpQ = utils.predicate_k(tQcQ, limit=mQ.shape[1])
+        tQcQ_row = tQcQ[0, None, 0]
+        threads_per_row = gmem_tiled_copy.layout_tv_tiled.shape[0][0]
+        num_threads = gmem_tiled_copy.size
+        tPrQPtr = self.compute_ptr(mQ[None, 0], tQcQ_row, tidx, block, threads_per_row, num_threads)
+        for m in cutlass.range_constexpr(cute.size(tQsQ.shape[1])):
+            q_ptr_i64 = utils.shuffle_sync(
+                tPrQPtr[m // threads_per_row], m % threads_per_row, width=threads_per_row
+            )
+            q_gmem_ptr = cute.make_ptr(
+                mQ.element_type, q_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
+            )
+            if (
+                t0QcQ[0, m, 0][0]
+                < seqlen * self.qhead_per_kvhead - block * self.m_block_size - tQcQ_row[0][0]
+            ):
+                mQ_cur = cute.make_tensor(q_gmem_ptr, (self.head_dim_padded,))
+                elems_per_load = cute.size(tQsQ.shape[0][0])
+                mQ_cur_copy = cute.tiled_divide(mQ_cur, (elems_per_load,))
+                for k in cutlass.range_constexpr(cute.size(tQsQ.shape[2])):
+                    ki = tQcQ[0, 0, k][1] // elems_per_load
+                    cute.copy(
+                        gmem_thr_copy,
+                        mQ_cur_copy[None, ki],
+                        tQsQ[None, m, k],
+                        pred=tQpQ[None, m, k] if cutlass.const_expr(self.check_hdim_oob) else None,
+                    )
+
+    @cute.jit
     def store_LSE(
         self,
         mLSE: cute.Tensor,

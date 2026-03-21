@@ -787,7 +787,9 @@ class SM120ForwardKernel:
         self.num_epilogue_threads = self.num_mma_threads
         self.num_mma_regs = 248
         self.num_producer_regs = 80
-        self.use_tma_Q = True
+        self.use_tma_Q = not (
+            self.pack_gqa and self.tile_m % self.qhead_per_kvhead != 0
+        )
         self.use_tma_O = False
 
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
@@ -828,7 +830,11 @@ class SM120ForwardKernel:
             if const_expr(mLSE is not None):
                 mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
 
-        gmem_tiled_copy_Q = cpasync.CopyBulkTensorTileG2SOp()
+        gmem_tiled_copy_Q = (
+            cpasync.CopyBulkTensorTileG2SOp()
+            if const_expr(self.use_tma_Q)
+            else self.gmem_tiled_copy_Q
+        )
         gmem_tiled_copy_KV = cpasync.CopyBulkTensorTileG2SOp()
         gmem_tiled_copy_O = cpasync.CopyBulkTensorTileS2GOp()
         sK_tma_layout = (
@@ -849,12 +855,14 @@ class SM120ForwardKernel:
         assert mK.shape[0] == self.tile_n, "paged TMA path requires page_size == tile_n"
         assert mV.shape[0] == self.tile_n, "paged TMA path requires page_size == tile_n"
 
-        tma_atom_Q, tma_tensor_Q = cpasync.make_tiled_tma_atom(
-            gmem_tiled_copy_Q,
-            mQ,
-            self.sQ_layout,
-            (self.tile_m, self.tile_hdim),
-        )
+        tma_atom_Q, tma_tensor_Q = (None, None)
+        if const_expr(self.use_tma_Q):
+            tma_atom_Q, tma_tensor_Q = cpasync.make_tiled_tma_atom(
+                gmem_tiled_copy_Q,
+                mQ,
+                self.sQ_layout,
+                (self.tile_m, self.tile_hdim),
+            )
         TileScheduler = (
             SingleTileDecodeScheduler
             if const_expr(self.paged_direct_q_seqlen > 0)
@@ -914,7 +922,7 @@ class SM120ForwardKernel:
             1,
         )
         self.kernel(
-            tma_tensor_Q,
+            tma_tensor_Q if const_expr(self.use_tma_Q) else mQ,
             tma_tensor_K,
             tma_tensor_V,
             tma_tensor_O if const_expr(self.use_tma_O) else mO,
@@ -967,7 +975,7 @@ class SM120ForwardKernel:
         mPageTable: Optional[cute.Tensor],
         mKDescale: Optional[cute.Tensor],
         mVDescale: Optional[cute.Tensor],
-        tma_atom_Q: cute.CopyAtom,
+        tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
         tma_atom_O: Optional[cute.CopyAtom],
@@ -992,7 +1000,8 @@ class SM120ForwardKernel:
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == 0:
-            cpasync.prefetch_descriptor(tma_atom_Q)
+            if const_expr(self.use_tma_Q):
+                cpasync.prefetch_descriptor(tma_atom_Q)
             cpasync.prefetch_descriptor(tma_atom_K)
             cpasync.prefetch_descriptor(tma_atom_V)
             if const_expr(tma_atom_O is not None):
@@ -1002,7 +1011,10 @@ class SM120ForwardKernel:
         storage = smem.allocate(SharedStorage)
         mbar_ptr_Q = storage.mbar_ptr.data_ptr()
         if warp_idx == 0:
-            cute.arch.mbarrier_init(mbar_ptr_Q, 1)
+            if const_expr(self.use_tma_Q):
+                cute.arch.mbarrier_init(mbar_ptr_Q, 1)
+            else:
+                cute.arch.mbarrier_init(mbar_ptr_Q, self.num_Q_load_threads)
         cute.arch.sync_threads()
 
         pipeline_kv_consumer_group = cutlass.pipeline.CooperativeGroup(
@@ -1162,7 +1174,7 @@ class SM120ForwardKernel:
         sKRaw: Optional[cute.Tensor],
         sVRaw: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
-        tma_atom_Q: cute.CopyAtom,
+        tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
         pipeline_k: pipeline.PipelineAsync,
@@ -1194,10 +1206,11 @@ class SM120ForwardKernel:
             else:
                 mQ_batch = mQ
             mQ_cur = mQ_batch[None, None, head_idx]
-            gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
-            load_Q, _, _ = copy_utils.tma_get_copy_fn(
-                tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True
-            )
+            if const_expr(self.use_tma_Q):
+                gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
+                load_Q, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True
+                )
             head_idx_kv = (
                 head_idx if const_expr(self.pack_gqa) else head_idx // self.qhead_per_kvhead
             )
@@ -1225,9 +1238,10 @@ class SM120ForwardKernel:
             n_block_min, n_block_max = block_info.get_n_block_min_max(
                 seqlen, m_block, split_idx, self.num_splits
             )
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr_Q, self.tma_copy_bytes["Q"])
-            load_Q(tma_bar_ptr=mbar_ptr_Q)
+            if const_expr(self.use_tma_Q):
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr_Q, self.tma_copy_bytes["Q"])
+                load_Q(tma_bar_ptr=mbar_ptr_Q)
             if const_expr(self.Q_in_regs):
                 wait_for_q_consumed = True
             for n_tile in cutlass.range(n_block_max - n_block_min, unroll=1):
@@ -1496,6 +1510,21 @@ class SM120ForwardKernel:
                 softmax.scale_log2 = base_softmax_scale_log2 * mKDescale[batch_idx, head_idx_kv]
             else:
                 softmax.scale_log2 = base_softmax_scale_log2
+            if const_expr(not self.use_tma_Q):
+                pack_gqa_loader = PackGQA(
+                    self.tile_m, self.tile_hdim, self.check_hdim_oob, self.qhead_per_kvhead
+                )
+                if const_expr(cute.rank(mQ) == 4):
+                    mQ_batch = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)
+                elif const_expr(seqlen.has_cu_seqlens_q):
+                    mQ_batch = seqlen.offset_batch_Q(mQ, batch_idx, dim=2)
+                else:
+                    mQ_batch = mQ
+                mQ_cur = mQ_batch[None, None, head_idx]
+                pack_gqa_loader.load_Q(
+                    mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q
+                )
+                cute.arch.cp_async_mbarrier_arrive_noinc(mbar_ptr_Q)
             cute.arch.mbarrier_wait(mbar_ptr_Q, phase=q_consumer_phase)
             q_consumer_phase ^= 1
             if const_expr(self.Q_in_regs):
