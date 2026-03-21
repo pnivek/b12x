@@ -82,6 +82,7 @@ def get_num_sm(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
+@torch._dynamo.disable
 def current_cuda_stream() -> cuda.CUstream:
     """Return the current Torch CUDA stream as a CUDA driver stream handle."""
     return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
