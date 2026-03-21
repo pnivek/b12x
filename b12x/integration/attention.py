@@ -475,7 +475,6 @@ def _validate_paged_inputs_against_plan(
         q_shape[1:],
         k_cache_shape,
         v_cache_shape,
-        page_table_shape[0],
         plan.device,
         plan.dtype,
         plan.kv_dtype,
@@ -484,7 +483,6 @@ def _validate_paged_inputs_against_plan(
         (plan.num_q_heads, plan.head_dim),
         plan.k_cache_shape,
         plan.v_cache_shape,
-        plan.num_batch,
         device,
         dtype,
         kv_dtype,
@@ -498,7 +496,6 @@ def _validate_paged_inputs_against_plan(
 
 @dataclass(frozen=True, kw_only=True)
 class PagedAttentionPlanKey:
-    num_batch: int
     num_q_heads: int
     head_dim: int
     k_cache_shape: tuple[int, ...]
@@ -595,19 +592,13 @@ class _PagedAttentionForwardLaunch:
         self._q_heads = q_heads
         self._head_dim = head_dim
         self._num_splits = num_splits
-        self._batch = page_table_shape[0]
         self._page_size = page_size
+        self._kv_heads = kv_heads_k
         self._q_stride = (q_heads * head_dim, head_dim, 1)
         self._k_cache_shape = k_cache_shape
         self._k_cache_stride = _contiguous_stride(k_cache_shape)
         self._v_cache_shape = v_cache_shape
         self._v_cache_stride = _contiguous_stride(v_cache_shape)
-        self._cache_seqlens_shape = cache_seqlens_shape
-        self._cache_seqlens_stride = _contiguous_stride(cache_seqlens_shape)
-        self._cu_seqlens_q_shape = cu_seqlens_q_shape
-        self._cu_seqlens_q_stride = _contiguous_stride(cu_seqlens_q_shape)
-        self._descale_shape = (self._batch, k_cache_shape[2])
-        self._descale_stride = _contiguous_stride(self._descale_shape)
         self._dtype = _torch_to_cutlass_dtype(dtype)
         self._kv_dtype = _torch_to_cutlass_dtype(kv_dtype)
         self._q_in_regs = q_in_regs or (self._kv_dtype == cutlass.Float8E4M3FN)
@@ -698,9 +689,9 @@ class _PagedAttentionForwardLaunch:
         softmax_scale: float,
         total_q: Int32,
         max_pages: Int32,
+        batch: Int32,
         current_stream: cuda.CUstream,
     ):
-        # Layouts with only structural (compile-time) dimensions.
         q_tensor = cute.make_tensor(q_ptr, layout=cute.make_layout(
             (total_q, self._q_heads, self._head_dim), stride=self._q_stride))
         k_cache_tensor = cute.make_tensor(
@@ -711,29 +702,20 @@ class _PagedAttentionForwardLaunch:
             v_cache_ptr,
             layout=cute.make_layout(self._v_cache_shape, stride=self._v_cache_stride),
         )
-        # O and LSE layouts depend on total_q (runtime).
         o_shape, o_stride = self._make_o_shape_stride(total_q)
         o_tensor = cute.make_tensor(o_ptr, layout=cute.make_layout(o_shape, stride=o_stride))
         lse_shape, lse_stride = self._make_lse_shape_stride(total_q)
         lse_tensor = cute.make_tensor(lse_ptr, layout=cute.make_layout(lse_shape, stride=lse_stride))
-        cu_seqlens_q_tensor = cute.make_tensor(
-            cu_seqlens_q_ptr,
-            layout=cute.make_layout(self._cu_seqlens_q_shape, stride=self._cu_seqlens_q_stride),
-        )
-        cache_seqlens_tensor = cute.make_tensor(
-            cache_seqlens_ptr,
-            layout=cute.make_layout(self._cache_seqlens_shape, stride=self._cache_seqlens_stride),
-        )
+        cu_seqlens_q_tensor = cute.make_tensor(cu_seqlens_q_ptr, layout=cute.make_layout(
+            (batch + 1,), stride=(1,)))
+        cache_seqlens_tensor = cute.make_tensor(cache_seqlens_ptr, layout=cute.make_layout(
+            (batch,), stride=(1,)))
         page_table_tensor = cute.make_tensor(page_table_ptr, layout=cute.make_layout(
-            (self._batch, max_pages), stride=(max_pages, 1)))
-        k_descale_tensor = cute.make_tensor(
-            k_descale_ptr,
-            layout=cute.make_layout(self._descale_shape, stride=self._descale_stride),
-        )
-        v_descale_tensor = cute.make_tensor(
-            v_descale_ptr,
-            layout=cute.make_layout(self._descale_shape, stride=self._descale_stride),
-        )
+            (batch, max_pages), stride=(max_pages, 1)))
+        k_descale_tensor = cute.make_tensor(k_descale_ptr, layout=cute.make_layout(
+            (batch, self._kv_heads), stride=(self._kv_heads, 1)))
+        v_descale_tensor = cute.make_tensor(v_descale_ptr, layout=cute.make_layout(
+            (batch, self._kv_heads), stride=(self._kv_heads, 1)))
         self._kernel(
             q_tensor,
             k_cache_tensor,
@@ -746,7 +728,7 @@ class _PagedAttentionForwardLaunch:
             mPageTable=page_table_tensor,
             mKDescale=k_descale_tensor,
             mVDescale=v_descale_tensor,
-            logical_num_batch_static=self._batch,
+            logical_num_batch_static=batch,
             logical_seqlen_q_static=total_q,
             logical_seqlen_k_static=self._page_size * max_pages,
             stream=current_stream,
@@ -835,13 +817,10 @@ class _PagedAttentionCombineLaunch:
 
 @functools.cache
 def _compile_paged_attention(
-    batch: int,
     q_heads: int,
     head_dim: int,
     k_cache_shape: tuple[int, ...],
     v_cache_shape: tuple[int, ...],
-    cache_seqlens_shape: tuple[int, ...],
-    cu_seqlens_q_shape: tuple[int, ...],
     dtype: torch.dtype,
     kv_dtype: torch.dtype,
     causal: bool,
@@ -857,16 +836,14 @@ def _compile_paged_attention(
 ):
     cutlass_dtype = _torch_to_cutlass_dtype(dtype)
     cutlass_kv_dtype = _torch_to_cutlass_dtype(kv_dtype)
-    # Placeholder values for total_q and max_pages — these are runtime.
-    placeholder_total_q = 1
-    placeholder_max_pages = 1
+    # Placeholder values — total_q, max_pages, batch are runtime.
     launch = _PagedAttentionForwardLaunch(
-        q_shape=(placeholder_total_q, q_heads, head_dim),
+        q_shape=(1, q_heads, head_dim),
         k_cache_shape=k_cache_shape,
         v_cache_shape=v_cache_shape,
-        page_table_shape=(batch, placeholder_max_pages),
-        cache_seqlens_shape=cache_seqlens_shape,
-        cu_seqlens_q_shape=cu_seqlens_q_shape,
+        page_table_shape=(1, 1),
+        cache_seqlens_shape=(1,),
+        cu_seqlens_q_shape=(2,),
         dtype=dtype,
         kv_dtype=kv_dtype,
         causal=causal,
@@ -893,6 +870,7 @@ def _compile_paged_attention(
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
         1.0,
+        Int32(1),
         Int32(1),
         Int32(1),
         current_cuda_stream(),
@@ -926,7 +904,6 @@ def _compile_paged_attention_combine(
 
 @functools.cache
 def _get_paged_attention_plan(
-    batch: int,
     q_heads: int,
     head_dim: int,
     k_cache_shape: tuple[int, ...],
@@ -947,11 +924,8 @@ def _get_paged_attention_plan(
 ) -> PagedAttentionPlan:
     _, _, kv_heads, _ = k_cache_shape
     qhead_per_kvhead = q_heads // kv_heads
-    cache_seqlens_shape = (batch,)
-    cu_seqlens_q_shape = (batch + 1,)
     return PagedAttentionPlan(
         key=PagedAttentionPlanKey(
-            num_batch=batch,
             num_q_heads=q_heads,
             head_dim=head_dim,
             k_cache_shape=k_cache_shape,
@@ -973,13 +947,10 @@ def _get_paged_attention_plan(
             qhead_per_kvhead=qhead_per_kvhead,
         ),
         compiled=_compile_paged_attention(
-            batch,
             q_heads,
             head_dim,
             k_cache_shape,
             v_cache_shape,
-            cache_seqlens_shape,
-            cu_seqlens_q_shape,
             dtype,
             kv_dtype,
             causal,
@@ -1034,10 +1005,12 @@ def _validate_paged_workspace(
 def allocate_paged_attention_workspace_for_plan(
     plan: PagedAttentionPlan,
     total_q: int,
+    batch: int = 1,
 ) -> PagedAttentionWorkspace:
     """Allocate reusable scratch for one paged attention plan.
 
     ``total_q`` sets the capacity of the output and LSE buffers.
+    ``batch`` sets the capacity of the descale buffers.
     """
     q_shape = (total_q, plan.num_q_heads, plan.head_dim)
     output = torch.empty(q_shape, dtype=plan.dtype, device=plan.device)
@@ -1045,7 +1018,7 @@ def allocate_paged_attention_workspace_for_plan(
         _paged_lse_storage_shape(q_shape), dtype=torch.float32, device=plan.device,
     )
     default_descale = torch.ones(
-        (plan.num_batch, plan.num_kv_heads),
+        (batch, plan.num_kv_heads),
         dtype=torch.float32,
         device=plan.device,
     )
@@ -1087,6 +1060,7 @@ def _resolve_paged_attention_workspace(
     *,
     plan: PagedAttentionPlan,
     total_q: int,
+    batch: int = 1,
 ) -> PagedAttentionWorkspace:
     if isinstance(workspace, PagedAttentionWorkspace):
         _validate_paged_workspace(workspace, plan=plan)
@@ -1100,7 +1074,7 @@ def _resolve_paged_attention_workspace(
     key = (stream_key, plan.key)
     resolved = workspace.workspaces.get(key)
     if resolved is None or resolved.output.shape[0] < total_q:
-        resolved = allocate_paged_attention_workspace_for_plan(plan, total_q=total_q)
+        resolved = allocate_paged_attention_workspace_for_plan(plan, total_q=total_q, batch=batch)
         workspace.workspaces[key] = resolved
     return resolved
 
@@ -1233,9 +1207,7 @@ def create_paged_attention_plan(
             device=device,
         )
     _, q_heads, head_dim_q = q_shape
-    batch = page_table_shape[0]
     return _get_paged_attention_plan(
-        batch,
         q_heads,
         head_dim_q,
         k_cache_shape,
@@ -1286,7 +1258,7 @@ def allocate_paged_attention_workspace(
         split_buckets=split_buckets,
         min_pages_per_split=min_pages_per_split,
     )
-    return allocate_paged_attention_workspace_for_plan(plan, total_q=q.shape[0])
+    return allocate_paged_attention_workspace_for_plan(plan, total_q=q.shape[0], batch=page_table.shape[0])
 
 
 def _combine_split_partials(
@@ -1379,19 +1351,20 @@ def b12x_paged_attention_forward(
         plan=plan,
     )
     resolved_workspace = _resolve_paged_attention_workspace(
-        workspace, plan=resolved_plan, total_q=q_shape[0],
+        workspace, plan=resolved_plan, total_q=q_shape[0], batch=page_table_shape[0],
     )
+    actual_batch = page_table_shape[0]
     _validate_optional_paged_descale(
         k_descale,
         name="k_descale",
-        batch=resolved_plan.num_batch,
+        batch=actual_batch,
         kv_heads=resolved_plan.num_kv_heads,
         device=device,
     )
     _validate_optional_paged_descale(
         v_descale,
         name="v_descale",
-        batch=resolved_plan.num_batch,
+        batch=actual_batch,
         kv_heads=resolved_plan.num_kv_heads,
         device=device,
     )
@@ -1442,6 +1415,7 @@ def b12x_paged_attention_forward(
         float(softmax_scale),
         q_shape[0],
         page_table_shape[1],
+        page_table_shape[0],
         current_cuda_stream(),
     )
     if resolved_plan.num_splits > 1:

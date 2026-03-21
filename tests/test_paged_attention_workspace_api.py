@@ -190,7 +190,6 @@ def test_paged_plan_exposes_logical_gqa_dimensions() -> None:
         causal=True,
     )
 
-    assert plan.num_batch == len(q_seqlens)
     assert plan.num_q_heads == 8
     assert plan.num_kv_heads == 1
     assert plan.qhead_per_kvhead == 8
