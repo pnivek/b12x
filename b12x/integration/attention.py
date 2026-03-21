@@ -557,6 +557,8 @@ class PagedAttentionWorkspace:
     default_v_descale: torch.Tensor
     split_output: torch.Tensor | None = None
     split_lse: torch.Tensor | None = None
+    split_lut: torch.Tensor | None = None
+    num_splits_buf: torch.Tensor | None = None
     plan_key: PagedAttentionPlanKey | None = None
 
 
@@ -699,6 +701,9 @@ class _PagedAttentionForwardLaunch:
         total_q: Int32,
         max_pages: Int32,
         batch: Int32,
+        split_lut_ptr: cute.Pointer,
+        split_lut_size: Int32,
+        num_splits_out_ptr: cute.Pointer,
         current_stream: cuda.CUstream,
     ):
         q_tensor = cute.make_tensor(q_ptr, layout=cute.make_layout(
@@ -725,6 +730,10 @@ class _PagedAttentionForwardLaunch:
             (batch, self._kv_heads), stride=(self._kv_heads, 1)))
         v_descale_tensor = cute.make_tensor(v_descale_ptr, layout=cute.make_layout(
             (batch, self._kv_heads), stride=(self._kv_heads, 1)))
+        split_lut_tensor = cute.make_tensor(split_lut_ptr, layout=cute.make_layout(
+            (split_lut_size,), stride=(1,)))
+        num_splits_out_tensor = cute.make_tensor(num_splits_out_ptr, layout=cute.make_layout(
+            (1,), stride=(1,)))
         self._kernel(
             q_tensor,
             k_cache_tensor,
@@ -737,6 +746,8 @@ class _PagedAttentionForwardLaunch:
             mPageTable=page_table_tensor,
             mKDescale=k_descale_tensor,
             mVDescale=v_descale_tensor,
+            mSplitLut=split_lut_tensor,
+            mNumSplitsOut=num_splits_out_tensor,
             logical_num_batch_static=batch,
             logical_seqlen_q_static=total_q,
             logical_seqlen_k_static=self._page_size * max_pages,
@@ -790,7 +801,7 @@ class _PagedAttentionCombineLaunch:
         output_ptr: cute.Pointer,
         lse_ptr: cute.Pointer,
         total_q: Int32,
-        num_splits: Int32,
+        num_splits_in_ptr: cute.Pointer,
         current_stream: cuda.CUstream,
     ):
         q_plane = self._q_heads * self._head_dim
@@ -816,12 +827,14 @@ class _PagedAttentionCombineLaunch:
             layout=cute.make_layout(
                 (self._q_heads, total_q), stride=(total_q, 1)),
         )
+        num_splits_in_tensor = cute.make_tensor(num_splits_in_ptr, layout=cute.make_layout(
+            (1,), stride=(1,)))
         self._kernel(
             split_output_tensor,
             split_lse_tensor,
             output_tensor,
             lse_tensor,
-            num_splits,
+            num_splits_in_tensor,
             stream=current_stream,
         )
 
@@ -884,6 +897,9 @@ def _compile_paged_attention(
         Int32(1),
         Int32(1),
         Int32(1),
+        make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
+        Int32(1),
+        make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
         current_cuda_stream(),
     )
 
@@ -909,7 +925,7 @@ def _compile_paged_attention_combine(
         make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
         Int32(1),
-        Int32(num_splits),
+        make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
         current_cuda_stream(),
     )
 
@@ -1014,6 +1030,73 @@ def _validate_paged_workspace(
             raise ValueError("paged workspace with num_splits>1 requires split scratch buffers")
 
 
+def _build_split_lut(
+    plan: PagedAttentionPlan,
+    max_pages_per_req: int,
+) -> torch.Tensor:
+    """Build a dense LUT mapping max_pages -> num_splits.
+
+    Reproduces the full split selection logic (initial bucket + overrides)
+    for each possible max_pages value, so the forward kernel can look up
+    the optimal split count at runtime without host involvement.
+    """
+    page_size = plan.key.k_cache_shape[1]
+    mode = plan.mode
+    kv_dtype = plan.kv_dtype
+    head_dim = plan.head_dim
+    q_rows_per_batch = plan.paged_direct_q_seqlen * plan.qhead_per_kvhead
+    tile_m = plan.tile_m
+    device = plan.device
+    buckets = _DEFAULT_PAGED_SPLIT_BUCKETS
+
+    lut = torch.ones(max_pages_per_req + 1, dtype=torch.int32, device="cpu")
+    for mp in range(max_pages_per_req + 1):
+        cache_seqlens = torch.tensor([mp * page_size], dtype=torch.int32)
+        ns = choose_paged_attention_num_splits(
+            cache_seqlens, page_size=page_size, mode=mode, kv_dtype=kv_dtype,
+            split_buckets=buckets,
+        )
+        # Apply extend split ladder.
+        if (
+            mode == "extend"
+            and head_dim == 256
+            and mp >= 32
+            and 32 < q_rows_per_batch <= 48
+        ):
+            if mp >= 128 and 24 in buckets:
+                ns = 24
+            elif kv_dtype == _FP8_KV_DTYPE and mp <= 64 and 32 in buckets:
+                ns = 32
+            elif kv_dtype == _FP8_KV_DTYPE and mp >= 32 and 24 in buckets:
+                ns = 24
+            elif mp >= 32 and 16 in buckets:
+                ns = 16
+        # Apply decode overrides.
+        if mode == "decode" and ns > 1:
+            promote_buckets = buckets
+            if kv_dtype != _FP8_KV_DTYPE and mp <= 64:
+                promote_buckets = tuple(b for b in buckets if b <= 16)
+            # Occupancy-based promotion.
+            target_ctas = torch.cuda.get_device_properties(device).multi_processor_count
+            blocks_per_split = (
+                plan.key.k_cache_shape[0] // page_size  # num_batch approximation
+                * ((q_rows_per_batch + tile_m - 1) // tile_m if q_rows_per_batch > 0 else 1)
+                * (plan.num_kv_heads if plan.num_q_heads != plan.num_kv_heads else plan.num_q_heads)
+            ) if q_rows_per_batch > 0 else 1
+            useful_cap = max(1, mp // 2) if mp > 1 else 1
+            for bucket in promote_buckets:
+                if bucket < ns or bucket > mp or bucket > useful_cap:
+                    continue
+                ns = bucket
+                if blocks_per_split * bucket >= target_ctas:
+                    break
+            # FP8 decode 32-split override at mid-range.
+            if kv_dtype == _FP8_KV_DTYPE and 32 <= mp <= 64 and 32 in buckets:
+                ns = 32
+        lut[mp] = ns
+    return lut.to(device=device)
+
+
 def allocate_paged_attention_workspace_for_plan(
     plan: PagedAttentionPlan,
     total_q: int,
@@ -1036,7 +1119,11 @@ def allocate_paged_attention_workspace_for_plan(
     )
     split_output = None
     split_lse = None
+    split_lut = None
+    num_splits_buf = None
     if plan.num_splits > 1:
+        page_size = plan.key.k_cache_shape[1]
+        max_pages_per_req = plan.key.k_cache_shape[0]  # page_table columns
         split_output = torch.empty(
             _split_paged_output_shape(q_shape, num_splits=plan.num_splits),
             dtype=plan.dtype,
@@ -1047,6 +1134,8 @@ def allocate_paged_attention_workspace_for_plan(
             dtype=torch.float32,
             device=plan.device,
         )
+        split_lut = _build_split_lut(plan, max_pages_per_req)
+        num_splits_buf = torch.zeros(1, dtype=torch.int32, device=plan.device)
     return PagedAttentionWorkspace(
         device=plan.device,
         dtype=plan.dtype,
@@ -1058,6 +1147,8 @@ def allocate_paged_attention_workspace_for_plan(
         default_v_descale=default_descale,
         split_output=split_output,
         split_lse=split_lse,
+        split_lut=split_lut,
+        num_splits_buf=num_splits_buf,
         plan_key=plan.key,
     )
 
@@ -1322,7 +1413,7 @@ def _combine_split_partials(
             assumed_align=4,
         ),
         total_q,
-        Int32(plan.num_splits),
+        make_ptr(cutlass.Int32, workspace.num_splits_buf.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         current_cuda_stream(),
     )
 
@@ -1441,6 +1532,13 @@ def b12x_paged_attention_forward(
         q_shape[0],
         page_table_shape[1],
         page_table_shape[0],
+        make_ptr(cutlass.Int32, resolved_workspace.split_lut.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
+            if resolved_workspace.split_lut is not None
+            else make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
+        resolved_workspace.split_lut.shape[0] if resolved_workspace.split_lut is not None else Int32(1),
+        make_ptr(cutlass.Int32, resolved_workspace.num_splits_buf.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
+            if resolved_workspace.num_splits_buf is not None
+            else make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
         current_cuda_stream(),
     )
     if resolved_plan.num_splits > 1:

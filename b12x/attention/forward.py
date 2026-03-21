@@ -765,6 +765,8 @@ class SM120ForwardKernel:
         mVDescale: Optional[cute.Tensor] = None,
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
+        mSplitLut: cute.Tensor = None,
+        mNumSplitsOut: cute.Tensor = None,
         aux_tensors=None,
         logical_num_batch_static: Int32 = 1,
         logical_seqlen_q_static: Int32 = 0,
@@ -961,6 +963,8 @@ class SM120ForwardKernel:
             SharedStorage,
             logical_seqlen_q_static,
             logical_seqlen_k_static,
+            mSplitLut,
+            mNumSplitsOut,
             aux_tensors,
         ).launch(
             grid=grid_dim,
@@ -1004,6 +1008,8 @@ class SM120ForwardKernel:
         SharedStorage: cutlass.Constexpr,
         logical_seqlen_q_static: Int32,
         logical_seqlen_k_static: Int32,
+        mSplitLut: cute.Tensor = None,
+        mNumSplitsOut: cute.Tensor = None,
         aux_tensors=None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1115,6 +1121,25 @@ class SM120ForwardKernel:
         )
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
+        # Compute actual_num_splits from cache_seqlens via LUT.
+        # Every thread computes the same value independently — bs reads
+        # from L1 cache, a max reduction, one divide, one LUT lookup.
+        if const_expr(self.is_split_kv):
+            max_seqlen = Int32(0)
+            for i in cutlass.range(mSeqUsedK.shape[0]):
+                val = mSeqUsedK[i]
+                max_seqlen = cutlass.max(max_seqlen, val)
+            max_pages = (max_seqlen + self.tile_n - 1) // self.tile_n
+            actual_num_splits = mSplitLut[cutlass.min(max_pages, mSplitLut.shape[0] - 1)]
+            # First CTA writes for the combine kernel.
+            bidx = cute.arch.block_idx()
+            if bidx[0] == 0 and bidx[1] == 0 and bidx[2] == 0:
+                tidx0 = cute.arch.thread_idx()[0]
+                if tidx0 == 0:
+                    mNumSplitsOut[0] = actual_num_splits
+        else:
+            actual_num_splits = Int32(1)
+
         if warp_idx == self.producer_warp_idx:
             cute.arch.setmaxregister_decrease(self.num_producer_regs)
             self.load(
@@ -1136,6 +1161,7 @@ class SM120ForwardKernel:
                 block_info,
                 SeqlenInfoCls,
                 TileSchedulerCls,
+                actual_num_splits,
             )
         elif warp_idx < self.num_compute_warps:
             cute.arch.setmaxregister_increase(self.num_mma_regs)
@@ -1167,6 +1193,7 @@ class SM120ForwardKernel:
                 block_info,
                 SeqlenInfoCls,
                 TileSchedulerCls,
+                actual_num_splits,
                 aux_tensors,
             )
 
@@ -1191,6 +1218,7 @@ class SM120ForwardKernel:
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
+        actual_num_splits: Int32 = 1,
     ):
         kv_producer_state = pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.num_stages
@@ -1244,7 +1272,7 @@ class SM120ForwardKernel:
             load_V = copy_utils.tma_producer_copy_fn(load_V, pipeline_v)
 
             n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx, self.num_splits
+                seqlen, m_block, split_idx, actual_num_splits
             )
             if const_expr(self.use_tma_Q):
                 with cute.arch.elect_one():
@@ -1438,6 +1466,7 @@ class SM120ForwardKernel:
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
+        actual_num_splits: Int32 = 1,
         aux_tensors=None,
     ):
         thr_mma_qk = tiled_mma_qk.get_slice(tidx)
@@ -1580,7 +1609,7 @@ class SM120ForwardKernel:
             )
 
             n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx, self.num_splits
+                seqlen, m_block, split_idx, actual_num_splits
             )
             if n_block_max > n_block_min:
                 kv_consumer_state = self.mma_one_n_block(

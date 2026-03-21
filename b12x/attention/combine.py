@@ -77,7 +77,7 @@ class PagedAttentionCombineKernel:
         mLSE_partial: cute.Tensor,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
-        num_splits: Int32,
+        mNumSplitsIn: cute.Tensor,
         stream: cuda.CUstream,
     ):
         if const_expr(len(mO_partial.shape) != 4):
@@ -117,7 +117,7 @@ class PagedAttentionCombineKernel:
         total_q = mO.shape[0]
         num_heads = mO.shape[1]
         grid = (total_q, num_heads, 1)
-        self.kernel(mO_partial, mLSE_partial, mO, mLSE, num_splits).launch(
+        self.kernel(mO_partial, mLSE_partial, mO, mLSE, mNumSplitsIn).launch(
             grid=grid,
             block=[self.num_threads, 1, 1],
             stream=stream,
@@ -130,13 +130,14 @@ class PagedAttentionCombineKernel:
         mLSE_partial: cute.Tensor,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
-        num_splits: Int32,
+        mNumSplitsIn: cute.Tensor,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         row_idx, head_idx, _ = cute.arch.block_idx()
         lane = tidx % cute.arch.WARP_SIZE
         warp_idx = tidx // cute.arch.WARP_SIZE
 
+        num_splits = mNumSplitsIn[0]
         lane_active = lane < num_splits
         split_lse = -Float32.inf
         if lane_active:

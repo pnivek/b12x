@@ -45,7 +45,7 @@ class BlockInfo:
             n_block_min = cutlass.max(n_idx_left // self.tile_n, 0)
         if const_expr(self.is_split_kv):
             total_blocks = cutlass.max(n_block_max - n_block_min, 0)
-            chunk = cute.ceil_div(total_blocks, num_splits)
+            chunk = (total_blocks + num_splits - 1) // num_splits
             split_max = n_block_max - split_idx * chunk
             split_min = cutlass.max(n_block_min, split_max - chunk)
             n_block_max = cutlass.max(cutlass.min(split_max, n_block_max), n_block_min)
