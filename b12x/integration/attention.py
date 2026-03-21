@@ -1188,11 +1188,8 @@ def create_paged_attention_plan(
         tile_shape is None
         and mode == "extend"
         and head_dim == 256
+        and max_pages >= 32
         and 32 < q_rows_per_batch <= 48
-        and (
-            (kv_dtype == _FP8_KV_DTYPE and max_pages >= 128)
-            or (kv_dtype != _FP8_KV_DTYPE and max_pages >= 32)
-        )
     ):
         kernel_config = PagedKernelConfig(
             kernel_family="main",
@@ -1200,16 +1197,24 @@ def create_paged_attention_plan(
             tile_n=64,
             num_compute_warps=3,
             num_stages=1,
-            q_in_regs=kv_dtype != _FP8_KV_DTYPE,
+            q_in_regs=True,
         )
-        if auto_num_splits and max_pages >= 512 and 24 in buckets:
+        # Extend split ladder: dtype-aware, more splits for FP8 mid-range.
+        if auto_num_splits and max_pages >= 128 and 24 in buckets:
             num_splits = 24
-        elif auto_num_splits and max_pages >= 128 and 16 in buckets:
+        elif auto_num_splits and kv_dtype == _FP8_KV_DTYPE and max_pages <= 64 and 32 in buckets:
+            num_splits = 32
+        elif auto_num_splits and kv_dtype == _FP8_KV_DTYPE and max_pages >= 32 and 24 in buckets:
+            num_splits = 24
+        elif auto_num_splits and max_pages >= 32 and 16 in buckets:
             num_splits = 16
     if auto_num_splits and mode == "decode" and num_splits > 1:
+        promote_buckets = buckets
+        if kv_dtype != _FP8_KV_DTYPE and max_pages <= 64:
+            promote_buckets = tuple(b for b in buckets if b <= 16)
         num_splits = _promote_fp8_paged_splits_for_occupancy(
             initial_splits=num_splits,
-            split_buckets=buckets,
+            split_buckets=promote_buckets,
             q_shape=q_shape,
             k_cache_shape=k_cache_shape,
             page_table_shape=page_table_shape,
@@ -1218,6 +1223,10 @@ def create_paged_attention_plan(
             device=device,
             q_rows_per_batch=q_rows_per_batch,
         )
+        # FP8 decode at mid-range context benefits from more splits to hide
+        # the per-fragment dequant latency.
+        if kv_dtype == _FP8_KV_DTYPE and 32 <= max_pages <= 64 and 32 in buckets:
+            num_splits = 32
     _, q_heads, head_dim_q = q_shape
     return _get_paged_attention_plan(
         q_heads,
