@@ -332,10 +332,6 @@ class SM120ForwardKernel:
         num_threads: int = 160,
         num_compute_warps: int = 4,
         Q_in_regs: bool = False,
-        score_mod: Optional[cutlass.Constexpr] = None,
-        mask_mod: Optional[cutlass.Constexpr] = None,
-        has_aux_tensors: bool = False,
-        mma_pv_is_rs: bool = True,
         paged_kv_non_tma: bool = False,
         paged_direct_q_seqlen: int = 0,
         mxfp8_pv: Optional[bool] = None,
@@ -360,13 +356,7 @@ class SM120ForwardKernel:
         self.num_splits = num_splits
         self.is_split_kv = num_splits > 1
         self.Q_in_regs = Q_in_regs
-        self.score_mod = score_mod
-        self.mask_mod = mask_mod
         self.qk_acc_dtype = Float32
-        assert self.score_mod is None, "score_mod is not part of the initial b12x transplant"
-        assert self.mask_mod is None, "mask_mod is not part of the initial b12x transplant"
-        self.mma_pv_is_rs = mma_pv_is_rs
-        assert self.mma_pv_is_rs, "SM120 rewrite currently only supports register-sourced PV"
         self.buffer_align_bytes = 1024
         self.num_compute_warps = num_compute_warps
         assert self.num_compute_warps >= 1
@@ -403,8 +393,6 @@ class SM120ForwardKernel:
         mO_type: Type[cutlass.Numeric],
         mLSE_type: Type[cutlass.Numeric] | None,
         mCuSeqlensQ_type: Type[cutlass.Numeric] | None,
-        mCuSeqlensK_type: Type[cutlass.Numeric] | None,
-        mSeqUsedQ_type: Type[cutlass.Numeric] | None,
         mSeqUsedK_type: Type[cutlass.Numeric] | None,
         mKDescale_type: Type[cutlass.Numeric] | None,
         mVDescale_type: Type[cutlass.Numeric] | None,
@@ -422,10 +410,6 @@ class SM120ForwardKernel:
             raise TypeError("LSE tensor must be Float32")
         if const_expr(mCuSeqlensQ_type not in [None, Int32]):
             raise TypeError("cu_seqlens_q tensor must be Int32")
-        if const_expr(mCuSeqlensK_type not in [None, Int32]):
-            raise TypeError("cu_seqlens_k tensor must be Int32")
-        if const_expr(mSeqUsedQ_type not in [None, Int32]):
-            raise TypeError("seqused_q tensor must be Int32")
         if const_expr(mSeqUsedK_type not in [None, Int32]):
             raise TypeError("seqused_k tensor must be Int32")
         if const_expr(mKDescale_type not in [None, Float32]):
@@ -775,8 +759,6 @@ class SM120ForwardKernel:
         mLSE: Optional[cute.Tensor],
         softmax_scale: Float32,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
-        mCuSeqlensK: Optional[cute.Tensor] = None,
-        mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
         mPageTable: Optional[cute.Tensor] = None,
         mKDescale: Optional[cute.Tensor] = None,
@@ -784,18 +766,12 @@ class SM120ForwardKernel:
         mFp8Lut: Optional[cute.Tensor] = None,
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
-        learnable_sink: Optional[cute.Tensor] = None,
-        blocksparse_tensors=None,
         aux_tensors=None,
         logical_num_batch_static: Int32 = 1,
         logical_seqlen_q_static: Int32 = 0,
         logical_seqlen_k_static: Int32 = 0,
         stream: cuda.CUstream = None,
     ):
-        assert mCuSeqlensK is None
-        assert mSeqUsedQ is None
-        assert learnable_sink is None
-        assert blocksparse_tensors is None
         self._check_type(
             *(
                 t.element_type if t is not None else None
@@ -806,8 +782,6 @@ class SM120ForwardKernel:
                     mO,
                     mLSE,
                     mCuSeqlensQ,
-                    mCuSeqlensK,
-                    mSeqUsedQ,
                     mSeqUsedK,
                     mKDescale,
                     mVDescale,
@@ -902,7 +876,7 @@ class SM120ForwardKernel:
             if const_expr(mPageTable is not None and self.paged_direct_q_seqlen > 0)
             else (
                 SingleTileVarlenScheduler
-                if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None)
+                if const_expr(mCuSeqlensQ is not None)
                 else SingleTileScheduler
             )
         )
@@ -926,7 +900,6 @@ class SM120ForwardKernel:
                 * (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
             ),
             mCuSeqlensQ=mCuSeqlensQ,
-            mSeqUsedQ=mSeqUsedQ,
             element_size=self.dtype.width // 8,
             lpt=self.is_causal or self.is_local,
             is_split_kv=self.is_split_kv,
@@ -966,8 +939,6 @@ class SM120ForwardKernel:
             tma_tensor_O if const_expr(self.use_tma_O) else mO,
             mLSE,
             mCuSeqlensQ,
-            mCuSeqlensK,
-            mSeqUsedQ,
             mSeqUsedK,
             mPageTable,
             mKDescale,
@@ -1012,8 +983,6 @@ class SM120ForwardKernel:
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
-        mCuSeqlensK: Optional[cute.Tensor],
-        mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
         mKDescale: Optional[cute.Tensor],
@@ -1166,8 +1135,6 @@ class SM120ForwardKernel:
                     seqlen_q_static=logical_seqlen_q_static,
                     seqlen_k_static=logical_seqlen_k_static,
                     mCuSeqlensQ=mCuSeqlensQ,
-                    mCuSeqlensK=mCuSeqlensK,
-                    mSeqUsedQ=mSeqUsedQ,
                     mSeqUsedK=mSeqUsedK,
                 )
             )
@@ -1727,7 +1694,6 @@ class SM120ForwardKernel:
                 mask_local=self.is_local,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=None,
-                mask_mod=self.mask_mod,
             )
 
             n_block_min, n_block_max = block_info.get_n_block_min_max(
