@@ -66,12 +66,6 @@ def _split_paged_lse_storage_shape(
     return (num_splits, *base)
 
 
-@functools.cache
-def _fp8_e4m3_lut(device_index: int) -> torch.Tensor:
-    values = torch.arange(256, dtype=torch.uint8, device=torch.device("cuda", device_index))
-    return values.view(torch.float8_e4m3fn).to(torch.float32).contiguous()
-
-
 def _paged_attention_logical_dims(
     q_shape: tuple[int, ...],
     k_cache_shape: tuple[int, ...],
@@ -581,7 +575,6 @@ class PagedAttentionWorkspace:
     lse: torch.Tensor
     default_k_descale: torch.Tensor
     default_v_descale: torch.Tensor
-    fp8_e4m3_lut: torch.Tensor
     split_output: torch.Tensor | None = None
     split_lse: torch.Tensor | None = None
     plan_key: PagedAttentionPlanKey | None = None
@@ -715,7 +708,6 @@ class _PagedAttentionForwardLaunch:
         page_table_ptr: cute.Pointer,
         k_descale_ptr: cute.Pointer,
         v_descale_ptr: cute.Pointer,
-        fp8_lut_ptr: cute.Pointer,
         softmax_scale: float,
         current_stream: cuda.CUstream,
     ):
@@ -753,10 +745,6 @@ class _PagedAttentionForwardLaunch:
             v_descale_ptr,
             layout=cute.make_layout(self._descale_shape, stride=self._descale_stride),
         )
-        fp8_lut_tensor = cute.make_tensor(
-            fp8_lut_ptr,
-            layout=cute.make_layout((256,), stride=(1,)),
-        )
         self._kernel(
             q_tensor,
             k_cache_tensor,
@@ -769,7 +757,6 @@ class _PagedAttentionForwardLaunch:
             mPageTable=page_table_tensor,
             mKDescale=k_descale_tensor,
             mVDescale=v_descale_tensor,
-            mFp8Lut=fp8_lut_tensor,
             logical_num_batch_static=self._num_batch,
             logical_seqlen_q_static=self._seqlen_q_static,
             logical_seqlen_k_static=self._seqlen_k_static,
@@ -910,7 +897,6 @@ def _compile_paged_attention(
         make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
-        make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
         1.0,
@@ -1150,7 +1136,6 @@ def allocate_paged_attention_workspace_for_plan(plan: PagedAttentionPlan) -> Pag
         dtype=torch.float32,
         device=plan.device,
     )
-    fp8_lut = _fp8_e4m3_lut(plan.device.index if plan.device.index is not None else torch.cuda.current_device())
     split_output = None
     split_lse = None
     if plan.num_splits > 1:
@@ -1185,7 +1170,6 @@ def allocate_paged_attention_workspace_for_plan(plan: PagedAttentionPlan) -> Pag
         lse=lse,
         default_k_descale=default_descale.clone(),
         default_v_descale=default_descale,
-        fp8_e4m3_lut=fp8_lut,
         split_output=split_output,
         split_lse=split_lse,
         plan_key=plan.key,
@@ -1543,7 +1527,6 @@ def b12x_paged_attention_forward(
         make_ptr(cutlass.Int32, page_table.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Float32, k_descale_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Float32, v_descale_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
-        make_ptr(cutlass.Float32, resolved_workspace.fp8_e4m3_lut.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         float(softmax_scale),
         current_cuda_stream(),
     )

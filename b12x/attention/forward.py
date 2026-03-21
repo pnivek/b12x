@@ -391,7 +391,6 @@ class SM120ForwardKernel:
         mSeqUsedK_type: Type[cutlass.Numeric] | None,
         mKDescale_type: Type[cutlass.Numeric] | None,
         mVDescale_type: Type[cutlass.Numeric] | None,
-        mFp8Lut_type: Type[cutlass.Numeric] | None,
     ):
         if const_expr(not (mQ_type == mO_type)):
             raise TypeError("Q and O tensors must have the same data type")
@@ -411,8 +410,6 @@ class SM120ForwardKernel:
             raise TypeError("k_descale tensor must be Float32")
         if const_expr(mVDescale_type not in [None, Float32]):
             raise TypeError("v_descale tensor must be Float32")
-        if const_expr(mFp8Lut_type not in [None, Float32]):
-            raise TypeError("fp8 LUT tensor must be Float32")
         assert mQ_type == self.dtype
         assert mK_type == self.kv_dtype
 
@@ -758,7 +755,6 @@ class SM120ForwardKernel:
         mPageTable: Optional[cute.Tensor] = None,
         mKDescale: Optional[cute.Tensor] = None,
         mVDescale: Optional[cute.Tensor] = None,
-        mFp8Lut: Optional[cute.Tensor] = None,
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
         aux_tensors=None,
@@ -780,7 +776,6 @@ class SM120ForwardKernel:
                     mSeqUsedK,
                     mKDescale,
                     mVDescale,
-                    mFp8Lut,
                 )
             )
         )
@@ -851,9 +846,8 @@ class SM120ForwardKernel:
             "K": cute.size_in_bytes(mK.element_type, sK_tma_layout),
             "V": cute.size_in_bytes(mV.element_type, sV_tma_layout),
         }
-        if const_expr(mPageTable is not None):
-            assert mK.shape[0] == self.tile_n, "paged TMA path requires page_size == tile_n"
-            assert mV.shape[0] == self.tile_n, "paged TMA path requires page_size == tile_n"
+        assert mK.shape[0] == self.tile_n, "paged TMA path requires page_size == tile_n"
+        assert mV.shape[0] == self.tile_n, "paged TMA path requires page_size == tile_n"
 
         tma_atom_Q, tma_tensor_Q = cpasync.make_tiled_tma_atom(
             gmem_tiled_copy_Q,
@@ -863,7 +857,7 @@ class SM120ForwardKernel:
         )
         TileScheduler = (
             SingleTileDecodeScheduler
-            if const_expr(mPageTable is not None and self.paged_direct_q_seqlen > 0)
+            if const_expr(self.paged_direct_q_seqlen > 0)
             else (
                 SingleTileVarlenScheduler
                 if const_expr(mCuSeqlensQ is not None)
@@ -930,7 +924,6 @@ class SM120ForwardKernel:
             mPageTable,
             mKDescale,
             mVDescale,
-            mFp8Lut,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
@@ -974,7 +967,6 @@ class SM120ForwardKernel:
         mPageTable: Optional[cute.Tensor],
         mKDescale: Optional[cute.Tensor],
         mVDescale: Optional[cute.Tensor],
-        mFp8Lut: Optional[cute.Tensor],
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
@@ -1083,7 +1075,7 @@ class SM120ForwardKernel:
                 seqlen_k_static=logical_seqlen_k_static,
                 mSeqUsedK=mSeqUsedK,
             )
-            if const_expr(mPageTable is not None and self.paged_direct_q_seqlen == 1)
+            if const_expr(self.paged_direct_q_seqlen == 1)
             else (
                 partial(
                     SeqlenInfoQK.create_uniform_q,
@@ -1091,7 +1083,7 @@ class SM120ForwardKernel:
                     seqlen_k_static=logical_seqlen_k_static,
                     mSeqUsedK=mSeqUsedK,
                 )
-                if const_expr(mPageTable is not None and self.paged_direct_q_seqlen > 1)
+                if const_expr(self.paged_direct_q_seqlen > 1)
                 else partial(
                     SeqlenInfoQK.create,
                     seqlen_q_static=logical_seqlen_q_static,
@@ -1152,64 +1144,11 @@ class SM120ForwardKernel:
                 mKDescale,
                 mVDescale,
                 softmax_scale,
-                mFp8Lut,
                 block_info,
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 aux_tensors,
             )
-
-    @cute.jit
-    def dequant_fp8_stage_shared(
-        self,
-        sXRaw: cute.Tensor,
-        sX: cute.Tensor,
-        mFp8Lut: Optional[cute.Tensor],
-        stage_idx: Int32,
-        tile_hdim_x: cutlass.Constexpr,
-        tidx: Int32,
-    ):
-        total_elems = self.tile_n * tile_hdim_x
-        total_vec4 = total_elems // 4
-        one = Float32(1.0)
-        sXRaw_u8 = cute.recast_tensor(sXRaw, cutlass.Uint8)
-        if const_expr(self.dtype == cutlass.BFloat16):
-            for idx_iter in cutlass.range_constexpr(cute.ceil_div(total_vec4, self.num_mma_threads)):
-                vec_idx = tidx + idx_iter * self.num_mma_threads
-                if vec_idx < total_vec4:
-                    linear_idx = vec_idx * 4
-                    row = linear_idx // tile_hdim_x
-                    col = linear_idx - row * tile_hdim_x
-                    packed = (
-                        cutlass.Uint32(sXRaw_u8[row, col + 0, stage_idx])
-                        | (cutlass.Uint32(sXRaw_u8[row, col + 1, stage_idx]) << cutlass.Uint32(8))
-                        | (cutlass.Uint32(sXRaw_u8[row, col + 2, stage_idx]) << cutlass.Uint32(16))
-                        | (cutlass.Uint32(sXRaw_u8[row, col + 3, stage_idx]) << cutlass.Uint32(24))
-                    )
-                    bf2_01, bf2_23 = fp8x4_e4m3_to_bfloat2x2(packed)
-                    value0, value1 = bfloat2_to_float2_scaled(bf2_01, one)
-                    value2, value3 = bfloat2_to_float2_scaled(bf2_23, one)
-                    sX[row, col + 0, stage_idx] = value0.to(self.dtype)
-                    sX[row, col + 1, stage_idx] = value1.to(self.dtype)
-                    sX[row, col + 2, stage_idx] = value2.to(self.dtype)
-                    sX[row, col + 3, stage_idx] = value3.to(self.dtype)
-            cute.arch.barrier(
-                barrier_id=int(NamedBarrierFwd.KVConvert),
-                number_of_threads=self.num_mma_threads,
-            )
-            return
-        assert mFp8Lut is not None
-        for idx_iter in cutlass.range_constexpr(cute.ceil_div(total_elems, self.num_mma_threads)):
-            linear_idx = tidx + idx_iter * self.num_mma_threads
-            if linear_idx < total_elems:
-                row = linear_idx // tile_hdim_x
-                col = linear_idx - row * tile_hdim_x
-                value = mFp8Lut[sXRaw_u8[row, col, stage_idx].to(Int32)]
-                sX[row, col, stage_idx] = value.to(self.dtype)
-        cute.arch.barrier(
-            barrier_id=int(NamedBarrierFwd.KVConvert),
-            number_of_threads=self.num_mma_threads,
-        )
 
     @cute.jit
     def load(
@@ -1262,24 +1201,10 @@ class SM120ForwardKernel:
             head_idx_kv = (
                 head_idx if const_expr(self.pack_gqa) else head_idx // self.qhead_per_kvhead
             )
-            if const_expr(mPageTable is not None):
-                mK_cur = mK[None, None, head_idx_kv, None]
-                mV_cur = mV[None, None, head_idx_kv, None]
-                gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (0, 0, None))
-                gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (0, 0, None))
-            else:
-                mK_cur = (
-                    seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
-                    if const_expr(cute.rank(mK) == 4)
-                    else mK[None, None, head_idx_kv]
-                )
-                mV_cur = (
-                    seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
-                    if const_expr(cute.rank(mV) == 4)
-                    else mV[None, None, head_idx_kv]
-                )
-                gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0))
-                gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
+            mK_cur = mK[None, None, head_idx_kv, None]
+            mV_cur = mV[None, None, head_idx_kv, None]
+            gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (0, 0, None))
+            gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (0, 0, None))
             load_K, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_K,
                 0,
@@ -1307,7 +1232,7 @@ class SM120ForwardKernel:
                 wait_for_q_consumed = True
             for n_tile in cutlass.range(n_block_max - n_block_min, unroll=1):
                 n_block = n_block_max - 1 - n_tile
-                src_idx = mPageTable[batch_idx, n_block] if const_expr(mPageTable is not None) else n_block
+                src_idx = mPageTable[batch_idx, n_block]
                 pipeline_k.producer_acquire(kv_producer_state)
                 load_K(src_idx=src_idx, producer_state=kv_producer_state)
                 pipeline_v.producer_acquire(kv_producer_state)
@@ -1360,7 +1285,6 @@ class SM120ForwardKernel:
         pipeline_k: cutlass.pipeline.PipelineAsync,
         pipeline_v: cutlass.pipeline.PipelineAsync,
         softmax: Softmax,
-        mFp8Lut: Optional[cute.Tensor],
         seqlen: SeqlenInfoQK,
         batch_idx: Int32,
         head_idx: Int32,
@@ -1479,7 +1403,6 @@ class SM120ForwardKernel:
         mKDescale: Optional[cute.Tensor],
         mVDescale: Optional[cute.Tensor],
         softmax_scale: Optional[Float32],
-        mFp8Lut: Optional[cute.Tensor],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
@@ -1641,7 +1564,6 @@ class SM120ForwardKernel:
                     pipeline_k,
                     pipeline_v,
                     softmax,
-                    mFp8Lut,
                     seqlen,
                     batch_idx,
                     head_idx,
@@ -1687,7 +1609,6 @@ class SM120ForwardKernel:
                             pipeline_k,
                             pipeline_v,
                             softmax,
-                            mFp8Lut,
                             seqlen,
                             batch_idx,
                             head_idx,
@@ -1729,7 +1650,6 @@ class SM120ForwardKernel:
                         pipeline_k,
                         pipeline_v,
                         softmax,
-                        mFp8Lut,
                         seqlen,
                         batch_idx,
                         head_idx,
