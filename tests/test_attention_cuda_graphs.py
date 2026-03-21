@@ -71,6 +71,7 @@ def test_paged_attention_replays_under_cuda_graph_with_dynamic_metadata(num_spli
             cu_seqlens_q,
             workspace=workspace,
             plan=plan,
+            output=workspace.output,
         )
 
     ref_out_1, ref_lse_1 = paged_attention_reference(
@@ -171,6 +172,7 @@ def test_paged_attention_fp8_kv_replays_under_cuda_graph() -> None:
             plan=plan,
             k_descale=k_descale,
             v_descale=v_descale,
+            output=workspace.output,
         )
 
     ref_out_1, ref_lse_1 = paged_attention_reference(

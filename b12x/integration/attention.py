@@ -374,11 +374,6 @@ def _validate_paged_lengths(
                 f"cache_seqlens[{request_idx}]={cache_len} exceeds page_table capacity "
                 f"{max_pages_per_request * page_size}"
             )
-        if q_len == 1 and cache_len == 1:
-            raise ValueError(
-                "b12x paged attention does not currently support the single-token single-key corner "
-                "(q_len=1, cache_len=1)"
-            )
         if causal and q_len > cache_len:
             raise ValueError(
                 f"causal paged attention requires q_len <= cache_len; got q_len={q_len}, "
@@ -1237,21 +1232,33 @@ def create_paged_attention_plan(
         cache_seqlens,
         cu_seqlens_q,
     )
-    _validate_paged_lengths(
-        total_q=q_shape[0],
-        page_size=page_size,
-        max_pages_per_request=page_table_shape[1],
-        cache_seqlens=cache_seqlens,
-        cu_seqlens_q=cu_seqlens_q,
-        causal=causal,
-    )
-    inferred_mode = infer_paged_attention_mode(cu_seqlens_q)
+    capturing = torch.cuda.is_current_stream_capturing()
+    if not capturing:
+        _validate_paged_lengths(
+            total_q=q_shape[0],
+            page_size=page_size,
+            max_pages_per_request=page_table_shape[1],
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            causal=causal,
+        )
     if mode is None:
+        if capturing:
+            raise ValueError(
+                "mode must be specified explicitly during CUDA graph capture"
+            )
+        inferred_mode = infer_paged_attention_mode(cu_seqlens_q)
         mode = inferred_mode
-    elif mode != inferred_mode:
-        raise ValueError(f"paged attention mode mismatch: requested {mode}, inferred {inferred_mode}")
+    elif not capturing:
+        inferred_mode = infer_paged_attention_mode(cu_seqlens_q)
+        if mode != inferred_mode:
+            raise ValueError(f"paged attention mode mismatch: requested {mode}, inferred {inferred_mode}")
     auto_num_splits = num_splits in (None, 0)
     if auto_num_splits:
+        if capturing:
+            raise ValueError(
+                "num_splits must be specified explicitly during CUDA graph capture"
+            )
         num_splits = choose_paged_attention_num_splits(
             cache_seqlens,
             page_size=page_size,
@@ -1262,9 +1269,15 @@ def create_paged_attention_plan(
         )
     elif num_splits not in buckets:
         raise ValueError(f"num_splits must be one of {buckets}, got {num_splits}")
-    max_pages = _max_pages_from_cache_seqlens(cache_seqlens, page_size=page_size)
+    if not capturing:
+        max_pages = _max_pages_from_cache_seqlens(cache_seqlens, page_size=page_size)
+        q_lengths = _q_lengths_from_cu_seqlens(cu_seqlens_q)
+    else:
+        max_pages = page_table_shape[1]
+        batch = cu_seqlens_q.shape[0] - 1
+        total_q = q_shape[0]
+        q_lengths = [total_q // batch] * batch if batch > 0 else []
     _, _, head_dim = q_shape
-    q_lengths = _q_lengths_from_cu_seqlens(cu_seqlens_q)
     uniform_q_seqlen = (
         q_lengths[0]
         if q_lengths and all(q_len == q_lengths[0] for q_len in q_lengths)
@@ -1372,10 +1385,12 @@ def _combine_split_partials(
     workspace: PagedAttentionWorkspace,
     *,
     plan: PagedAttentionPlan,
+    output: torch.Tensor | None = None,
 ) -> None:
     assert workspace.split_output is not None
     assert workspace.split_lse is not None
     assert plan.compiled_combine is not None
+    dest_output = output if output is not None else workspace.output
     plan.compiled_combine(
         make_ptr(
             plan.cutlass_dtype,
@@ -1391,7 +1406,7 @@ def _combine_split_partials(
         ),
         make_ptr(
             plan.cutlass_dtype,
-            workspace.output.data_ptr(),
+            dest_output.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=16,
         ),
@@ -1418,6 +1433,7 @@ def b12x_paged_attention_forward(
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
     softmax_scale: float | None = None,
+    output: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Execute the page-size-64 SGLang paged path with true in-kernel paged loads."""
     (
@@ -1497,11 +1513,22 @@ def b12x_paged_attention_forward(
     if softmax_scale is None:
         softmax_scale = q_shape[2] ** -0.5
 
-    kernel_output = (
-        resolved_workspace.output
-        if resolved_workspace.num_splits == 1
-        else resolved_workspace.split_output
-    )
+    if output is not None:
+        if tuple(output.shape) != q_shape:
+            raise ValueError(f"output must have shape {q_shape}, got {tuple(output.shape)}")
+        if output.dtype != dtype:
+            raise ValueError(f"output must have dtype {dtype}, got {output.dtype}")
+        if output.device != device:
+            raise ValueError(f"output must be on device {device}, got {output.device}")
+        if not output.is_contiguous():
+            raise ValueError("output must be contiguous")
+    elif torch.cuda.is_current_stream_capturing():
+        raise ValueError("CUDA graph capture requires a caller-owned output buffer")
+
+    if resolved_workspace.num_splits == 1:
+        kernel_output = output if output is not None else resolved_workspace.output
+    else:
+        kernel_output = resolved_workspace.split_output
     kernel_lse = (
         resolved_workspace.lse if resolved_workspace.num_splits == 1 else resolved_workspace.split_lse
     )
@@ -1531,8 +1558,9 @@ def b12x_paged_attention_forward(
         current_cuda_stream(),
     )
     if resolved_plan.num_splits > 1:
-        _combine_split_partials(resolved_workspace, plan=resolved_plan)
-    return resolved_workspace.output, resolved_workspace.lse.transpose(0, 1)
+        _combine_split_partials(resolved_workspace, plan=resolved_plan, output=output)
+    final_output = output if output is not None else resolved_workspace.output
+    return final_output, resolved_workspace.lse.transpose(0, 1)
 
 
 def b12x_paged_decode(
@@ -1548,6 +1576,7 @@ def b12x_paged_decode(
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
     softmax_scale: float | None = None,
+    output: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Decode-oriented paged attention surface; currently shares the main kernel."""
     resolved_plan = plan
@@ -1588,6 +1617,7 @@ def b12x_paged_decode(
         k_descale=k_descale,
         v_descale=v_descale,
         softmax_scale=softmax_scale,
+        output=output,
     )
 
 
@@ -1604,6 +1634,7 @@ def b12x_paged_extend(
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
     softmax_scale: float | None = None,
+    output: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Extend-oriented paged attention surface; currently shares the main kernel."""
     resolved_plan = plan
@@ -1644,6 +1675,7 @@ def b12x_paged_extend(
         k_descale=k_descale,
         v_descale=v_descale,
         softmax_scale=softmax_scale,
+        output=output,
     )
 
 

@@ -600,7 +600,8 @@ def test_exact_paged_workspace_rejects_shape_mismatch() -> None:
         )
 
 
-def test_single_token_single_key_paged_corner_is_rejected() -> None:
+def test_single_token_single_key_paged_corner() -> None:
+    """The (q_len=1, cache_len=1) decode corner must produce correct output."""
     require_sm120()
     clear_attention_caches()
 
@@ -611,16 +612,38 @@ def test_single_token_single_key_paged_corner_is_rejected() -> None:
         seed=53,
     )
 
-    with pytest.raises(ValueError, match="single-token single-key corner"):
-        create_paged_attention_plan(
-            q,
-            k_cache,
-            v_cache,
-            page_table,
-            cache_seqlens,
-            cu_seqlens_q,
-            causal=True,
-        )
+    plan = create_paged_attention_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+    )
+    workspace = allocate_paged_attention_workspace_for_plan(plan)
+    out, lse = b12x_paged_attention_forward(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        workspace=workspace,
+        plan=plan,
+    )
+    ref_out, ref_lse = paged_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+    )
+    assert (out - ref_out).abs().max().item() <= 0.02
+    assert (lse - ref_lse).abs().max().item() <= 0.03
+    assert _cosine_similarity(out, ref_out) >= 0.99999
 
 
 def test_invalid_num_splits_is_rejected() -> None:
