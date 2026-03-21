@@ -140,7 +140,7 @@ def test_paged_workspace_matches_reference_for_qwen_like_extend_shape(num_splits
         causal=True,
         num_splits=num_splits,
     )
-    workspace = allocate_paged_attention_workspace_for_plan(plan)
+    workspace = allocate_paged_attention_workspace_for_plan(plan, total_q=q.shape[0])
     out, lse = b12x_paged_attention_forward(
         q,
         k_cache,
@@ -194,10 +194,7 @@ def test_paged_plan_exposes_logical_gqa_dimensions() -> None:
     assert plan.num_q_heads == 8
     assert plan.num_kv_heads == 1
     assert plan.qhead_per_kvhead == 8
-    assert plan.seqlen_q_static == sum(q_seqlens)
-    assert plan.seqlen_k_static == page_size * page_table.shape[1]
-    assert plan.logical_q_rows_static == sum(q_seqlens) * 8
-    assert plan.logical_total_q_rows == sum(q_seqlens) * 8
+    assert plan.head_dim == 256
     assert plan.mode == "extend"
     assert plan.kernel_family == "main"
     assert plan.tile_m == 32
@@ -234,7 +231,7 @@ def test_paged_workspace_matches_reference_for_fp8_kv_cache() -> None:
         causal=True,
         num_splits=1,
     )
-    workspace = allocate_paged_attention_workspace_for_plan(plan)
+    workspace = allocate_paged_attention_workspace_for_plan(plan, total_q=q.shape[0])
     out, lse = b12x_paged_attention_forward(
         q,
         k_fp8,
@@ -476,7 +473,7 @@ def test_paged_workspace_pool_requires_explicit_plan() -> None:
     )
     pool = allocate_paged_attention_workspace_pool()
 
-    with pytest.raises(TypeError, match="require an explicit PagedAttentionPlan"):
+    with pytest.raises(TypeError, match="explicit PagedAttentionPlan"):
         b12x_paged_attention_forward(
             q,
             k_cache,
@@ -508,8 +505,8 @@ def test_paged_decode_and_extend_surfaces_validate_mode() -> None:
     q_e, k_e, v_e, pt_e, cs_e, cu_e = extend_inputs
     decode_plan = create_paged_attention_plan(q_d, k_d, v_d, pt_d, cs_d, cu_d, causal=True)
     extend_plan = create_paged_attention_plan(q_e, k_e, v_e, pt_e, cs_e, cu_e, causal=True)
-    decode_workspace = allocate_paged_attention_workspace_for_plan(decode_plan)
-    extend_workspace = allocate_paged_attention_workspace_for_plan(extend_plan)
+    decode_workspace = allocate_paged_attention_workspace_for_plan(decode_plan, total_q=q_d.shape[0])
+    extend_workspace = allocate_paged_attention_workspace_for_plan(extend_plan, total_q=q_e.shape[0])
 
     b12x_paged_decode(
         q_d,
@@ -572,6 +569,8 @@ def test_exact_paged_workspace_rejects_shape_mismatch() -> None:
         q_seqlens=[2, 3],
         cache_seqlens=[65, 129],
         page_size=64,
+        q_heads=4,
+        kv_heads=1,
         seed=41,
         page_table_width=3,
         num_pages=10,
@@ -585,7 +584,7 @@ def test_exact_paged_workspace_rejects_shape_mismatch() -> None:
         cu_seqlens_q0,
         causal=True,
     )
-    workspace = allocate_paged_attention_workspace_for_plan(plan0)
+    workspace = allocate_paged_attention_workspace_for_plan(plan0, total_q=q0.shape[0])
 
     with pytest.raises(ValueError, match="paged attention plan mismatch"):
         b12x_paged_attention_forward(
@@ -621,7 +620,7 @@ def test_single_token_single_key_paged_corner() -> None:
         cu_seqlens_q,
         causal=True,
     )
-    workspace = allocate_paged_attention_workspace_for_plan(plan)
+    workspace = allocate_paged_attention_workspace_for_plan(plan, total_q=q.shape[0])
     out, lse = b12x_paged_attention_forward(
         q,
         k_cache,

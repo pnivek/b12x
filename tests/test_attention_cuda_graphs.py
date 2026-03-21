@@ -55,7 +55,7 @@ def test_paged_decode_small_gqa_ratio(
         q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q,
         causal=True, mode="decode", num_splits=1,
     )
-    workspace = allocate_paged_attention_workspace_for_plan(plan)
+    workspace = allocate_paged_attention_workspace_for_plan(plan, total_q=q.shape[0])
 
     output, lse = b12x_paged_attention_forward(
         q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q,
@@ -92,7 +92,7 @@ def test_paged_attention_replays_under_cuda_graph_with_dynamic_metadata(num_spli
         causal=True,
         num_splits=num_splits,
     )
-    workspace = allocate_paged_attention_workspace_for_plan(plan)
+    workspace = allocate_paged_attention_workspace_for_plan(plan, total_q=q.shape[0])
 
     b12x_paged_attention_forward(
         q,
@@ -189,7 +189,7 @@ def test_paged_attention_fp8_kv_replays_under_cuda_graph() -> None:
         causal=True,
         num_splits=1,
     )
-    workspace = allocate_paged_attention_workspace_for_plan(plan)
+    workspace = allocate_paged_attention_workspace_for_plan(plan, total_q=q.shape[0])
 
     b12x_paged_attention_forward(
         q,

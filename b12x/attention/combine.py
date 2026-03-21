@@ -97,16 +97,10 @@ class PagedAttentionCombineKernel:
             raise ValueError(f"mO_partial split dimension must be {self.num_splits}")
         if const_expr(mLSE_partial.shape[0] != self.num_splits):
             raise ValueError(f"mLSE_partial split dimension must be {self.num_splits}")
-        if const_expr(mO_partial.shape[1] != mO.shape[0]):
-            raise ValueError("mO_partial total_q must match mO total_q")
         if const_expr(mO_partial.shape[2] != mO.shape[1]):
             raise ValueError("mO_partial num_heads must match mO num_heads")
         if const_expr(mO_partial.shape[3] != mO.shape[2]):
             raise ValueError("mO_partial head_dim must match mO head_dim")
-        if const_expr(mLSE_partial.shape[1] != mO.shape[1] or mLSE_partial.shape[2] != mO.shape[0]):
-            raise ValueError("mLSE_partial layout must be (num_splits, num_heads, total_q)")
-        if const_expr(mLSE.shape[0] != mO.shape[1] or mLSE.shape[1] != mO.shape[0]):
-            raise ValueError("mLSE layout must be (num_heads, total_q)")
         if const_expr(mO.shape[2] != self.head_dim):
             raise ValueError(f"mO head_dim must be {self.head_dim}")
         if const_expr(not self.can_implement(
