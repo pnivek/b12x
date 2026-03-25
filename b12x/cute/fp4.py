@@ -503,6 +503,27 @@ def ldmatrix_m8n8x4_trans_right_half_b16(smem_addr: Int32, *, loc=None, ip=None)
 
 
 @dsl_user_op
+def ld_shared_v4_u32(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
+    """Load 128 bits (4 x uint32) from shared memory. smem_addr is a u32 shared-memory address."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v4.u32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    r1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    r2 = llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)
+    r3 = llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)
+    return Uint32(r0), Uint32(r1), Uint32(r2), Uint32(r3)
+
+
+@dsl_user_op
 def st_shared_u64(smem_addr: Int32, value: Uint64, *, loc=None, ip=None):
     """Store 64 bits to shared memory. smem_addr is a u32 shared-memory address."""
     llvm.inline_asm(
@@ -513,6 +534,35 @@ def st_shared_u64(smem_addr: Int32, value: Uint64, *, loc=None, ip=None):
         ],
         "st.shared.u64 [$0], $1;",
         "r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def st_shared_v4_u32(
+    smem_addr: Int32,
+    v0: Uint32,
+    v1: Uint32,
+    v2: Uint32,
+    v3: Uint32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Store 128 bits (4 x uint32) to shared memory. smem_addr is a u32 shared-memory address."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Uint32(v0).ir_value(loc=loc, ip=ip),
+            Uint32(v1).ir_value(loc=loc, ip=ip),
+            Uint32(v2).ir_value(loc=loc, ip=ip),
+            Uint32(v3).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.v4.u32 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,

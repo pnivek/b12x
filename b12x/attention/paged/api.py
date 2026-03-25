@@ -71,6 +71,7 @@ def _build_forward_kernel(
     split_kv: bool,
     mxfp8_turbo: bool,
     enable_mxfp8_pv: bool,
+    enable_paged_kv_tma: bool,
 ) -> PagedForwardKernel:
     return PagedForwardKernel(
         _torch_to_cutlass_dtype(traits.q_dtype),
@@ -81,6 +82,7 @@ def _build_forward_kernel(
         split_kv=split_kv,
         mxfp8_turbo=mxfp8_turbo,
         enable_mxfp8_pv=enable_mxfp8_pv,
+        enable_paged_kv_tma=enable_paged_kv_tma,
     )
 
 
@@ -146,6 +148,7 @@ def paged_attention_forward(
         plan.split_kv,
         mxfp8_turbo,
         enable_mxfp8_pv,
+        plan.mode == "decode",
     )
     forward_output = workspace.tmp_output if plan.split_kv else output
     forward_lse = workspace.tmp_lse if plan.split_kv else workspace.lse

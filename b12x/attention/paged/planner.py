@@ -13,6 +13,7 @@ No kernel-side split LUT or legacy scheduler assumptions live here.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Literal
 
@@ -61,6 +62,19 @@ _PAGED_EXTEND_BF16_CHUNK_TABLE_PAGES = (
     (1024, 24),
     (2048, 24),
 )
+_PAGED_EXTEND_BF16_TMA_VONLY_PLAIN_CHUNK_TABLE_PAGES = (
+    (1, 1),
+    (2, 1),
+    (4, 1),
+    (8, 1),
+    (16, 1),
+    (32, 2),
+    (128, 3),
+    (256, 6),
+    (512, 24),
+    (1024, 24),
+    (2048, 24),
+)
 _PAGED_DECODE_BF16_CHUNK_TABLE_PAGES = (
     # Provisional dense-table fit from the partial decode sweep:
     # exact at the benchmark lengths, smoothed elsewhere to the nearest
@@ -74,6 +88,20 @@ _PAGED_DECODE_BF16_CHUNK_TABLE_PAGES = (
     (256, 12),
     (320, 16),
     (448, 48),
+    (640, 64),
+    (960, 96),
+    (2048, 128),
+)
+_PAGED_DECODE_BF16_TMA_VONLY_PLAIN_CHUNK_TABLE_PAGES = (
+    (1, 1),
+    (2, 2),
+    (16, 1),
+    (32, 2),
+    (64, 3),
+    (128, 6),
+    (256, 12),
+    (320, 16),
+    (512, 48),
     (640, 64),
     (960, 96),
     (2048, 128),
@@ -170,6 +198,15 @@ def _lookup_chunk_pages_from_table(
     return None
 
 
+def _use_paged_bf16_tma_vonly_plain_chunk_tables() -> bool:
+    return (
+        os.environ.get("B12X_PAGED_KV_TMA", "0") == "1"
+        and os.environ.get("B12X_PAGED_KV_TMA_K", "1") == "0"
+        and os.environ.get("B12X_PAGED_KV_TMA_V", "1") == "1"
+        and os.environ.get("B12X_PAGED_KV_TMA_PLAIN_BF16_LAYOUT", "0") == "1"
+    )
+
+
 def _paged_chunk_table_pages(
     *,
     mode: Literal["decode", "extend"],
@@ -210,11 +247,21 @@ def _paged_chunk_table_pages(
             _PAGED_DECODE_FP8_CHUNK_TABLE_PAGES,
         )
     if mode == "extend" and kv_dtype == torch.bfloat16:
+        if _use_paged_bf16_tma_vonly_plain_chunk_tables():
+            return _lookup_chunk_pages_from_table(
+                max_effective_kv_pages,
+                _PAGED_EXTEND_BF16_TMA_VONLY_PLAIN_CHUNK_TABLE_PAGES,
+            )
         return _lookup_chunk_pages_from_table(
             max_effective_kv_pages,
             _PAGED_EXTEND_BF16_CHUNK_TABLE_PAGES,
         )
     if mode == "decode" and kv_dtype == torch.bfloat16:
+        if _use_paged_bf16_tma_vonly_plain_chunk_tables():
+            return _lookup_chunk_pages_from_table(
+                max_effective_kv_pages,
+                _PAGED_DECODE_BF16_TMA_VONLY_PLAIN_CHUNK_TABLE_PAGES,
+            )
         return _lookup_chunk_pages_from_table(
             max_effective_kv_pages,
             _PAGED_DECODE_BF16_CHUNK_TABLE_PAGES,
