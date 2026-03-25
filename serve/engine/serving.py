@@ -54,6 +54,17 @@ def _should_enable_prefix_cache(
     return has_state_snapshot_slots
 
 
+def _should_enable_layer_compile(
+    *,
+    is_hybrid: bool,
+    compile_layers: bool,
+) -> bool:
+    """Decide whether per-layer torch.compile should run."""
+    if not compile_layers:
+        return False
+    return not is_hybrid
+
+
 class ServingEngine:
     """Unified serving engine for all ranks."""
 
@@ -67,6 +78,7 @@ class ServingEngine:
         graph_batch_sizes: list[int] | None = None,
         prefill_chunk_size: int = 512,
         capture_prefill_graph: bool = False,
+        compile_layers: bool = False,
     ):
         torch.set_grad_enabled(False)
         self.tp_group = tp_group
@@ -220,6 +232,12 @@ class ServingEngine:
         is_hybrid = layer_types is not None and any(t == "linear_attention" for t in layer_types)
 
         graph_sizes = [1, 2, 4, 8] if graph_batch_sizes is None else graph_batch_sizes
+        enable_layer_compile = _should_enable_layer_compile(
+            is_hybrid=is_hybrid,
+            compile_layers=compile_layers,
+        )
+        if self.rank == 0 and compile_layers and not enable_layer_compile:
+            print("Layer compile disabled for hybrid models.")
 
         if not is_hybrid:
             # Warmup uses kv_mgr-based path which doesn't support SSM layers.
@@ -228,12 +246,12 @@ class ServingEngine:
             prefill_lengths = warmup_prefill_lengths or [4, 64]
             self.runner.warmup(batch_sizes=[1], prefill_lengths=prefill_lengths)
 
-        if not is_hybrid:
+        if enable_layer_compile:
             if self.rank == 0:
                 print("Compiling...")
             self.runner.compile_model()
 
-        if not is_hybrid:
+        if enable_layer_compile:
             self.runner.warmup(batch_sizes=[1], prefill_lengths=[4, prefill_chunk_size])
 
         if graph_sizes:
@@ -243,12 +261,14 @@ class ServingEngine:
                 batch_sizes=graph_sizes,
                 prefill_chunk_size=prefill_chunk_size if capture_prefill_graph else None,
             )
-            # Graph capture warmup contaminates SSM and KV state. Reset all.
-            if linear_state_arena is not None:
-                linear_state_arena.zero_all()
-            for i in range(len(self.pool.k_cache)):
-                self.pool.k_cache[i].zero_()
-                self.pool.v_cache[i].zero_()
+
+        # Warmup/compile/graph capture all touch shared runtime state. Reset it
+        # before the scheduler starts serving real requests.
+        if linear_state_arena is not None:
+            linear_state_arena.zero_all()
+        for i in range(len(self.pool.k_cache)):
+            self.pool.k_cache[i].zero_()
+            self.pool.v_cache[i].zero_()
 
         # Scheduler.
         hybrid_prefix_cache = _should_enable_prefix_cache(

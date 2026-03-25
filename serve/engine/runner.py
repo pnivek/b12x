@@ -81,6 +81,8 @@ class ModelRunner:
 
         # CUDA graph pool (lazily populated).
         self._graph_pool = None
+        self._compiled_layers = None
+        self._workspace_refresh_needed = False
 
     def prefill(
         self,
@@ -104,16 +106,46 @@ class ModelRunner:
         return self._forward(token_ids, request_ids, q_seqlens, mode="extend")
 
     def compile_model(self, mode: str = "max-autotune-no-cudagraphs") -> None:
-        """Apply torch.compile to each layer's forward pass.
+        """Compile per-layer wrappers for prefill/extend only.
 
         b12x kernel calls within each layer are wrapped with
         @torch.compiler.disable so dynamo doesn't trace into them.
-        Compiling per-layer means CapturedGraph._run_forward() calls
-        the compiled layers directly.
+        Decode still uses eager layers: compiled TransformerLayer wrappers
+        are producing non-finite outputs on the first decode step even when
+        the same submodules run correctly in eager mode.
 
         """
-        for i in range(len(self.model.layers)):
-            self.model.layers[i] = torch.compile(self.model.layers[i], mode=mode)
+        self._compiled_layers = [
+            torch.compile(layer, mode=mode)
+            for layer in self.model.layers
+        ]
+
+    def _refresh_paged_attention_workspaces(self) -> None:
+        """Recreate paged-attention workspaces after compiled prefill/extend.
+
+        The compiled prefill path can leave the next eager decode unstable for
+        one-page KV pools. Rebinding fresh workspaces before decode avoids
+        reusing that poisoned runtime metadata.
+        """
+        if self.pool is None:
+            return
+
+        kv_layer_idx = 0
+        for layer in self.model.layers:
+            attn = getattr(layer, "attn", None)
+            if not isinstance(attn, B12xPagedAttention):
+                continue
+            attn.set_workspace(
+                attn.allocate_workspaces(
+                    device=self.device,
+                    kv_dtype=self.pool.k_cache[kv_layer_idx].dtype,
+                    page_size=self.pool.page_size,
+                    num_cache_pages=self.pool.num_pages,
+                    max_total_q=self.max_total_tokens,
+                    use_cuda_graph=False,
+                )
+            )
+            kv_layer_idx += 1
 
     def capture_decode_graphs(
         self,
@@ -150,6 +182,8 @@ class ModelRunner:
         t0 = time.time()
 
         for plen in prefill_lengths:
+            if not self._warmup_shape_fits(batch_size=1, prefill_len=plen, decode_steps=1):
+                continue
             # Prefill at various lengths to compile attention for those shapes.
             dummy_ids = torch.ones(plen, dtype=torch.long, device=self.device)
             self.prefill(dummy_ids, request_ids=[10000], q_seqlens=[plen])
@@ -161,6 +195,8 @@ class ModelRunner:
         for bs in batch_sizes:
             if bs == 1:
                 continue  # Already covered above.
+            if not self._warmup_shape_fits(batch_size=bs, prefill_len=4, decode_steps=2):
+                continue
             for i in range(bs):
                 dummy_ids = torch.ones(4, dtype=torch.long, device=self.device)
                 self.prefill(dummy_ids, request_ids=[10000 + i], q_seqlens=[4])
@@ -173,6 +209,14 @@ class ModelRunner:
 
         torch.cuda.synchronize()
         print(f"Warmup complete ({time.time() - t0:.1f}s)")
+
+    def _warmup_shape_fits(self, *, batch_size: int, prefill_len: int, decode_steps: int) -> bool:
+        """Return whether a dummy warmup shape fits the currently bound KV pool."""
+        if self.pool is None:
+            return True
+        total_len_per_request = prefill_len + decode_steps
+        pages_per_request = (total_len_per_request + self.pool.page_size - 1) // self.pool.page_size
+        return batch_size * pages_per_request <= self.pool.num_pages
 
     def decode(
         self,
@@ -298,10 +342,21 @@ class ModelRunner:
             is_decode=(mode == "decode"),
         )
 
-        for layer in self.model.layers:
+        if mode == "decode" and self._workspace_refresh_needed:
+            self._refresh_paged_attention_workspaces()
+            self._workspace_refresh_needed = False
+
+        layers = self.model.layers
+        if mode != "decode" and self._compiled_layers is not None:
+            layers = self._compiled_layers
+
+        for layer in layers:
             hidden = layer(hidden, state)
             if layer_stds is not None:
                 layer_stds.append(float(hidden.float().std().item()))
+
+        if mode != "decode" and self._compiled_layers is not None:
+            self._workspace_refresh_needed = True
 
         hidden = rms_norm(hidden, self.model.final_norm_weight, cfg.rms_norm_eps,
                           gemma_style=getattr(cfg, 'gemma_norm', False))

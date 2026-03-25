@@ -21,14 +21,16 @@ from serve.tp.launch import launch_tp
 
 
 def _run(tp_group, model_path, max_tokens, chat, prompt_text, temperature, top_p, top_k, rep_penalty,
-         serve_mode=False, port=8000, capture_prefill_graph=False, enable_thinking=True, no_graph=False):
+         serve_mode=False, port=8000, capture_prefill_graph=False, enable_thinking=True, no_graph=False,
+         compile_layers=False):
     rank = tp_group.rank if tp_group else 0
     device = f"cuda:{tp_group.device.index}" if tp_group else "cuda"
 
     graph_sizes = [1, 2, 4, 8] if not no_graph else []
     engine = ServingEngine(model_path, device=device, tp_group=tp_group,
                            graph_batch_sizes=graph_sizes,
-                           capture_prefill_graph=capture_prefill_graph)
+                           capture_prefill_graph=capture_prefill_graph,
+                           compile_layers=compile_layers)
 
     if rank != 0:
         engine.run_follower()
@@ -159,6 +161,8 @@ def main():
                         help="Disable thinking/reasoning for reasoning models (Qwen3.5)")
     parser.add_argument("--no-graph", action="store_true",
                         help="Disable CUDA graph capture (run eager)")
+    parser.add_argument("--compile", action="store_true",
+                        help="Enable per-layer torch.compile (experimental)")
     args = parser.parse_args()
 
     gpu_ids = None
@@ -172,7 +176,7 @@ def main():
         args=(args.model_path, args.max_tokens, args.chat, args.prompt,
               args.temperature, args.top_p, args.top_k, args.repetition_penalty,
               args.serve, args.port, args.capture_prefill_graph,
-              not args.no_think, args.no_graph),
+              not args.no_think, args.no_graph, args.compile),
         gpu_ids=gpu_ids,
     )
 

@@ -1,6 +1,9 @@
 """Tests for serving-engine configuration policy helpers."""
 
-from serve.engine.serving import _should_enable_prefix_cache
+from serve.engine.serving import (
+    _should_enable_layer_compile,
+    _should_enable_prefix_cache,
+)
 
 
 def test_prefix_cache_enabled_for_non_hybrid_models():
@@ -32,4 +35,25 @@ def test_prefix_cache_disabled_for_tp_hybrid_even_with_snapshots():
         is_hybrid=True,
         world_size=4,
         has_state_snapshot_slots=True,
+    )
+
+
+def test_layer_compile_disabled_by_default():
+    assert not _should_enable_layer_compile(
+        is_hybrid=False,
+        compile_layers=False,
+    )
+
+
+def test_layer_compile_disabled_for_hybrid_models():
+    assert not _should_enable_layer_compile(
+        is_hybrid=True,
+        compile_layers=True,
+    )
+
+
+def test_layer_compile_enabled_only_when_requested_for_non_hybrid():
+    assert _should_enable_layer_compile(
+        is_hybrid=False,
+        compile_layers=True,
     )
