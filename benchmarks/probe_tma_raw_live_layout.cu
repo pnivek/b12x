@@ -12,11 +12,17 @@ namespace {
 
 constexpr int kRows = 64;
 constexpr int kCols = 256;
-constexpr int kSubtileCols = 64;
-constexpr int kSubtiles = kCols / kSubtileCols;
-constexpr int kElements = kRows * kCols;
-constexpr int kWords = kElements / 2;
-constexpr int kStageBytes = kElements * int(sizeof(uint16_t));
+constexpr int kMaxElemBytes = 2;
+constexpr int kMaxStageBytes = kRows * kCols * kMaxElemBytes;
+constexpr int kMaxWords = kMaxStageBytes / int(sizeof(uint32_t));
+
+struct ProbeConfig {
+  const char* dtype_name;
+  int elem_bytes;
+  int subtile_cols;
+  int subtiles;
+  CUtensorMapDataType tensor_dtype;
+};
 
 __device__ __forceinline__ uint32_t smem_ptr(const void* ptr) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
@@ -63,53 +69,49 @@ __device__ __forceinline__ void cp_async_bulk_tensor_2d(
 }
 
 __global__ void probe_tma_live_layout_kernel(
-    const uint16_t* __restrict__ src,
     const CUtensorMap* __restrict__ tensor_map,
     uint32_t* __restrict__ out_words,
-    bool plane_slabs) {
-  __shared__ alignas(1024) uint16_t stage[kElements];
-  __shared__ alignas(8) uint64_t bars[kSubtiles];
+    bool plane_slabs,
+    int subtile_cols,
+    int subtiles,
+    int row_bytes,
+    int subtile_bytes,
+    int stage_words) {
+  __shared__ alignas(1024) uint8_t stage[kMaxStageBytes];
+  __shared__ alignas(8) uint64_t bars[4];
 
   if (threadIdx.x == 0) {
-    for (int g = 0; g < kSubtiles; ++g) {
+    for (int g = 0; g < subtiles; ++g) {
       mbarrier_init(&bars[g], 1);
     }
   }
   __syncthreads();
 
   if (threadIdx.x == 0) {
-    for (int g = 0; g < kSubtiles; ++g) {
-      uint16_t* dst = plane_slabs ? (stage + g * kRows * kSubtileCols) : (stage + g * kSubtileCols);
-      mbarrier_arrive_expect_tx(&bars[g], kRows * kSubtileCols * int(sizeof(uint16_t)));
+    for (int g = 0; g < subtiles; ++g) {
+      uint8_t* dst =
+          plane_slabs ? (stage + g * kRows * subtile_bytes) : (stage + g * subtile_bytes);
+      mbarrier_arrive_expect_tx(&bars[g], kRows * subtile_bytes);
       cp_async_bulk_tensor_2d(
           dst,
           tensor_map,
-          g * kSubtileCols,
+          g * subtile_cols,
           0,
           &bars[g]);
     }
   }
   __syncthreads();
 
-  for (int g = 0; g < kSubtiles; ++g) {
+  for (int g = 0; g < subtiles; ++g) {
     while (!mbarrier_try_wait_parity(&bars[g], 0)) {
     }
   }
   __syncthreads();
 
-  const uint32_t* stage_words = reinterpret_cast<const uint32_t*>(stage);
-  for (int word_idx = threadIdx.x; word_idx < kWords; word_idx += blockDim.x) {
-    out_words[word_idx] = stage_words[word_idx];
+  const uint32_t* stage_words_ptr = reinterpret_cast<const uint32_t*>(stage);
+  for (int word_idx = threadIdx.x; word_idx < stage_words; word_idx += blockDim.x) {
+    out_words[word_idx] = stage_words_ptr[word_idx];
   }
-}
-
-int permuted_word_index(int row, int col_halfword_pair) {
-  const int elem_col = col_halfword_pair * 2;
-  const int vec_idx = elem_col / 8;
-  const int lane_in_vec = elem_col % 8;
-  const int permuted_vec = vec_idx ^ (row % 8);
-  const int permuted_elem = permuted_vec * 8 + lane_in_vec;
-  return row * kCols + permuted_elem;
 }
 
 CUtensorMapSwizzle parse_swizzle(const std::string& name) {
@@ -144,6 +146,29 @@ const char* swizzle_name(CUtensorMapSwizzle swizzle) {
   }
 }
 
+ProbeConfig parse_dtype(const std::string& name) {
+  if (name == "bf16") {
+    return ProbeConfig{
+        .dtype_name = "bf16",
+        .elem_bytes = 2,
+        .subtile_cols = 64,
+        .subtiles = 4,
+        .tensor_dtype = CU_TENSOR_MAP_DATA_TYPE_UINT16,
+    };
+  }
+  if (name == "fp8") {
+    return ProbeConfig{
+        .dtype_name = "fp8",
+        .elem_bytes = 1,
+        .subtile_cols = 128,
+        .subtiles = 2,
+        .tensor_dtype = CU_TENSOR_MAP_DATA_TYPE_UINT8,
+    };
+  }
+  std::fprintf(stderr, "unsupported dtype: %s\n", name.c_str());
+  std::exit(2);
+}
+
 void check_cuda(cudaError_t err, const char* what) {
   if (err != cudaSuccess) {
     std::fprintf(stderr, "%s failed: %s\n", what, cudaGetErrorString(err));
@@ -162,11 +187,33 @@ void check_cu(CUresult err, const char* what) {
   }
 }
 
+uint8_t source_byte(int idx) {
+  uint32_t x = static_cast<uint32_t>(idx) * 1103515245u + 12345u;
+  x ^= x >> 11;
+  x ^= x << 7;
+  x ^= x >> 13;
+  return static_cast<uint8_t>((x >> 16) & 0xFFu);
+}
+
+void pack_words(const std::vector<uint8_t>& bytes, std::vector<uint32_t>* words_out) {
+  const int word_count = static_cast<int>(bytes.size()) / 4;
+  words_out->assign(word_count, 0);
+  for (int idx = 0; idx < word_count; ++idx) {
+    (*words_out)[idx] =
+        static_cast<uint32_t>(bytes[idx * 4 + 0]) |
+        (static_cast<uint32_t>(bytes[idx * 4 + 1]) << 8) |
+        (static_cast<uint32_t>(bytes[idx * 4 + 2]) << 16) |
+        (static_cast<uint32_t>(bytes[idx * 4 + 3]) << 24);
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  const std::string swizzle_arg = argc > 1 ? argv[1] : "128b";
-  const std::string layout_mode = argc > 2 ? argv[2] : "fullrow";
+  const std::string dtype_arg = argc > 1 ? argv[1] : "bf16";
+  const std::string swizzle_arg = argc > 2 ? argv[2] : "128b";
+  const std::string layout_mode = argc > 3 ? argv[3] : "fullrow";
+  const ProbeConfig cfg = parse_dtype(dtype_arg);
   const CUtensorMapSwizzle swizzle = parse_swizzle(swizzle_arg);
   const bool plane_slabs = layout_mode == "planes";
   if (!plane_slabs && layout_mode != "fullrow") {
@@ -174,32 +221,45 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+  const int row_bytes = kCols * cfg.elem_bytes;
+  const int subtile_bytes = cfg.subtile_cols * cfg.elem_bytes;
+  const int stage_bytes = kRows * row_bytes;
+  const int stage_words = stage_bytes / int(sizeof(uint32_t));
+
   check_cuda(cudaSetDevice(0), "cudaSetDevice");
   check_cuda(cudaFree(nullptr), "cudaFree");
   check_cu(cuInit(0), "cuInit");
 
-  std::vector<uint16_t> host_src(kElements);
-  for (int idx = 0; idx < kElements; ++idx) {
-    host_src[idx] = static_cast<uint16_t>(idx);
+  std::vector<uint8_t> host_src_bytes(stage_bytes);
+  for (int idx = 0; idx < stage_bytes; ++idx) {
+    host_src_bytes[idx] = source_byte(idx);
   }
 
-  uint16_t* dev_src = nullptr;
+  void* dev_src = nullptr;
   uint32_t* dev_out = nullptr;
   CUtensorMap* dev_tensor_map = nullptr;
-  check_cuda(cudaMalloc(&dev_src, kStageBytes), "cudaMalloc(dev_src)");
-  check_cuda(cudaMalloc(&dev_out, kWords * sizeof(uint32_t)), "cudaMalloc(dev_out)");
-  check_cuda(cudaMemcpy(dev_src, host_src.data(), kStageBytes, cudaMemcpyHostToDevice), "cudaMemcpy(dev_src)");
+  check_cuda(cudaMalloc(&dev_src, stage_bytes), "cudaMalloc(dev_src)");
+  check_cuda(cudaMalloc(&dev_out, stage_words * sizeof(uint32_t)), "cudaMalloc(dev_out)");
+  check_cuda(cudaMemcpy(dev_src, host_src_bytes.data(), stage_bytes, cudaMemcpyHostToDevice), "cudaMemcpy(dev_src)");
 
   alignas(64) CUtensorMap host_tensor_map{};
-  std::array<uint64_t, 2> global_dim = {static_cast<uint64_t>(kCols), static_cast<uint64_t>(kRows)};
-  std::array<uint64_t, 1> global_stride = {static_cast<uint64_t>(kCols * sizeof(uint16_t))};
-  std::array<uint32_t, 2> box_dim = {static_cast<uint32_t>(kSubtileCols), static_cast<uint32_t>(kRows)};
+  std::array<uint64_t, 2> global_dim = {
+      static_cast<uint64_t>(kCols),
+      static_cast<uint64_t>(kRows),
+  };
+  std::array<uint64_t, 1> global_stride = {
+      static_cast<uint64_t>(kCols * cfg.elem_bytes),
+  };
+  std::array<uint32_t, 2> box_dim = {
+      static_cast<uint32_t>(cfg.subtile_cols),
+      static_cast<uint32_t>(kRows),
+  };
   std::array<uint32_t, 2> element_stride = {1u, 1u};
 
   check_cu(
       cuTensorMapEncodeTiled(
           &host_tensor_map,
-          CU_TENSOR_MAP_DATA_TYPE_UINT16,
+          cfg.tensor_dtype,
           2,
           dev_src,
           global_dim.data(),
@@ -217,48 +277,61 @@ int main(int argc, char** argv) {
       cudaMemcpy(dev_tensor_map, &host_tensor_map, sizeof(CUtensorMap), cudaMemcpyHostToDevice),
       "cudaMemcpy(dev_tensor_map)");
 
-  probe_tma_live_layout_kernel<<<1, 128>>>(dev_src, dev_tensor_map, dev_out, plane_slabs);
+  probe_tma_live_layout_kernel<<<1, 128>>>(
+      dev_tensor_map,
+      dev_out,
+      plane_slabs,
+      cfg.subtile_cols,
+      cfg.subtiles,
+      row_bytes,
+      subtile_bytes,
+      stage_words);
   check_cuda(cudaGetLastError(), "kernel launch");
   check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
 
-  std::vector<uint32_t> host_out(kWords);
-  check_cuda(cudaMemcpy(host_out.data(), dev_out, kWords * sizeof(uint32_t), cudaMemcpyDeviceToHost), "cudaMemcpy(dev_out)");
+  std::vector<uint32_t> host_out(stage_words);
+  check_cuda(
+      cudaMemcpy(host_out.data(), dev_out, stage_words * sizeof(uint32_t), cudaMemcpyDeviceToHost),
+      "cudaMemcpy(dev_out)");
 
-  std::vector<uint32_t> expected(kWords);
+  std::vector<uint8_t> expected_bytes(stage_bytes, 0);
+  const int chunks_per_row = row_bytes / 16;
+  const int chunks_per_plane = subtile_bytes / 16;
   if (plane_slabs) {
-    for (int plane = 0; plane < kSubtiles; ++plane) {
-      const int plane_elem_base = plane * kSubtileCols;
-      const int plane_word_base = plane * (kRows * (kSubtileCols / 2));
+    for (int plane = 0; plane < cfg.subtiles; ++plane) {
+      const int plane_dst_byte_base = plane * kRows * subtile_bytes;
+      const int plane_src_byte_base = plane * subtile_bytes;
       for (int row = 0; row < kRows; ++row) {
-        for (int pair_idx = 0; pair_idx < kSubtileCols / 2; ++pair_idx) {
-          const int dst_word = plane_word_base + row * (kSubtileCols / 2) + pair_idx;
-          const int elem_col = pair_idx * 2;
-          const int vec_idx = elem_col / 8;
-          const int lane_in_vec = elem_col % 8;
-          const int permuted_vec = vec_idx ^ (row % 8);
-          const int src_elem = row * kCols + plane_elem_base + permuted_vec * 8 + lane_in_vec;
-          const uint32_t lo = static_cast<uint32_t>(src_elem & 0xFFFF);
-          const uint32_t hi = static_cast<uint32_t>((src_elem + 1) & 0xFFFF);
-          expected[dst_word] = lo | (hi << 16);
+        for (int chunk = 0; chunk < chunks_per_plane; ++chunk) {
+          const int src_chunk = chunk ^ (row % 8);
+          const int dst_byte = plane_dst_byte_base + row * subtile_bytes + chunk * 16;
+          const int src_byte = row * row_bytes + plane_src_byte_base + src_chunk * 16;
+          for (int byte_idx = 0; byte_idx < 16; ++byte_idx) {
+            expected_bytes[dst_byte + byte_idx] = host_src_bytes[src_byte + byte_idx];
+          }
         }
       }
     }
   } else {
     for (int row = 0; row < kRows; ++row) {
-      for (int pair_idx = 0; pair_idx < kCols / 2; ++pair_idx) {
-        const int dst_word = row * (kCols / 2) + pair_idx;
-        const int src_elem = permuted_word_index(row, pair_idx);
-        const uint32_t lo = static_cast<uint32_t>(src_elem & 0xFFFF);
-        const uint32_t hi = static_cast<uint32_t>((src_elem + 1) & 0xFFFF);
-        expected[dst_word] = lo | (hi << 16);
+      for (int chunk = 0; chunk < chunks_per_row; ++chunk) {
+        const int src_chunk = chunk ^ (row % 8);
+        const int dst_byte = row * row_bytes + chunk * 16;
+        const int src_byte = row * row_bytes + src_chunk * 16;
+        for (int byte_idx = 0; byte_idx < 16; ++byte_idx) {
+          expected_bytes[dst_byte + byte_idx] = host_src_bytes[src_byte + byte_idx];
+        }
       }
     }
   }
 
+  std::vector<uint32_t> expected_words;
+  pack_words(expected_bytes, &expected_words);
+
   int mismatch_count = 0;
   int first_mismatch = -1;
-  for (int idx = 0; idx < kWords; ++idx) {
-    if (host_out[idx] != expected[idx]) {
+  for (int idx = 0; idx < stage_words; ++idx) {
+    if (host_out[idx] != expected_words[idx]) {
       ++mismatch_count;
       if (first_mismatch == -1) {
         first_mismatch = idx;
@@ -267,18 +340,20 @@ int main(int argc, char** argv) {
   }
 
   std::printf("{\n");
+  std::printf("  \"dtype\": \"%s\",\n", cfg.dtype_name);
   std::printf("  \"swizzle\": \"%s\",\n", swizzle_name(swizzle));
   std::printf("  \"layout_mode\": \"%s\",\n", plane_slabs ? "planes" : "fullrow");
   std::printf("  \"mismatch_count\": %d,\n", mismatch_count);
   if (first_mismatch >= 0) {
-    const int row = first_mismatch / (kCols / 2);
-    const int word_in_row = first_mismatch - row * (kCols / 2);
+    const int words_per_row = row_bytes / 4;
+    const int row = first_mismatch / words_per_row;
+    const int word_in_row = first_mismatch - row * words_per_row;
     std::printf("  \"first_mismatch\": {\n");
     std::printf("    \"word\": %d,\n", first_mismatch);
     std::printf("    \"row\": %d,\n", row);
     std::printf("    \"word_in_row\": %d,\n", word_in_row);
     std::printf("    \"got\": \"0x%08x\",\n", host_out[first_mismatch]);
-    std::printf("    \"expected\": \"0x%08x\"\n", expected[first_mismatch]);
+    std::printf("    \"expected\": \"0x%08x\"\n", expected_words[first_mismatch]);
     std::printf("  },\n");
   } else {
     std::printf("  \"first_mismatch\": null,\n");
