@@ -617,7 +617,7 @@ class ServingEngine:
 
     # -- TP step-level broadcast -------------------------------------------
 
-    # Header: [mode_code, total_q, bs, graph_bs]
+    # Header: [mode_code, total_q, bs, graph_bs, page_table_width]
     # mode_code: 0=idle, 1=prefill, 2=decode, 255=shutdown.
 
     _MODE_IDLE = 0
@@ -627,7 +627,7 @@ class ServingEngine:
 
     def _broadcast_step_idle(self) -> None:
         """Tell followers there's no work this step."""
-        header = torch.tensor([self._MODE_IDLE, 0, 0, 0],
+        header = torch.tensor([self._MODE_IDLE, 0, 0, 0, 0],
                               dtype=torch.long, device=self.device)
         dist.broadcast(header, src=0)
 
@@ -637,8 +637,9 @@ class ServingEngine:
         total_q = batch.token_ids.shape[0]
         bs = batch.cache_seqlens.shape[0]
         graph_bs = batch.graph_bs or 0
+        page_table_width = batch.page_table.shape[1]
 
-        header = torch.tensor([mode_code, total_q, bs, graph_bs],
+        header = torch.tensor([mode_code, total_q, bs, graph_bs, page_table_width],
                               dtype=torch.long, device=self.device)
         dist.broadcast(header, src=0)
 
@@ -646,11 +647,7 @@ class ServingEngine:
         dist.broadcast(batch.token_ids, src=0)
         q_seqlens_t = torch.tensor(batch.q_seqlens, dtype=torch.int32, device=self.device)
         dist.broadcast(q_seqlens_t, src=0)
-        # Pad page_table to pool.num_pages columns for consistent shape.
-        pt = batch.page_table
-        if pt.shape[1] < self.pool.num_pages:
-            pt = torch.nn.functional.pad(pt, (0, self.pool.num_pages - pt.shape[1]))
-        dist.broadcast(pt, src=0)
+        dist.broadcast(batch.page_table, src=0)
         dist.broadcast(batch.cache_seqlens, src=0)
 
         # Broadcast SSM cache indices if hybrid model.
@@ -666,7 +663,7 @@ class ServingEngine:
 
         Returns "shutdown", None (idle), or (mode, token_ids, ...) tuple.
         """
-        header = torch.empty(4, dtype=torch.long, device=self.device)
+        header = torch.empty(5, dtype=torch.long, device=self.device)
         dist.broadcast(header, src=0)
 
         mode_code = header[0].item()
@@ -678,6 +675,7 @@ class ServingEngine:
         total_q = header[1].item()
         bs = header[2].item()
         graph_bs = header[3].item() or None
+        page_table_width = header[4].item()
         mode = "prefill" if mode_code == self._MODE_PREFILL else "decode"
 
         token_ids = torch.empty(total_q, dtype=torch.long, device=self.device)
@@ -686,9 +684,7 @@ class ServingEngine:
         dist.broadcast(q_seqlens_t, src=0)
         q_seqlens = q_seqlens_t.tolist()
 
-        # Page table: need to know shape. Use same max_pages as rank 0.
-        # Broadcast page_table shape first via its existing tensor.
-        page_table = torch.empty(bs, self.pool.num_pages, dtype=torch.int32, device=self.device)
+        page_table = torch.empty(bs, page_table_width, dtype=torch.int32, device=self.device)
         dist.broadcast(page_table, src=0)
         cache_seqlens = torch.empty(bs, dtype=torch.int32, device=self.device)
         dist.broadcast(cache_seqlens, src=0)
