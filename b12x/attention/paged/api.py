@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from functools import lru_cache
 import os
+import warnings
 from typing import Literal
 
 import cutlass
@@ -17,6 +19,8 @@ from .merge import PagedPersistentMergeKernel, default_paged_persistent_ctas
 from .planner import PagedPlan
 from .traits import PagedForwardTraits, select_paged_forward_traits_from_plan
 from .workspace import PagedAttentionWorkspace
+
+_EAGER_HOST_LAUNCHER_CACHE_SIZE = 32
 
 
 def _torch_to_cutlass_dtype(dtype: torch.dtype) -> type[cutlass.Numeric]:
@@ -63,6 +67,58 @@ def _attn_turbo_enabled(attn_mode: Literal["default", "turbo"] | None) -> bool:
     if attn_mode == "default":
         return False
     return os.environ.get("B12X_ATTN", "").upper() == "TURBO"
+
+
+def _tensor_meta_key(
+    tensor: torch.Tensor | None,
+) -> tuple[tuple[int, ...], tuple[int, ...], str, tuple[str, int | None]] | None:
+    if tensor is None:
+        return None
+    return (
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        str(tensor.dtype),
+        (tensor.device.type, tensor.device.index),
+    )
+
+
+def _launcher_cache_lookup(
+    kernel: object,
+    cache_key: tuple[object, ...],
+):
+    cache = getattr(kernel, "_eager_host_launchers", None)
+    if cache is None:
+        cache = OrderedDict()
+        setattr(kernel, "_eager_host_launchers", cache)
+        return cache, None
+    compiled = cache.get(cache_key)
+    if compiled is not None:
+        cache.move_to_end(cache_key)
+    return cache, compiled
+
+
+def _run_cached_host_launcher(
+    kernel: object,
+    cache_key: tuple[object, ...],
+    args: tuple[object, ...],
+) -> None:
+    if torch.cuda.is_current_stream_capturing():
+        kernel(*args)
+        return
+    cache, compiled = _launcher_cache_lookup(kernel, cache_key)
+    if compiled is None:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Cache is disabled as user wants to compile only.",
+                category=UserWarning,
+            )
+            compiled = kernel(*args, compile_only=True)
+        cache[cache_key] = compiled
+        if len(cache) > _EAGER_HOST_LAUNCHER_CACHE_SIZE:
+            cache.popitem(last=False)
+    exe_args, _ = compiled.generate_execution_args(*args)
+    compiled.run_compiled_program(exe_args)
 
 
 @lru_cache(maxsize=64)
@@ -182,7 +238,7 @@ def paged_attention_forward(
     v_descale_arg = _to_kernel_tensor(v_descale, cutlass.Float32)
 
     stream = current_cuda_stream()
-    forward_kernel(
+    forward_args = (
         q_arg,
         k_cache_arg,
         v_cache_arg,
@@ -201,6 +257,25 @@ def paged_attention_forward(
         v_descale_arg,
         stream,
     )
+    forward_cache_key = (
+        _tensor_meta_key(q),
+        _tensor_meta_key(k_cache),
+        _tensor_meta_key(v_cache),
+        _tensor_meta_key(page_table),
+        _tensor_meta_key(cache_seqlens),
+        _tensor_meta_key(cu_seqlens_q),
+        _tensor_meta_key(workspace.request_indices),
+        _tensor_meta_key(workspace.qo_tile_indices),
+        _tensor_meta_key(workspace.kv_tile_indices),
+        _tensor_meta_key(workspace.o_indptr),
+        _tensor_meta_key(workspace.kv_chunk_size_ptr),
+        _tensor_meta_key(workspace.block_valid_mask),
+        _tensor_meta_key(forward_output),
+        _tensor_meta_key(forward_lse),
+        _tensor_meta_key(k_descale),
+        _tensor_meta_key(v_descale),
+    )
+    _run_cached_host_launcher(forward_kernel, forward_cache_key, forward_args)
 
     if plan.split_kv:
         persistent_ctas = default_paged_persistent_ctas(
@@ -215,15 +290,24 @@ def paged_attention_forward(
         output_arg = _to_kernel_tensor(output, _torch_to_cutlass_dtype(output.dtype))
         lse_arg = _to_kernel_tensor(workspace.lse, cutlass.Float32)
         total_num_rows_arg = _to_kernel_tensor(workspace.total_num_rows_ptr, cutlass.Int32, assumed_align=4)
-        merge_kernel(
+        merge_args = (
             tmp_output_arg,
             tmp_lse_arg,
             merge_indptr_arg,
             output_arg,
             lse_arg,
             total_num_rows_arg,
-            stream=stream,
         )
+        merge_cache_key = (
+            _tensor_meta_key(workspace.tmp_output),
+            _tensor_meta_key(workspace.tmp_lse),
+            _tensor_meta_key(workspace.merge_indptr),
+            _tensor_meta_key(output),
+            _tensor_meta_key(workspace.lse),
+            _tensor_meta_key(workspace.total_num_rows_ptr),
+            persistent_ctas,
+        )
+        _run_cached_host_launcher(merge_kernel, merge_cache_key, (*merge_args, stream))
 
     return output[: plan.total_q], workspace.current_lse_view()
 

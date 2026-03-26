@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 
+import cutlass.base_dsl.dsl as cutlass_dsl
 import pytest
 import torch
 
@@ -525,3 +526,83 @@ def test_graph_workspace_rejects_capacity_growth() -> None:
 
     with pytest.raises(ValueError, match="graph-mode paged workspace capacity exceeded"):
         workspace.prepare(pt_l, cs_l, cu_l)
+
+
+def _count_generate_original_ir_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[int], object]:
+    calls = [0]
+    original_generate_original_ir = cutlass_dsl.BaseDSL.generate_original_ir
+
+    def counted_generate_original_ir(self, *args, **kwargs):
+        calls[0] += 1
+        return original_generate_original_ir(self, *args, **kwargs)
+
+    monkeypatch.setattr(cutlass_dsl.BaseDSL, "generate_original_ir", counted_generate_original_ir)
+    return calls, original_generate_original_ir
+
+
+def test_eager_workspace_reuses_compiled_host_launcher_for_identical_nosplit_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[4],
+        cache_seqlens=[4],
+        page_size=64,
+        q_heads=48,
+        kv_heads=8,
+        head_dim=128,
+        seed=79,
+    )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cu_seqlens_q=cu_seqlens_q,
+    )
+    calls, _ = _count_generate_original_ir_calls(monkeypatch)
+
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
+    workspace.run(q, k_cache, v_cache, output=torch.empty_like(q))
+    first_run_calls = calls[0]
+
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
+    workspace.run(q, k_cache, v_cache, output=torch.empty_like(q))
+
+    assert first_run_calls > 0
+    assert calls[0] == first_run_calls
+
+
+def test_eager_workspace_reuses_compiled_host_launcher_for_identical_splitkv_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[6, 5, 7, 4],
+        cache_seqlens=[97, 81, 113, 68],
+        page_size=64,
+        seed=83,
+    )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cu_seqlens_q=cu_seqlens_q,
+    )
+    calls, _ = _count_generate_original_ir_calls(monkeypatch)
+
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
+    assert workspace.plan.split_kv is True
+    workspace.run(q, k_cache, v_cache, output=torch.empty_like(q))
+    first_run_calls = calls[0]
+
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
+    workspace.run(q, k_cache, v_cache, output=torch.empty_like(q))
+
+    assert first_run_calls > 0
+    assert calls[0] == first_run_calls
