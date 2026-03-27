@@ -12,19 +12,24 @@ from __future__ import annotations
 import sys
 import time
 
-import torch
+from serve.runtime_warnings import import_torch_safely
+
+torch = import_torch_safely()
 torch.set_grad_enabled(False)
 
+from serve.logging import configure_logging, get_logger
 from serve.engine.sampling import SamplingParams
 from serve.engine.serving import ServingEngine
 from serve.tp.launch import launch_tp
 
+LOGGER = get_logger(__name__)
 
 def _run(tp_group, model_path, max_tokens, chat, prompt_text, temperature, top_p, top_k, rep_penalty,
          serve_mode=False, port=8000, capture_prefill_graph=False, enable_thinking=True, no_graph=False,
-         compile_layers=False, load_backend="auto"):
+         compile_layers=False, load_backend="auto", log_level="info"):
     rank = tp_group.rank if tp_group else 0
     device = f"cuda:{tp_group.device.index}" if tp_group else "cuda"
+    configure_logging(log_level, rank=rank)
 
     graph_sizes = [1, 2, 4, 8] if not no_graph else []
     engine = ServingEngine(model_path, device=device, tp_group=tp_group,
@@ -40,7 +45,7 @@ def _run(tp_group, model_path, max_tokens, chat, prompt_text, temperature, top_p
     if serve_mode:
         from serve.api.server import ServingApp
         app = ServingApp(engine)
-        print(f"Starting API server on port {port}...")
+        LOGGER.info(f"Starting API server on port {port}")
         try:
             app.run(port=port)
         finally:
@@ -170,6 +175,12 @@ def main():
         default="auto",
         help="Model loading backend",
     )
+    parser.add_argument(
+        "--log-level",
+        choices=("debug", "info", "warning", "error"),
+        default="info",
+        help="Serve log verbosity",
+    )
     args = parser.parse_args()
 
     gpu_ids = None
@@ -183,7 +194,7 @@ def main():
         args=(args.model_path, args.max_tokens, args.chat, args.prompt,
               args.temperature, args.top_p, args.top_k, args.repetition_penalty,
               args.serve, args.port, args.capture_prefill_graph,
-              not args.no_think, args.no_graph, args.compile, args.load_backend),
+              not args.no_think, args.no_graph, args.compile, args.load_backend, args.log_level),
         gpu_ids=gpu_ids,
     )
 

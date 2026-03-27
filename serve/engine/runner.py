@@ -14,10 +14,12 @@ import torch.nn.functional as F
 
 from serve.cache.kv_cache import KVCacheManager
 from serve.cache.page_pool import PagePool
+from serve.logging import StartupSession, get_logger
 from serve.model.attention import B12xPagedAttention
 from serve.model.loader import LoadedModel
 from serve.model.ops import rms_norm
 
+LOGGER = get_logger(__name__)
 
 class ModelRunner:
     """Runs forward passes through the full model stack."""
@@ -151,21 +153,33 @@ class ModelRunner:
         self,
         batch_sizes: list[int] | None = None,
         prefill_chunk_size: int | None = None,
+        startup: StartupSession | None = None,
     ) -> None:
         """Capture CUDA graphs for decode and optionally prefill."""
         if batch_sizes is None:
             batch_sizes = [1, 2, 4, 8]
         from serve.engine.cuda_graph import GraphPool
+        total_graphs = len(batch_sizes) + (1 if prefill_chunk_size else 0)
+        if startup is not None:
+            startup.start("Capture CUDA graphs", total=total_graphs)
         self._graph_pool = GraphPool(
             self.model, self.pool, self.device,
             batch_sizes=batch_sizes,
             prefill_chunk_size=prefill_chunk_size,
+            progress_callback=(
+                None
+                if startup is None
+                else lambda desc: startup.advance(description=desc)
+            ),
         )
+        if startup is not None:
+            startup.finish()
 
     def warmup(
         self,
         batch_sizes: list[int] | None = None,
         prefill_lengths: list[int] | None = None,
+        startup: StartupSession | None = None,
     ) -> None:
         """Pre-compile kernels for common shapes.
 
@@ -180,13 +194,28 @@ class ModelRunner:
 
         import time
         t0 = time.time()
+        total_steps = 0
+        for plen in prefill_lengths:
+            if self._warmup_shape_fits(batch_size=1, prefill_len=plen, decode_steps=1):
+                total_steps += 2
+        for bs in batch_sizes:
+            if bs == 1:
+                continue
+            if self._warmup_shape_fits(batch_size=bs, prefill_len=4, decode_steps=2):
+                total_steps += bs + 2
+        if startup is not None:
+            startup.start("Warmup kernels", total=total_steps)
 
         for plen in prefill_lengths:
             if not self._warmup_shape_fits(batch_size=1, prefill_len=plen, decode_steps=1):
                 continue
             # Prefill at various lengths to compile attention for those shapes.
+            if startup is not None:
+                startup.advance(description=f"Warmup kernels [dim](prefill {plen} tok)[/]")
             dummy_ids = torch.ones(plen, dtype=torch.long, device=self.device)
             self.prefill(dummy_ids, request_ids=[10000], q_seqlens=[plen])
+            if startup is not None:
+                startup.advance(description=f"Warmup kernels [dim](decode after {plen} tok)[/]")
             # One decode step.
             dummy_tok = torch.ones(1, dtype=torch.long, device=self.device)
             self.decode(dummy_tok, request_ids=[10000])
@@ -198,17 +227,23 @@ class ModelRunner:
             if not self._warmup_shape_fits(batch_size=bs, prefill_len=4, decode_steps=2):
                 continue
             for i in range(bs):
+                if startup is not None:
+                    startup.advance(description=f"Warmup kernels [dim](prefill bs={bs}, req={i + 1}/{bs})[/]")
                 dummy_ids = torch.ones(4, dtype=torch.long, device=self.device)
                 self.prefill(dummy_ids, request_ids=[10000 + i], q_seqlens=[4])
             rids = [10000 + i for i in range(bs)]
             for _ in range(2):
+                if startup is not None:
+                    startup.advance(description=f"Warmup kernels [dim](decode bs={bs})[/]")
                 dummy_tok = torch.ones(bs, dtype=torch.long, device=self.device)
                 self.decode(dummy_tok, request_ids=rids)
             for i in range(bs):
                 self.kv_mgr.free_request(10000 + i)
 
         torch.cuda.synchronize()
-        print(f"Warmup complete ({time.time() - t0:.1f}s)")
+        if startup is not None:
+            startup.finish()
+        LOGGER.info(f"Warmup complete ({time.time() - t0:.1f}s)")
 
     def _warmup_shape_fits(self, *, batch_size: int, prefill_len: int, decode_steps: int) -> bool:
         """Return whether a dummy warmup shape fits the currently bound KV pool."""

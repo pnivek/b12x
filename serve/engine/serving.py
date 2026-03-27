@@ -24,9 +24,11 @@ from serve.cache.prefix_checkpoint_cache import PrefixCheckpointCache
 from serve.engine.request import Request
 from serve.engine.sampling import SamplingParams, sample_batch
 from serve.engine.scheduler import BatchScheduler
+from serve.logging import get_logger, start_startup_session
 from serve.model.loader import load_model, LoadedModel
 from serve.tp.group import TPGroup
 
+LOGGER = get_logger(__name__)
 
 @dataclass
 class GenerationResult:
@@ -153,7 +155,7 @@ class ServingEngine:
         self._loop_error: str | None = None
 
         if self.rank == 0:
-            print(f"Loading model (TP={self.world_size})...")
+            LOGGER.info(f"Loading model [bold](TP={self.world_size})[/]")
 
         self.model = load_model(
             model_path,
@@ -278,7 +280,7 @@ class ServingEngine:
             )
             kv_budget = max(0, kv_budget - snapshot_ssm_bytes)
             if self.rank == 0:
-                print(
+                LOGGER.info(
                     f"LinearStateArena: {live_ssm_slots} live + "
                     f"{snapshot_slots} checkpoint slots, "
                     f"{linear_state_arena.memory_bytes() / 1e6:.0f} MB"
@@ -302,7 +304,7 @@ class ServingEngine:
         kv_pool_bytes = num_pages * kv_bytes_per_token_block
 
         if self.rank == 0:
-            print(
+            LOGGER.debug(
                 "KV sizing: "
                 f"target={_format_gib(target_mem)} "
                 f"total={_format_gib(total_mem)} "
@@ -311,7 +313,7 @@ class ServingEngine:
                 f"kv_budget_before_tp={_format_gib(kv_budget_before_tp)} "
                 f"kv_budget={_format_gib(kv_budget)}"
             )
-            print(
+            LOGGER.debug(
                 "KV layout: "
                 f"layers={num_kv_layers} "
                 f"kv_heads={self.cfg.num_kv_heads} "
@@ -345,7 +347,7 @@ class ServingEngine:
                                  pool=self.pool, ssm_pool=linear_state_arena)
 
         if self.rank == 0:
-            print(f"KV cache: {self.pool.num_pages} pages ({self.pool.num_pages * 64} tokens)")
+            LOGGER.info(f"KV cache: {self.pool.num_pages} pages ({self.pool.num_pages * 64} tokens)")
 
         is_hybrid = layer_types is not None and any(t == "linear_attention" for t in layer_types)
 
@@ -354,30 +356,32 @@ class ServingEngine:
             is_hybrid=is_hybrid,
             compile_layers=compile_layers,
         )
+        startup = start_startup_session()
         if self.rank == 0 and compile_layers and not enable_layer_compile:
-            print("Layer compile disabled for hybrid models.")
+            LOGGER.warning("Layer compile disabled for hybrid models.")
 
         if not is_hybrid:
             # Warmup uses kv_mgr-based path which doesn't support SSM layers.
             if self.rank == 0:
-                print("Warming up...")
+                LOGGER.info("Warming up")
             prefill_lengths = warmup_prefill_lengths or [4, 64]
-            self.runner.warmup(batch_sizes=[1], prefill_lengths=prefill_lengths)
+            self.runner.warmup(batch_sizes=[1], prefill_lengths=prefill_lengths, startup=startup)
 
         if enable_layer_compile:
             if self.rank == 0:
-                print("Compiling...")
+                LOGGER.info("Compiling layers")
             self.runner.compile_model()
 
         if enable_layer_compile:
-            self.runner.warmup(batch_sizes=[1], prefill_lengths=[4, prefill_chunk_size])
+            self.runner.warmup(batch_sizes=[1], prefill_lengths=[4, prefill_chunk_size], startup=startup)
 
         if graph_sizes:
             if self.rank == 0:
-                print("Capturing CUDA graphs...")
+                LOGGER.info("Capturing CUDA graphs")
             self.runner.capture_decode_graphs(
                 batch_sizes=graph_sizes,
                 prefill_chunk_size=prefill_chunk_size if capture_prefill_graph else None,
+                startup=startup,
             )
 
         # Warmup/compile/graph capture all touch shared runtime state. Reset it
@@ -398,7 +402,7 @@ class ServingEngine:
             ),
         )
         if self.rank == 0 and is_hybrid and self.world_size > 1:
-            print("Hybrid prefix cache disabled under TP until SSM snapshots are mirrored across ranks.")
+            LOGGER.warning("Hybrid prefix cache disabled under TP until SSM snapshots are mirrored across ranks.")
 
         self.scheduler = BatchScheduler(
             cache=self.cache,
@@ -415,7 +419,7 @@ class ServingEngine:
             dist.barrier()
 
         if self.rank == 0:
-            print("Ready.")
+            LOGGER.info("Ready")
 
     # -- public API (rank 0) -----------------------------------------------
 

@@ -17,7 +17,9 @@ import time
 import uuid
 from typing import Optional
 
-import torch
+from serve.runtime_warnings import import_torch_safely
+
+torch = import_torch_safely()
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
@@ -27,6 +29,9 @@ from fastapi.responses import JSONResponse
 
 from serve.engine.sampling import SamplingParams
 from serve.engine.serving import ServingEngine
+from serve.logging import configure_logging, get_logger
+
+LOGGER = get_logger(__name__)
 
 
 # -- request/response models -----------------------------------------------
@@ -279,5 +284,6 @@ class ServingApp:
 
 
 if __name__ == "__main__":
-    print("Use 'python -m serve.cli MODEL --serve' for the API server.")
-    print("It supports TP, prefill graphs, and all other options.")
+    configure_logging("info", rank=0)
+    LOGGER.info("Use 'python -m serve.cli MODEL --serve' for the API server.")
+    LOGGER.info("It supports TP, prefill graphs, and all other options.")

@@ -13,7 +13,9 @@ from typing import Optional
 
 import datetime
 
-import torch
+from serve.runtime_warnings import import_torch_safely
+
+torch = import_torch_safely()
 import torch.distributed as dist
 import torch.multiprocessing as mp
 

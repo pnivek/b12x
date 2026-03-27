@@ -97,6 +97,14 @@ _PAGED_DECODE_FP8_CHUNK_TABLE_PAGES = (
 )
 
 
+def _merge_backend_supports_split_kv(
+    *,
+    output_dtype: torch.dtype,
+    head_dim_vo: int,
+) -> bool:
+    return output_dtype in (torch.float16, torch.bfloat16, torch.float32) and head_dim_vo == 256
+
+
 def _ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
@@ -364,6 +372,9 @@ def create_paged_plan(
     min_kv_chunk_size = max(128 // page_size, 1)
     if max_batch_size_if_split is None:
         max_batch_size_if_split = max(total_num_qo_tiles, 1) * max(max(effective_kv_len_arr), 1)
+
+    if not _merge_backend_supports_split_kv(output_dtype=q.dtype, head_dim_vo=head_dim_vo):
+        disable_split_kv = True
 
     if disable_split_kv:
         split_kv = False

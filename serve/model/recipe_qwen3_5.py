@@ -16,6 +16,7 @@ import torch
 from b12x.cute.fp4 import swizzle_block_scale
 from b12x.integration.tp_moe import B12XFP4ExpertWeights
 
+from serve.logging import get_logger
 from serve.model.attention import B12xPagedAttention
 from serve.model.ffn import MoEFFN
 from serve.model.gdn import GDNLinearAttention
@@ -24,6 +25,7 @@ from serve.model.loader import LoadedModel, ShardedLoader, register_recipe
 from serve.model.ops import make_norm, precompute_rope_freqs
 from serve.tp.group import tp_shard_dim0, tp_shard_dim1, TPGroup
 
+LOGGER = get_logger(__name__)
 
 @dataclass(frozen=True)
 class Qwen35ModelConfig:
@@ -446,18 +448,20 @@ def recipe_qwen3_5_moe(hf_model, hf_config, loader, device, tp_group):
     attn_layers = sum(1 for t in cfg.layer_types if t == "attention")
     linear_layers = sum(1 for t in cfg.layer_types if t == "linear_attention")
     if rank == 0:
-        print(f"Qwen3.5: {cfg.num_layers} layers ({attn_layers} attn + {linear_layers} linear), "
-              f"{cfg.num_experts} experts, TP={world_size}")
+        LOGGER.info(
+            f"Qwen3.5: {cfg.num_layers} layers ({attn_layers} attn + {linear_layers} linear), "
+            f"{cfg.num_experts} experts, TP={world_size}"
+        )
 
     layers = nn.ModuleList()
+    loader.start_layer_progress("Qwen3.5 layers", total=cfg.num_layers)
     for i in range(cfg.num_layers):
-        if rank == 0 and i % 10 == 0:
-            print(f"  Loading layer {i}/{cfg.num_layers}...")
         if cfg.layer_types[i] == "attention":
             layer = extract_attention_layer(i, cfg, tp_group, device, loader)
         else:
             layer = extract_linear_layer(i, cfg, tp_group, device, loader)
         layers.append(layer)
+        loader.advance_layer_progress(description=f"Qwen3.5 layers [{i + 1}/{cfg.num_layers}]")
 
     # Embedding and head.
     embed_weight = loader.tensor("model.language_model.embed_tokens.weight").to(device)

@@ -186,6 +186,30 @@ def test_paged_fp8_auto_chunk_heuristic_uses_larger_decode_chunks() -> None:
     assert plan.split_kv is True
 
 
+def test_paged_plan_disables_split_kv_when_merge_backend_is_unsupported() -> None:
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+        q_seqlens=[6] * 8,
+        cache_seqlens=[8192] * 8,
+        q_heads=48,
+        kv_heads=8,
+        head_dim_qk=128,
+        head_dim_vo=128,
+        kv_dtype=torch.bfloat16,
+    )
+    plan = create_paged_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        enable_cuda_graph=True,
+        graph_chunk_policy=True,
+    )
+
+    assert plan.split_kv is False
+
+
 def test_paged_fp8_auto_chunk_heuristic_uses_coarser_extend_chunks_at_very_long_context() -> None:
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[6] * 8,

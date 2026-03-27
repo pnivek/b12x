@@ -22,6 +22,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from transformers import AutoConfig, AutoModelForCausalLM
 
+from serve.logging import get_logger, start_load_session
 from serve.model.ops import precompute_rope_freqs
 from serve.tp.group import TPGroup
 
@@ -60,6 +61,7 @@ class LoadMetrics:
 
 
 _SAFE_DTYPE_MAP = dict(sf._TYPES)
+LOGGER = get_logger(__name__)
 
 
 def _normalize_backend(backend: str, world_size: int) -> str:
@@ -113,6 +115,7 @@ class TensorIndex:
         self._meta_files: dict[str, object] = {}
         self._meta_cache: dict[str, TensorMeta] = {}
         self._all_keys = set(self.weight_map.keys())
+        self._total_bytes: int | None = None
 
     def keys(self) -> set[str]:
         return self._all_keys
@@ -141,6 +144,18 @@ class TensorIndex:
 
     def close(self) -> None:
         self._meta_files.clear()
+
+    def total_bytes(self) -> int:
+        if self._total_bytes is None:
+            total = 0
+            for key in self._all_keys:
+                meta = self.meta(key)
+                tensor_bytes = int(torch.empty((), dtype=meta.dtype).element_size())
+                for dim in meta.shape:
+                    tensor_bytes *= dim
+                total += tensor_bytes
+            self._total_bytes = total
+        return self._total_bytes
 
 
 # -- safetensor loading ----------------------------------------------------
@@ -177,6 +192,14 @@ class ShardedLoader:
 
         self._device_files: dict[str, object] = {}
         self._allow_data_reads = self.backend == "local" or self.is_node_leader
+        self._load_session = None
+        if self.rank == 0:
+            self._load_session = start_load_session(
+                model_name=self.model_path.name,
+                backend=self.backend,
+                total_bytes=self.index.total_bytes(),
+                tp_world_size=self.world_size,
+            )
 
     def keys(self) -> set[str]:
         return self.index.keys()
@@ -355,6 +378,8 @@ class ShardedLoader:
         self.index.close()
 
     def log_metrics(self) -> None:
+        if self._load_session is not None:
+            self._load_session.finish()
         elapsed_ms = int((time.time() - self._load_start_time) * 1000.0)
         vals = torch.tensor(
             [
@@ -374,11 +399,19 @@ class ShardedLoader:
             sent_gib = vals[1].item() / (1024**3)
             recv_gib = vals[2].item() / (1024**3)
             load_s = vals[4].item() / 1000.0 / max(1, self.world_size)
-            print(
+            LOGGER.info(
                 f"Load backend={self.backend} storage={storage_gib:.2f} GiB "
                 f"sent={sent_gib:.2f} GiB recv={recv_gib:.2f} GiB "
                 f"tensors={vals[3].item()} load_time={load_s:.1f}s"
             )
+
+    def start_layer_progress(self, description: str, *, total: int) -> None:
+        if self._load_session is not None:
+            self._load_session.start_layers(description, total=total)
+
+    def advance_layer_progress(self, *, advance: int = 1, description: str | None = None) -> None:
+        if self._load_session is not None:
+            self._load_session.advance_layers(advance=advance, description=description)
 
     def _open_device_file(self, shard_file: str):
         if not self._allow_data_reads:
@@ -393,7 +426,10 @@ class ShardedLoader:
     def _load_full_local(self, key: str) -> torch.Tensor:
         meta = self.index.meta(key)
         tensor = self._open_device_file(meta.shard_file).get_tensor(key)
-        self.metrics.storage_bytes_read += tensor.numel() * tensor.element_size()
+        num_bytes = tensor.numel() * tensor.element_size()
+        self.metrics.storage_bytes_read += num_bytes
+        if self._load_session is not None:
+            self._load_session.advance_storage(num_bytes)
         self.metrics.tensors_loaded += 1
         return tensor
 
@@ -404,7 +440,10 @@ class ShardedLoader:
         slices = [slice(None)] * len(meta.shape)
         slices[dim] = slice(valid_start, valid_end)
         tensor = self._open_device_file(meta.shard_file).get_slice(key)[tuple(slices)]
-        self.metrics.storage_bytes_read += tensor.numel() * tensor.element_size()
+        num_bytes = tensor.numel() * tensor.element_size()
+        self.metrics.storage_bytes_read += num_bytes
+        if self._load_session is not None:
+            self._load_session.advance_storage(num_bytes)
         self.metrics.tensors_loaded += 1
         return tensor
 
@@ -475,13 +514,17 @@ class ShardedLoader:
             return out
 
         if self.is_node_leader:
+            full_tensor = self._load_full_local(key)
             logical_ranks = self._node_logical_ranks(replica_group_size)
+            inflight_reqs: list[dist.Work] = []
+            inflight_bytes = 0
+            inflight_keepalive: list[torch.Tensor] = []
             for logical_rank_chunk in _chunked(logical_ranks, self._p2p_window):
                 send_plan: list[tuple[torch.Tensor, int]] = []
                 keepalive: list[torch.Tensor] = []
                 for logical_rank in logical_rank_chunk:
-                    piece = self._load_local_shard_piece(
-                        key,
+                    piece = self._slice_shard_piece(
+                        full_tensor,
                         dim=dim,
                         start=start,
                         total=total,
@@ -498,26 +541,42 @@ class ShardedLoader:
                             out.copy_(piece)
                         else:
                             send_plan.append((piece, dst))
-                self._batch_send(send_plan)
+                if inflight_reqs:
+                    self._wait_batch_send(inflight_reqs, inflight_bytes)
+                    inflight_reqs = []
+                    inflight_keepalive.clear()
+                    inflight_bytes = 0
+                inflight_reqs, inflight_bytes = self._launch_batch_send(send_plan)
+                inflight_keepalive = keepalive
+            if inflight_reqs:
+                self._wait_batch_send(inflight_reqs, inflight_bytes)
         else:
             self._batch_recv([out])
 
         return out
 
-    def _batch_send(self, send_plan: list[tuple[torch.Tensor, int]]) -> None:
+    def _launch_batch_send(self, send_plan: list[tuple[torch.Tensor, int]]) -> tuple[list[dist.Work], int]:
         if not send_plan:
-            return
+            return [], 0
         assert self.tp_group is not None
         ops = [
             dist.P2POp(dist.isend, tensor, dst, group=self.tp_group.process_group)
             for tensor, dst in send_plan
         ]
         reqs = dist.batch_isend_irecv(ops)
+        num_bytes = sum(tensor.numel() * tensor.element_size() for tensor, _dst in send_plan)
+        return reqs, num_bytes
+
+    def _wait_batch_send(self, reqs: list[dist.Work], num_bytes: int) -> None:
         for req in reqs:
             req.wait()
-        self.metrics.transport_bytes_sent += sum(
-            tensor.numel() * tensor.element_size() for tensor, _dst in send_plan
-        )
+        self.metrics.transport_bytes_sent += num_bytes
+        if self._load_session is not None:
+            self._load_session.advance_fanout(num_bytes)
+
+    def _batch_send(self, send_plan: list[tuple[torch.Tensor, int]]) -> None:
+        reqs, num_bytes = self._launch_batch_send(send_plan)
+        self._wait_batch_send(reqs, num_bytes)
 
     def _batch_recv(self, recv_tensors: list[torch.Tensor]) -> None:
         if not recv_tensors:
@@ -652,6 +711,40 @@ class ShardedLoader:
         out[tuple(slices)].copy_(piece)
         return out
 
+    def _slice_shard_piece(
+        self,
+        tensor: torch.Tensor,
+        *,
+        dim: int,
+        start: int,
+        total: int,
+        logical_rank: int,
+        logical_world: int,
+        unit: int,
+        pad: bool,
+    ) -> torch.Tensor:
+        shard_size, valid_len, local_start = self._shard_layout(
+            total=total,
+            logical_rank=logical_rank,
+            logical_world=logical_world,
+            unit=unit,
+            pad=pad,
+        )
+        full_shape = list(tensor.shape)
+        full_shape[dim] = shard_size
+        out = torch.zeros(tuple(full_shape), dtype=tensor.dtype, device=tensor.device)
+        if valid_len == 0:
+            self.metrics.tensors_loaded += 1
+            return out
+        slices = [slice(None)] * tensor.ndim
+        slices[dim] = slice(start + local_start, start + local_start + valid_len)
+        piece = tensor[tuple(slices)]
+        out_slices = [slice(None)] * out.ndim
+        out_slices[dim] = slice(0, valid_len)
+        out[tuple(out_slices)].copy_(piece)
+        self.metrics.tensors_loaded += 1
+        return out
+
 
 # -- public API ------------------------------------------------------------
 
@@ -706,7 +799,7 @@ def load_model(
     if hasattr(hf_config, "text_config"):
         instantiate_config = hf_config.text_config
         instantiate_config.model_type = instantiate_config.model_type or model_type
-    print(f"Instantiating {model_type} on meta device...")
+    LOGGER.info(f"Instantiating {model_type} on meta device")
     with torch.device("meta"):
         hf_model = AutoModelForCausalLM.from_config(instantiate_config)
 
@@ -739,9 +832,11 @@ def _apply_minimax_m2(hf_model, hf_config, loader, device, tp_group):
     )
 
     layers = nn.ModuleList()
+    loader.start_layer_progress("MiniMax M2 layers", total=cfg.num_layers)
     for i in range(cfg.num_layers):
         layer = extract_layer(hf_model.model.layers[i], i, cfg, tp_group, device, loader)
         layers.append(layer)
+        loader.advance_layer_progress(description=f"MiniMax M2 layers [{i + 1}/{cfg.num_layers}]")
 
     embed_weight = loader.tensor("model.embed_tokens.weight").to(torch.bfloat16)
     embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size, _weight=embed_weight)
