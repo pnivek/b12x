@@ -4879,6 +4879,13 @@ class PagedBf16ExtendRawForwardKernel:
             cute.recast_ptr(payload_u8.iterator.align(16), dtype=self.q_dtype),
             cute.make_layout((self.cta_tile_q, self.head_dim_qk), stride=(self.head_dim_qk, 1)),
         )
+        sOStageU32 = cute.recast_tensor(
+            cute.make_tensor(
+                cute.recast_ptr(payload_u8.iterator.align(16), dtype=cutlass.BFloat16),
+                cute.make_layout((self.cta_tile_q, self.head_dim_vo), stride=(self.head_dim_vo, 1)),
+            ),
+            cutlass.Uint32,
+        )
         sQBytes = cute.flatten(cute.recast_tensor(sQ, cutlass.Uint8))
         sKStageBytes = cute.make_tensor(
             payload_u8.iterator + Int32(self.q_bytes),
@@ -4888,6 +4895,7 @@ class PagedBf16ExtendRawForwardKernel:
             payload_u8.iterator + Int32(self.q_bytes + self.k_bytes),
             cute.make_layout((self.v_bytes,), stride=(1,)),
         )
+        mOFlat = cute.flatten(mO)
         mQBytes = cute.flatten(cute.recast_tensor(mQ, cutlass.Uint8))
         _async_copy_q_tile_permuted_128b_impl(
             mQBytes,
@@ -5158,17 +5166,9 @@ class PagedBf16ExtendRawForwardKernel:
                         out_high0 = o_frag[mma_q, mma_d, reg_base + 4] * inv_d
                         out_high1 = o_frag[mma_q, mma_d, reg_base + 5] * inv_d
                     if valid_row_store:
-                        if const_expr(self.split_kv):
-                            partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
-                            mO[partial_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.o_dtype)
-                            mO[partial_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.o_dtype)
-                            mO[partial_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.o_dtype)
-                            mO[partial_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.o_dtype)
-                        else:
-                            mO[q_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.o_dtype)
-                            mO[q_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.o_dtype)
-                            mO[q_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.o_dtype)
-                            mO[q_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.o_dtype)
+                        packed_row_local = row_local_idx[mma_q, row_slot]
+                        sOStageU32[packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(out_low0, out_low1)
+                        sOStageU32[packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(out_high0, out_high1)
                 if valid_row_store and lane_pair_base == 0:
                     row_lse = (
                         Float32(-Float32.inf)
@@ -5180,6 +5180,34 @@ class PagedBf16ExtendRawForwardKernel:
                         mLSE[partial_row_idx, q_head_idx] = row_lse
                     else:
                         mLSE[q_head_idx, q_row_idx] = row_lse
+        cute.arch.sync_threads()
+        store_chunks_per_row = self.head_dim_vo // 8
+        store_chunk_linear_idx = tidx
+        store_total_chunks = packed_tile_rows * store_chunks_per_row
+        while store_chunk_linear_idx < store_total_chunks:
+            packed_row_local = store_chunk_linear_idx // store_chunks_per_row
+            chunk_idx = store_chunk_linear_idx - packed_row_local * store_chunks_per_row
+            packed_q_idx = packed_tile_start + packed_row_local
+            token_local = packed_q_idx // group_size
+            q_group_lane = packed_q_idx - token_local * group_size
+            q_head_idx = kv_head_idx * group_size + q_group_lane
+            q_row_idx = q_start + token_local
+            if const_expr(self.split_kv):
+                partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                gmem_elem_offset = (
+                    ((partial_row_idx * mO.shape[1] + q_head_idx) * self.head_dim_vo) + chunk_idx * 8
+                )
+            else:
+                gmem_elem_offset = ((q_row_idx * mO.shape[1] + q_head_idx) * self.head_dim_vo) + chunk_idx * 8
+            u32_idx = chunk_idx * 4
+            st_global_v4_u32(
+                get_ptr_as_int64(mOFlat, gmem_elem_offset),
+                sOStageU32[packed_row_local, u32_idx + 0],
+                sOStageU32[packed_row_local, u32_idx + 1],
+                sOStageU32[packed_row_local, u32_idx + 2],
+                sOStageU32[packed_row_local, u32_idx + 3],
+            )
+            store_chunk_linear_idx += self.num_threads
 
 
 class PagedFp8ExtendRawForwardKernel:
