@@ -5185,16 +5185,16 @@ class PagedBf16ExtendRawForwardKernel:
 class PagedFp8ExtendRawForwardKernel:
     def __init__(self, *, split_kv: bool):
         self.split_kv = split_kv
-        self.cta_tile_q = 64
+        self.cta_tile_q = 48
         self.stage_tile_rows = 64
         self.compute_tile_rows = 32
         self.num_mma_q = 1
         self.num_mma_kv = 2
         self.num_mma_d_qk = 16
         self.num_mma_d_vo = 16
-        self.num_warps_q = 4
+        self.num_warps_q = 3
         self.num_warps_kv = 1
-        self.num_threads = 128
+        self.num_threads = 96
         self.head_dim_qk = 256
         self.head_dim_vo = 256
         self.page_size = 64
@@ -5307,7 +5307,7 @@ class PagedFp8ExtendRawForwardKernel:
             mVTmaDescPtrs,
         ).launch(
             grid=(mBlockValidMask.shape[0], mKTmaDescPtrs.shape[0], 1),
-            block=[32, 4, 1],
+            block=[32, 3, 1],
             smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
