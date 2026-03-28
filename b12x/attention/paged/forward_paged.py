@@ -5438,15 +5438,15 @@ class PagedBf16ExtendRawForwardKernel:
 
 
 class PagedFp8ExtendRawForwardKernel:
-    def __init__(self, *, split_kv: bool, cta_tile_q: int, long_context_pipeline: bool = False):
+    def __init__(self, *, split_kv: bool, cta_tile_q: int):
         self.split_kv = split_kv
         self.cta_tile_q = cta_tile_q
-        self.long_context_pipeline = long_context_pipeline
-        self.stage_tile_rows = 32 if long_context_pipeline else 64
-        self.num_stages = 2 if long_context_pipeline else 1
-        self.compute_tile_rows = 16 if long_context_pipeline else 32
+        self.long_context_pipeline = cta_tile_q == 48
+        self.stage_tile_rows = 32 if self.long_context_pipeline else 64
+        self.num_stages = 2 if self.long_context_pipeline else 1
+        self.compute_tile_rows = 16 if self.long_context_pipeline else 32
         self.num_mma_q = 1
-        self.num_mma_kv = 1 if long_context_pipeline else 2
+        self.num_mma_kv = 1 if self.long_context_pipeline else 2
         self.num_mma_d_qk = 16
         self.num_mma_d_vo = 16
         self.num_warps_q = 2 if cta_tile_q == 32 else 3
