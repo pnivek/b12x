@@ -189,6 +189,21 @@ def _use_fp8_extend_raw_specialization(
     )
 
 
+def _use_fp8_extend_raw_long_context_specialization(
+    plan: PagedPlan,
+    traits: PagedForwardTraits,
+    *,
+    split_kv: bool,
+) -> bool:
+    del split_kv
+    return (
+        plan.mode == "extend"
+        and plan.kv_dtype == torch.float8_e4m3fn
+        and traits.cta_tile_q == 48
+        and plan.kv_chunk_size >= 1536
+    )
+
+
 def _use_bf16_extend_raw_specialization(
     traits: PagedForwardTraits,
     *,
@@ -299,9 +314,14 @@ def _build_fp8_extend_raw_forward_kernel(
     split_kv: bool,
     mxfp8_turbo: bool,
     enable_mxfp8_pv: bool,
+    long_context_pipeline: bool,
 ) -> PagedFp8ExtendRawForwardKernel:
     del mxfp8_turbo, enable_mxfp8_pv
-    return PagedFp8ExtendRawForwardKernel(split_kv=split_kv, cta_tile_q=traits.cta_tile_q)
+    return PagedFp8ExtendRawForwardKernel(
+        split_kv=split_kv,
+        cta_tile_q=traits.cta_tile_q,
+        long_context_pipeline=long_context_pipeline,
+    )
 
 
 @lru_cache(maxsize=16)
@@ -430,11 +450,17 @@ def paged_attention_forward(
         traits,
         split_kv=plan.split_kv,
     ):
+        long_context_pipeline = _use_fp8_extend_raw_long_context_specialization(
+            plan,
+            traits,
+            split_kv=plan.split_kv,
+        )
         forward_kernel = _build_fp8_extend_raw_forward_kernel(
             traits,
             plan.split_kv,
             mxfp8_turbo,
             enable_mxfp8_pv,
+            long_context_pipeline,
         )
     else:
         forward_kernel = _build_forward_kernel(

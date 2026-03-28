@@ -5438,13 +5438,16 @@ class PagedBf16ExtendRawForwardKernel:
 
 
 class PagedFp8ExtendRawForwardKernel:
-    def __init__(self, *, split_kv: bool, cta_tile_q: int):
+    def __init__(self, *, split_kv: bool, cta_tile_q: int, long_context_pipeline: bool = False):
         self.split_kv = split_kv
         self.cta_tile_q = cta_tile_q
-        self.stage_tile_rows = 64
-        self.compute_tile_rows = 32
+        self.long_context_pipeline = long_context_pipeline
+        self.stage_tile_rows = 32 if long_context_pipeline else 64
+        self.k_num_stages = 2 if long_context_pipeline or cta_tile_q == 48 else 1
+        self.v_num_stages = 2 if long_context_pipeline else 1
+        self.compute_tile_rows = 16 if long_context_pipeline else 32
         self.num_mma_q = 1
-        self.num_mma_kv = 2
+        self.num_mma_kv = 1 if long_context_pipeline else 2
         self.num_mma_d_qk = 16
         self.num_mma_d_vo = 16
         self.num_warps_q = 2 if cta_tile_q == 32 else 3
@@ -5461,12 +5464,14 @@ class PagedFp8ExtendRawForwardKernel:
         self.kv_tma_plane_head_dim = 128
         self.kv_tma_plane_count = 2
         self.q_bytes = self.cta_tile_q * self.head_dim_qk * 2
-        self.k_bytes = self.stage_tile_rows * self.head_dim_qk
-        self.v_bytes = self.stage_tile_rows * self.head_dim_vo
+        self.k_bytes = self.k_num_stages * self.stage_tile_rows * self.head_dim_qk
+        self.v_bytes = self.v_num_stages * self.stage_tile_rows * self.head_dim_vo
         self.shared_storage_bytes = self.q_bytes + self.k_bytes + self.v_bytes
         self.kv_plane_stage_bytes = self.stage_tile_rows * self.kv_tma_plane_head_dim
-        self.kv_tma_copy_bytes_k = self.k_bytes
-        self.kv_tma_copy_bytes_v = self.v_bytes
+        self.kv_plane_total_bytes_k = self.k_num_stages * self.kv_plane_stage_bytes
+        self.kv_plane_total_bytes_v = self.v_num_stages * self.kv_plane_stage_bytes
+        self.kv_tma_copy_bytes_k = self.stage_tile_rows * self.head_dim_qk
+        self.kv_tma_copy_bytes_v = self.stage_tile_rows * self.head_dim_vo
         self.softmax_scale_log2 = Float32((self.head_dim_qk ** -0.5) * attention_utils.LOG2_E)
 
     def _get_shared_storage_cls(self):
@@ -5474,8 +5479,8 @@ class PagedFp8ExtendRawForwardKernel:
             pass
 
         SharedStorage.__annotations__ = {
-            "mbar_ptr_K": cute.struct.MemRange[cutlass.Int64, 2],
-            "mbar_ptr_V": cute.struct.MemRange[cutlass.Int64, 2],
+            "mbar_ptr_K": cute.struct.MemRange[cutlass.Int64, 2 * self.k_num_stages],
+            "mbar_ptr_V": cute.struct.MemRange[cutlass.Int64, 2 * self.v_num_stages],
             "payload": cute.struct.Align[
                 cute.struct.MemRange[
                     cutlass.Uint8,
@@ -5636,9 +5641,10 @@ class PagedFp8ExtendRawForwardKernel:
         storage = smem.allocate(SharedStorage)
         mbar_ptr_K = storage.mbar_ptr_K.data_ptr()
         mbar_ptr_V = storage.mbar_ptr_V.data_ptr()
-        if tidx == Int32(0):
-            cute.arch.mbarrier_init(mbar_ptr_K, Int32(1))
-            cute.arch.mbarrier_init(mbar_ptr_V, Int32(1))
+        if tidx < Int32(self.k_num_stages):
+            cute.arch.mbarrier_init(mbar_ptr_K + tidx, Int32(1))
+        if tidx < Int32(self.v_num_stages):
+            cute.arch.mbarrier_init(mbar_ptr_V + tidx, Int32(1))
         cute.arch.sync_threads()
 
         payload_u8 = storage.payload.get_tensor(cute.make_layout((self.shared_storage_bytes,), stride=(1,)))
@@ -5688,6 +5694,8 @@ class PagedFp8ExtendRawForwardKernel:
         mVTmaDescFlat = cute.flatten(mVTmaDescPtrs)
         tc_upcast_stride_q = Int32(self.head_dim_qk // 8)
         tc_upcast_stride_plane = Int32(self.kv_tma_plane_head_dim // 16)
+        if const_expr(self.cta_tile_q == 48):
+            cute.arch.setmaxregister_increase(248)
         lane_group = lane // 4
         lane_pair_base = Int32(2 * (lane % 4))
         warp_row_base = Int32(warp_q_idx * self.num_mma_q * 16)
@@ -5753,39 +5761,42 @@ class PagedFp8ExtendRawForwardKernel:
             if const_expr(mVDescale is not None and len(mVDescale.shape) == 1)
             else (mVDescale[request_idx, kv_head_idx] if const_expr(mVDescale is not None) else Float32(1.0))
         )
-        producer_state = pipeline.PipelineStateSimple(1, Int32(0))
-        consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
         tile_base = chunk_start
+        producer_state_k = pipeline.PipelineStateSimple(self.k_num_stages, Int32(0))
+        consumer_state_k = pipeline.PipelineStateSimple(self.k_num_stages, Int32(0))
+        producer_state_v = pipeline.PipelineStateSimple(self.v_num_stages, Int32(0))
+        consumer_state_v = pipeline.PipelineStateSimple(self.v_num_stages, Int32(0))
         if tile_base < chunk_end and warp_q_idx == Int32(0):
             self._issue_paged_kv_tma_copy_2planes_fp8_raw(
                 mKTmaDescFlat,
                 kv_head_idx,
                 sKStageBytes,
-                Int32(0),
-                self.kv_plane_stage_bytes,
-                producer_state,
+                producer_state_k.index * Int32(self.kv_plane_stage_bytes),
+                Int32(self.kv_plane_total_bytes_k),
+                producer_state_k,
                 mbar_ptr_K,
-                self.kv_tma_copy_bytes_k,
+                Int32(self.stage_tile_rows * self.head_dim_qk),
                 mPageTable,
                 request_idx,
                 tile_base,
                 Int32(self.page_size),
             )
+            producer_state_k.advance()
             self._issue_paged_kv_tma_copy_2planes_fp8_raw(
                 mVTmaDescFlat,
                 kv_head_idx,
                 sVStageBytes,
-                Int32(0),
-                self.kv_plane_stage_bytes,
-                producer_state,
+                producer_state_v.index * Int32(self.kv_plane_stage_bytes),
+                Int32(self.kv_plane_total_bytes_v),
+                producer_state_v,
                 mbar_ptr_V,
-                self.kv_tma_copy_bytes_v,
+                Int32(self.stage_tile_rows * self.head_dim_vo),
                 mPageTable,
                 request_idx,
                 tile_base,
                 Int32(self.page_size),
             )
-            producer_state.advance()
+            producer_state_v.advance()
         cute.arch.sync_threads()
         prefetch_base = tile_base + Int32(self.stage_tile_rows)
 
@@ -5796,9 +5807,26 @@ class PagedFp8ExtendRawForwardKernel:
                 chunk_end,
             )
             tile_tokens = tile_limit - tile_base
-            cute.arch.mbarrier_wait(mbar_ptr_K + consumer_state.index, phase=consumer_state.phase)
-            cute.arch.mbarrier_wait(mbar_ptr_V + consumer_state.index, phase=consumer_state.phase)
+            cute.arch.mbarrier_wait(mbar_ptr_K + consumer_state_k.index, phase=consumer_state_k.phase)
             cute.arch.sync_threads()
+            if prefetch_base < chunk_end and warp_q_idx == Int32(0):
+                self._issue_paged_kv_tma_copy_2planes_fp8_raw(
+                    mKTmaDescFlat,
+                    kv_head_idx,
+                    sKStageBytes,
+                    producer_state_k.index * Int32(self.kv_plane_stage_bytes),
+                    Int32(self.kv_plane_total_bytes_k),
+                    producer_state_k,
+                    mbar_ptr_K,
+                    Int32(self.stage_tile_rows * self.head_dim_qk),
+                    mPageTable,
+                    request_idx,
+                    prefetch_base,
+                    Int32(self.page_size),
+                )
+                producer_state_k.advance()
+            k_stage_plane_offset = consumer_state_k.index * Int32(self.kv_plane_stage_bytes)
+            v_stage_plane_offset = consumer_state_v.index * Int32(self.kv_plane_stage_bytes)
 
             for subtile_iter in cutlass.range_constexpr(2):
                 subtile_row_base = Int32(subtile_iter * self.compute_tile_rows)
@@ -5808,8 +5836,8 @@ class PagedFp8ExtendRawForwardKernel:
                     _literal_qk_mma_into_sfrag_plane_fp8_raw(
                         frag_S,
                         q_smem_base_addr,
-                        shared_ptr_to_u32(sKStageBytes.iterator + Int32(0 * self.kv_plane_stage_bytes)),
-                        shared_ptr_to_u32(sKStageBytes.iterator + Int32(1 * self.kv_plane_stage_bytes)),
+                        shared_ptr_to_u32(sKStageBytes.iterator + k_stage_plane_offset + Int32(0 * self.kv_plane_total_bytes_k)),
+                        shared_ptr_to_u32(sKStageBytes.iterator + k_stage_plane_offset + Int32(1 * self.kv_plane_total_bytes_k)),
                         lane,
                         warp_q_idx,
                         Int32(0),
@@ -5848,8 +5876,8 @@ class PagedFp8ExtendRawForwardKernel:
                         _literal_qk_mma_into_sfrag_plane_fp8_raw(
                             frag_S_pair,
                             q_smem_base_addr,
-                            shared_ptr_to_u32(sKStageBytes.iterator + Int32(0 * self.kv_plane_stage_bytes)),
-                            shared_ptr_to_u32(sKStageBytes.iterator + Int32(1 * self.kv_plane_stage_bytes)),
+                            shared_ptr_to_u32(sKStageBytes.iterator + k_stage_plane_offset + Int32(0 * self.kv_plane_total_bytes_k)),
+                            shared_ptr_to_u32(sKStageBytes.iterator + k_stage_plane_offset + Int32(1 * self.kv_plane_total_bytes_k)),
                             lane,
                             warp_q_idx,
                             Int32(0),
@@ -5922,11 +5950,12 @@ class PagedFp8ExtendRawForwardKernel:
                                 d_frag[mma_q, 0] = d0
                                 d_frag[mma_q, 1] = d1
 
+                        cute.arch.mbarrier_wait(mbar_ptr_V + consumer_state_v.index, phase=consumer_state_v.phase)
                         _literal_pv_mma_into_ofrag_plane_fp8_raw(
                             o_frag,
                             p_frag,
-                            shared_ptr_to_u32(sVStageBytes.iterator + Int32(0 * self.kv_plane_stage_bytes)),
-                            shared_ptr_to_u32(sVStageBytes.iterator + Int32(1 * self.kv_plane_stage_bytes)),
+                            shared_ptr_to_u32(sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * self.kv_plane_total_bytes_v)),
+                            shared_ptr_to_u32(sVStageBytes.iterator + v_stage_plane_offset + Int32(1 * self.kv_plane_total_bytes_v)),
                             lane,
                             Int32(0),
                             subtile_row_base,
@@ -5939,8 +5968,8 @@ class PagedFp8ExtendRawForwardKernel:
                         _literal_pv_mma_into_ofrag_plane_fp8_raw(
                             o_frag,
                             p_frag_pair,
-                            shared_ptr_to_u32(sVStageBytes.iterator + Int32(0 * self.kv_plane_stage_bytes)),
-                            shared_ptr_to_u32(sVStageBytes.iterator + Int32(1 * self.kv_plane_stage_bytes)),
+                            shared_ptr_to_u32(sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * self.kv_plane_total_bytes_v)),
+                            shared_ptr_to_u32(sVStageBytes.iterator + v_stage_plane_offset + Int32(1 * self.kv_plane_total_bytes_v)),
                             lane,
                             Int32(0),
                             next_subtile_row_base,
@@ -5976,11 +6005,12 @@ class PagedFp8ExtendRawForwardKernel:
                                 d_frag[mma_q, 0] = d0
                                 d_frag[mma_q, 1] = d1
 
+                        cute.arch.mbarrier_wait(mbar_ptr_V + consumer_state_v.index, phase=consumer_state_v.phase)
                         _literal_pv_mma_into_ofrag_plane_fp8_raw(
                             o_frag,
                             p_frag,
-                            shared_ptr_to_u32(sVStageBytes.iterator + Int32(0 * self.kv_plane_stage_bytes)),
-                            shared_ptr_to_u32(sVStageBytes.iterator + Int32(1 * self.kv_plane_stage_bytes)),
+                            shared_ptr_to_u32(sVStageBytes.iterator + v_stage_plane_offset + Int32(0 * self.kv_plane_total_bytes_v)),
+                            shared_ptr_to_u32(sVStageBytes.iterator + v_stage_plane_offset + Int32(1 * self.kv_plane_total_bytes_v)),
                             lane,
                             Int32(0),
                             subtile_row_base,
@@ -5991,38 +6021,25 @@ class PagedFp8ExtendRawForwardKernel:
                             v_scale,
                         )
 
-            consumer_state.advance()
+            consumer_state_k.advance()
+            consumer_state_v.advance()
             tile_base += Int32(self.stage_tile_rows)
             if tile_base < chunk_end and warp_q_idx == Int32(0):
-                self._issue_paged_kv_tma_copy_2planes_fp8_raw(
-                    mKTmaDescFlat,
-                    kv_head_idx,
-                    sKStageBytes,
-                    Int32(0),
-                    self.kv_plane_stage_bytes,
-                    producer_state,
-                    mbar_ptr_K,
-                    self.kv_tma_copy_bytes_k,
-                    mPageTable,
-                    request_idx,
-                    prefetch_base,
-                    Int32(self.page_size),
-                )
                 self._issue_paged_kv_tma_copy_2planes_fp8_raw(
                     mVTmaDescFlat,
                     kv_head_idx,
                     sVStageBytes,
-                    Int32(0),
-                    self.kv_plane_stage_bytes,
-                    producer_state,
+                    producer_state_v.index * Int32(self.kv_plane_stage_bytes),
+                    Int32(self.kv_plane_total_bytes_v),
+                    producer_state_v,
                     mbar_ptr_V,
-                    self.kv_tma_copy_bytes_v,
+                    Int32(self.stage_tile_rows * self.head_dim_vo),
                     mPageTable,
                     request_idx,
                     prefetch_base,
                     Int32(self.page_size),
                 )
-                producer_state.advance()
+                producer_state_v.advance()
             prefetch_base += Int32(self.stage_tile_rows)
             cute.arch.sync_threads()
 
