@@ -200,7 +200,6 @@ def _use_fp8_extend_raw_long_context_specialization(
         plan.mode == "extend"
         and plan.kv_dtype == torch.float8_e4m3fn
         and traits.cta_tile_q == 48
-        and plan.kv_chunk_size >= 1536
     )
 
 
