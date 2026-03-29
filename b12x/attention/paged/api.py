@@ -313,9 +313,17 @@ def _build_bf16_extend_raw_forward_kernel(
     split_kv: bool,
     mxfp8_turbo: bool,
     enable_mxfp8_pv: bool,
+    long_context_pipeline: bool,
 ) -> PagedBf16ExtendRawForwardKernel:
     del traits, mxfp8_turbo, enable_mxfp8_pv
-    return PagedBf16ExtendRawForwardKernel(split_kv=split_kv)
+    return PagedBf16ExtendRawForwardKernel(
+        split_kv=split_kv,
+        long_context_pipeline=long_context_pipeline,
+    )
+
+
+def _use_bf16_extend_raw_long_form(cache_seqlens: torch.Tensor) -> bool:
+    return int(torch.max(cache_seqlens).item()) < 32768
 
 
 @lru_cache(maxsize=16)
@@ -428,6 +436,7 @@ def paged_attention_forward(
             plan.split_kv,
             mxfp8_turbo,
             enable_mxfp8_pv,
+            _use_bf16_extend_raw_long_form(cache_seqlens),
         )
     elif _use_fp8_extend_raw_specialization(
         traits,
