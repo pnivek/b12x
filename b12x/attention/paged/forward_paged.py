@@ -3073,14 +3073,17 @@ class PagedForwardKernel:
                 payload_u8,
                 Float32,
             )
-            sync_o_elems = self.traits.num_warps_kv * self.traits.cta_tile_q * self.traits.head_dim_vo
+            sync_o_row_stride = self.traits.head_dim_vo + (
+                24 if (not self.kv_is_fp8 and self.dtype_o == cutlass.BFloat16 and self.traits.cta_tile_q == 16) else 0
+            )
+            sync_o_elems = self.traits.num_warps_kv * self.traits.cta_tile_q * sync_o_row_stride
             sSyncO = cute.make_tensor(
                 sync_payload.iterator,
                 cute.make_layout(
                     (self.traits.num_warps_kv, self.traits.cta_tile_q, self.traits.head_dim_vo),
                     stride=(
-                        self.traits.cta_tile_q * self.traits.head_dim_vo,
-                        self.traits.head_dim_vo,
+                        self.traits.cta_tile_q * sync_o_row_stride,
+                        sync_o_row_stride,
                         1,
                     ),
                 ),
@@ -3097,8 +3100,8 @@ class PagedForwardKernel:
                 cute.make_layout(
                     (self.traits.num_warps_kv, self.traits.cta_tile_q, self.traits.head_dim_vo * 2),
                     stride=(
-                        self.traits.cta_tile_q * self.traits.head_dim_vo * 2,
-                        self.traits.head_dim_vo * 2,
+                        self.traits.cta_tile_q * sync_o_row_stride * 2,
+                        sync_o_row_stride * 2,
                         1,
                     ),
                 ),
