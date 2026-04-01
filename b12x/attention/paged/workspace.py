@@ -74,6 +74,7 @@ class PagedAttentionWorkspace:
     tmp_output: torch.Tensor | None = None
     tmp_lse: torch.Tensor | None = None
     _plan_q: torch.Tensor | None = None
+    _plan_output: torch.Tensor | None = None
     _plan_k_cache: torch.Tensor | None = None
     _plan_v_cache: torch.Tensor | None = None
     _plan: PagedPlan | None = None
@@ -127,6 +128,11 @@ class PagedAttentionWorkspace:
             dtype=dtype,
             device=device,
         )
+        plan_output = _shape_only_cuda_tensor(
+            (max_total_q, num_q_heads, head_dim_vo),
+            dtype=dtype,
+            device=device,
+        )
         plan_k_cache = _shape_only_cuda_tensor(
             (num_cache_pages, page_size, num_kv_heads, head_dim_qk),
             dtype=kv_dtype,
@@ -150,6 +156,7 @@ class PagedAttentionWorkspace:
             page_size=page_size,
             use_cuda_graph=use_cuda_graph,
             _plan_q=plan_q,
+            _plan_output=plan_output,
             _plan_k_cache=plan_k_cache,
             _plan_v_cache=plan_v_cache,
         )

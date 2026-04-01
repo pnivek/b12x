@@ -458,8 +458,15 @@ def paged_attention_forward(
     workspace._live_plane_tma_descs = (k_tma_desc, v_tma_desc, k_tma_desc_ptrs, v_tma_desc_ptrs)
 
     stream = current_cuda_stream()
+    use_capacity_contract = plan.mode == "extend" and workspace.fixed_capacity
+    q_cache_tensor = workspace._plan_q if use_capacity_contract and workspace._plan_q is not None else q
+    output_cache_tensor = (
+        workspace._plan_output
+        if use_capacity_contract and workspace._plan_output is not None
+        else forward_output
+    )
     forward_cache_key = [
-        _tensor_meta_key(q),
+        _tensor_meta_key(q_cache_tensor),
         _tensor_meta_key(k_cache),
         _tensor_meta_key(v_cache),
         _tensor_meta_key(page_table),
@@ -471,13 +478,13 @@ def paged_attention_forward(
         _tensor_meta_key(workspace.o_indptr),
         _tensor_meta_key(workspace.kv_chunk_size_ptr),
         _tensor_meta_key(workspace.block_valid_mask),
-        _tensor_meta_key(forward_output),
+        _tensor_meta_key(output_cache_tensor),
         _tensor_meta_key(forward_lse),
         _tensor_meta_key(k_descale),
         _tensor_meta_key(v_descale),
     ]
     cache_key_labels = [
-        "q",
+        "q_contract" if use_capacity_contract else "q",
         "k_cache",
         "v_cache",
         "page_table",
@@ -489,7 +496,7 @@ def paged_attention_forward(
         "o_indptr",
         "kv_chunk_size_ptr",
         "block_valid_mask",
-        "forward_output",
+        "output_contract" if use_capacity_contract else "forward_output",
         "forward_lse",
         "k_descale",
         "v_descale",

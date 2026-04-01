@@ -6,6 +6,8 @@ import cutlass.base_dsl.dsl as cutlass_dsl
 import pytest
 import torch
 
+from b12x.attention.paged.api import _build_extend_forward_kernel
+from b12x.attention.paged.traits import select_paged_forward_traits_from_plan
 from b12x.attention.reference import paged_attention_reference
 from b12x.integration.attention import (
     PagedAttentionWorkspace,
@@ -378,6 +380,54 @@ def test_paged_workspace_matches_reference_for_bf16_nosplit_extend_shape() -> No
     assert (out - ref_out).abs().max().item() <= 0.02
     assert (_lse_base2_to_natural(lse) - ref_lse).abs().max().item() <= 0.03
     assert _cosine_similarity(out, ref_out) >= 0.99999
+
+
+def test_paged_fixed_capacity_extend_reuses_larger_eager_launcher() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q_large, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[128],
+        cache_seqlens=[128],
+        page_size=64,
+        q_heads=8,
+        kv_heads=1,
+        head_dim=256,
+        seed=43,
+    )
+    q_small = q_large[:64].contiguous()
+    cu_seqlens_q_small = torch.tensor([0, 64], dtype=torch.int32, device=q_large.device)
+
+    workspace = PagedAttentionWorkspace.for_eager_extend_capacity(
+        device=q_large.device,
+        dtype=q_large.dtype,
+        kv_dtype=k_cache.dtype,
+        num_q_heads=q_large.shape[1],
+        num_kv_heads=k_cache.shape[2],
+        head_dim_qk=q_large.shape[2],
+        head_dim_vo=v_cache.shape[3],
+        page_size=int(k_cache.shape[1]),
+        max_total_q=128,
+        max_batch=1,
+        max_page_table_width=int(page_table.shape[1]),
+        num_cache_pages=int(k_cache.shape[0]),
+    )
+
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
+    output_large = torch.empty_like(q_large)
+    workspace.run(q_large, k_cache, v_cache, output=output_large)
+
+    traits = select_paged_forward_traits_from_plan(workspace.plan)
+    forward_kernel = _build_extend_forward_kernel(traits, False, False)
+    first_launcher_count = len(getattr(forward_kernel, "_eager_host_launchers", {}))
+    assert first_launcher_count == 1
+
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q_small)
+    output_small = torch.empty_like(q_small)
+    workspace.run(q_small, k_cache, v_cache, output=output_small)
+
+    second_launcher_count = len(getattr(forward_kernel, "_eager_host_launchers", {}))
+    assert second_launcher_count == 1
 
 
 def test_paged_workspace_matches_reference_for_fp8_nosplit_extend_shape() -> None:
