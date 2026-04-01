@@ -208,8 +208,8 @@ def test_paged_workspace_exposes_primary_backend_metadata() -> None:
     assert plan.head_dim_vo == 256
     assert plan.mode == "extend"
     assert plan.cta_tile_q == 64
-    assert plan.kv_chunk_size == 64
-    assert plan.split_kv is True
+    assert plan.kv_chunk_size == 2 * 64
+    assert plan.split_kv is False
     assert plan.total_q == q.shape[0]
     assert plan.page_table_shape == tuple(page_table.shape)
 
@@ -288,7 +288,7 @@ def test_paged_workspace_matches_reference_for_fp8_kv_cache() -> None:
     assert _cosine_similarity(out, ref_out) >= 0.9999
 
 
-def test_paged_workspace_matches_reference_for_bf16_splitkv_extend_shape() -> None:
+def test_paged_workspace_matches_reference_for_bf16_large_extend_shape() -> None:
     require_sm120()
     clear_attention_caches()
 
@@ -310,8 +310,8 @@ def test_paged_workspace_matches_reference_for_bf16_splitkv_extend_shape() -> No
     workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
 
     assert workspace.plan.mode == "extend"
-    assert workspace.plan.split_kv is True
-    assert workspace.plan.kv_chunk_size == 64
+    assert workspace.plan.split_kv is False
+    assert workspace.plan.kv_chunk_size == 2 * 64
 
     output = torch.empty_like(q)
     out, lse = workspace.run(q, k_cache, v_cache, output=output)
@@ -328,6 +328,120 @@ def test_paged_workspace_matches_reference_for_bf16_splitkv_extend_shape() -> No
 
     assert (out - ref_out).abs().max().item() <= 0.02
     assert (_lse_base2_to_natural(lse) - ref_lse).abs().max().item() <= 0.02
+    assert _cosine_similarity(out, ref_out) >= 0.9999
+
+
+def test_paged_workspace_matches_reference_for_bf16_nosplit_extend_shape() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[4],
+        cache_seqlens=[4096],
+        page_size=64,
+        q_heads=48,
+        kv_heads=8,
+        head_dim=128,
+        seed=31,
+        page_table_width=64,
+        num_pages=512,
+    )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cu_seqlens_q=cu_seqlens_q,
+    )
+    workspace.prepare(
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        fixed_split_size=64,
+    )
+
+    assert workspace.plan.mode == "extend"
+    assert workspace.plan.split_kv is False
+
+    output = torch.empty_like(q)
+    out, lse = workspace.run(q, k_cache, v_cache, output=output)
+    ref_out, ref_lse = paged_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+    )
+    torch.cuda.synchronize()
+
+    assert (out - ref_out).abs().max().item() <= 0.02
+    assert (_lse_base2_to_natural(lse) - ref_lse).abs().max().item() <= 0.03
+    assert _cosine_similarity(out, ref_out) >= 0.99999
+
+
+def test_paged_workspace_matches_reference_for_fp8_nosplit_extend_shape() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[4],
+        cache_seqlens=[4096],
+        page_size=64,
+        q_heads=8,
+        kv_heads=1,
+        head_dim=256,
+        seed=37,
+        page_table_width=64,
+        num_pages=256,
+    )
+    k_fp8, v_fp8, k_descale, v_descale = _quantize_paged_kv_cache_e4m3(
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+    )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_fp8,
+        v_cache=v_fp8,
+        cu_seqlens_q=cu_seqlens_q,
+    )
+    workspace.prepare(
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        fixed_split_size=64,
+    )
+
+    assert workspace.plan.mode == "extend"
+    assert workspace.plan.split_kv is False
+    assert workspace.plan.kv_dtype == torch.float8_e4m3fn
+
+    output = torch.empty_like(q)
+    out, lse = workspace.run(
+        q,
+        k_fp8,
+        v_fp8,
+        output=output,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    ref_out, ref_lse = paged_attention_reference(
+        q,
+        k_fp8,
+        v_fp8,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=True,
+    )
+    torch.cuda.synchronize()
+
+    assert (out - ref_out).abs().max().item() <= 0.05
+    assert (_lse_base2_to_natural(lse) - ref_lse).abs().max().item() <= 0.05
     assert _cosine_similarity(out, ref_out) >= 0.9999
 
 
@@ -408,6 +522,100 @@ def test_workspace_eager_path_grows_with_larger_shape() -> None:
     workspace.prepare(pt_l, cs_l, cu_l)
     assert int(workspace.request_indices.shape[0]) >= request_items_small
     assert int(workspace.merge_indptr.shape[0]) >= merge_small
+
+
+def test_fixed_capacity_extend_workspace_reuses_large_buffers() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    small = _make_paged_inputs(
+        q_seqlens=[32, 32],
+        cache_seqlens=[64 * 16, 64 * 16],
+        page_size=64,
+        seed=91,
+        page_table_width=64,
+        num_pages=256,
+    )
+    large = _make_paged_inputs(
+        q_seqlens=[32, 32],
+        cache_seqlens=[64 * 64, 64 * 64],
+        page_size=64,
+        seed=93,
+        page_table_width=64,
+        num_pages=256,
+    )
+    q_s, k_s, v_s, pt_s, cs_s, cu_s = small
+    _q_l, _k_l, _v_l, pt_l, cs_l, cu_l = large
+    workspace = PagedAttentionWorkspace.for_fixed_capacity(
+        mode="extend",
+        device=q_s.device,
+        dtype=q_s.dtype,
+        kv_dtype=k_s.dtype,
+        num_q_heads=int(q_s.shape[1]),
+        num_kv_heads=int(k_s.shape[2]),
+        head_dim_qk=int(q_s.shape[2]),
+        head_dim_vo=int(v_s.shape[3]),
+        page_size=int(k_s.shape[1]),
+        max_total_q=int(q_s.shape[0]),
+        max_batch=int(pt_s.shape[0]),
+        max_page_table_width=int(pt_s.shape[1]),
+        max_work_items=128,
+        max_partial_rows=2048,
+        num_cache_pages=int(k_s.shape[0]),
+    )
+    workspace.prepare(pt_s, cs_s, cu_s)
+    ptrs = (
+        workspace.request_indices.data_ptr(),
+        workspace.page_table.data_ptr(),
+        workspace.lse.data_ptr(),
+        workspace.tmp_output.data_ptr(),
+        workspace.tmp_lse.data_ptr(),
+    )
+
+    workspace.prepare(pt_l, cs_l, cu_l)
+
+    assert ptrs == (
+        workspace.request_indices.data_ptr(),
+        workspace.page_table.data_ptr(),
+        workspace.lse.data_ptr(),
+        workspace.tmp_output.data_ptr(),
+        workspace.tmp_lse.data_ptr(),
+    )
+    assert workspace.plan.total_num_partial_rows <= 2048
+
+
+def test_fixed_capacity_extend_workspace_rejects_overflow() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[64],
+        cache_seqlens=[64 * 256],
+        page_size=64,
+        seed=95,
+        page_table_width=256,
+        num_pages=512,
+    )
+    workspace = PagedAttentionWorkspace.for_fixed_capacity(
+        mode="extend",
+        device=q.device,
+        dtype=q.dtype,
+        kv_dtype=k_cache.dtype,
+        num_q_heads=int(q.shape[1]),
+        num_kv_heads=int(k_cache.shape[2]),
+        head_dim_qk=int(q.shape[2]),
+        head_dim_vo=int(v_cache.shape[3]),
+        page_size=int(k_cache.shape[1]),
+        max_total_q=int(q.shape[0]),
+        max_batch=1,
+        max_page_table_width=int(page_table.shape[1]),
+        max_work_items=0,
+        max_partial_rows=0,
+        num_cache_pages=int(k_cache.shape[0]),
+    )
+
+    with pytest.raises(ValueError, match="paged prefill plan exceeds the configured eager workspace budget"):
+        workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
 
 
 def test_workspace_mode_validation_rejects_mismatched_prepare() -> None:
@@ -505,7 +713,7 @@ def test_graph_workspace_reuses_stable_metadata_buffers_for_smaller_replay() -> 
     assert workspace.active_total_q == q1.shape[0]
 
 
-def test_graph_workspace_uses_narrower_fp8_extend_chunks_at_8192() -> None:
+def test_graph_workspace_uses_nosplit_fp8_extend_chunks_at_8192() -> None:
     require_sm120()
     clear_attention_caches()
 
@@ -534,8 +742,8 @@ def test_graph_workspace_uses_narrower_fp8_extend_chunks_at_8192() -> None:
 
     assert workspace.plan.mode == "extend"
     assert workspace.plan.kv_dtype == torch.float8_e4m3fn
-    assert workspace.plan.kv_chunk_size == 3 * 64
-    assert workspace.plan.split_kv is True
+    assert workspace.plan.kv_chunk_size == 128 * 64
+    assert workspace.plan.split_kv is False
 
 
 def test_graph_workspace_rejects_capacity_growth() -> None:
@@ -585,20 +793,22 @@ def _count_generate_original_ir_calls(
     return calls, original_generate_original_ir
 
 
-def test_eager_workspace_reuses_compiled_host_launcher_for_identical_nosplit_shape(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_eager_workspace_reuses_compiled_host_launcher_for_identical_nosplit_shape() -> None:
     require_sm120()
     clear_attention_caches()
+    from b12x.attention.paged.api import _build_extend_forward_kernel
+    from b12x.attention.paged.traits import select_paged_forward_traits_from_plan
 
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
         q_seqlens=[4],
-        cache_seqlens=[4],
+        cache_seqlens=[4096],
         page_size=64,
         q_heads=48,
         kv_heads=8,
         head_dim=128,
         seed=79,
+        page_table_width=64,
+        num_pages=512,
     )
     workspace = _make_workspace(
         q=q,
@@ -606,20 +816,26 @@ def test_eager_workspace_reuses_compiled_host_launcher_for_identical_nosplit_sha
         v_cache=v_cache,
         cu_seqlens_q=cu_seqlens_q,
     )
-    calls, _ = _count_generate_original_ir_calls(monkeypatch)
 
     workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
     workspace.run(q, k_cache, v_cache, output=torch.empty_like(q))
-    first_run_calls = calls[0]
+    traits = select_paged_forward_traits_from_plan(workspace.plan)
+    kernel = _build_extend_forward_kernel(traits, False, False)
+    cache = getattr(kernel, "_eager_host_launchers", None)
+    assert cache is not None
+    assert len(cache) == 1
+    first_compiled = next(iter(cache.values()))
 
     workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
     workspace.run(q, k_cache, v_cache, output=torch.empty_like(q))
 
-    assert first_run_calls > 0
-    assert calls[0] == first_run_calls
+    cache = getattr(kernel, "_eager_host_launchers", None)
+    assert cache is not None
+    assert len(cache) == 1
+    assert next(iter(cache.values())) is first_compiled
 
 
-def test_eager_workspace_reuses_compiled_host_launcher_for_identical_splitkv_shape(
+def test_eager_workspace_reuses_compiled_host_launcher_for_identical_extend_shape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     require_sm120()
@@ -640,7 +856,7 @@ def test_eager_workspace_reuses_compiled_host_launcher_for_identical_splitkv_sha
     calls, _ = _count_generate_original_ir_calls(monkeypatch)
 
     workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
-    assert workspace.plan.split_kv is True
+    assert workspace.plan.split_kv is False
     workspace.run(q, k_cache, v_cache, output=torch.empty_like(q))
     first_run_calls = calls[0]
 

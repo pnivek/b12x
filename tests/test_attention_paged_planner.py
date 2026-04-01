@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from b12x.attention.paged.planner import (
+    PagedPlanBudget,
     build_decode_chunk_pages_lut,
     create_paged_plan,
     decode_chunk_pages_for_graph,
@@ -116,7 +117,6 @@ def test_paged_workspace_shapes_follow_plan_metadata() -> None:
         page_table,
         cache_seqlens,
         cu_seqlens_q,
-        fixed_split_size=16,
     )
     workspace = PagedAttentionWorkspace.for_tensors(
         mode="extend",
@@ -128,19 +128,16 @@ def test_paged_workspace_shapes_follow_plan_metadata() -> None:
         page_table,
         cache_seqlens,
         cu_seqlens_q,
-        fixed_split_size=16,
     )
 
     assert workspace.lse.shape == (8, 7)
-    assert workspace.kv_chunk_size_ptr.item() == 16 * 64
+    assert workspace.kv_chunk_size_ptr.item() == 128 * 64
     assert workspace.total_num_rows_ptr.item() == 7
     assert workspace.request_indices.shape[0] == plan.new_batch_size
     assert workspace.merge_indptr.shape[0] == plan.total_q + 1
     assert workspace.o_indptr.shape[0] == page_table.shape[0] + 1
-    assert workspace.tmp_output is not None
-    assert workspace.tmp_output.shape[0] == plan.total_num_partial_rows
-    assert workspace.tmp_lse is not None
-    assert workspace.tmp_lse.shape == (plan.total_num_partial_rows, plan.num_q_heads)
+    assert workspace.tmp_output is None
+    assert workspace.tmp_lse is None
 
 
 def test_paged_fp8_auto_chunk_heuristic_uses_larger_decode_chunks() -> None:
@@ -238,7 +235,82 @@ def test_paged_graph_mode_falls_back_when_heuristic_overflows_budget() -> None:
     )
 
     assert plan.new_batch_size <= plan.padded_batch_size
-    assert plan.split_kv is True
+
+
+def test_paged_extend_plan_respects_fixed_partial_row_budget() -> None:
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+        q_seqlens=[128],
+        cache_seqlens=[128 * 64],
+        kv_dtype=torch.bfloat16,
+    )
+    plan = create_paged_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        plan_budget=PagedPlanBudget(
+            max_total_q=128,
+            max_batch=1,
+            max_page_table_width=128,
+            max_work_items=4096,
+            max_partial_rows=512,
+        ),
+    )
+
+    assert plan.mode == "extend"
+    assert plan.split_kv is False
+    assert plan.total_num_partial_rows == 0
+
+
+def test_paged_extend_plan_budget_can_force_nosplit() -> None:
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+        q_seqlens=[64],
+        cache_seqlens=[256 * 64],
+        kv_dtype=torch.bfloat16,
+    )
+    plan = create_paged_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        plan_budget=PagedPlanBudget(
+            max_total_q=64,
+            max_batch=1,
+            max_page_table_width=256,
+            max_work_items=4096,
+            max_partial_rows=0,
+        ),
+    )
+
+    assert plan.mode == "extend"
+    assert plan.split_kv is False
+    assert plan.total_num_partial_rows == 0
+
+
+def test_paged_extend_plan_rejects_fixed_split_smaller_than_full_span() -> None:
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+        q_seqlens=[6] * 8,
+        cache_seqlens=[8192] * 8,
+        kv_dtype=torch.bfloat16,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="extend fixed_split_size must cover the full effective KV span",
+    ):
+        create_paged_plan(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            fixed_split_size=8,
+        )
 
 
 def test_paged_graph_mode_uses_registered_decode_graph_policy() -> None:
@@ -371,6 +443,10 @@ def test_paged_non_policy_chunk_selection_still_produces_valid_split_kv_plans(
     )
 
     assert plan.kv_chunk_size > 0
-    assert plan.total_num_partial_rows >= plan.total_q
     assert plan.new_batch_size >= page_table.shape[0]
-    assert plan.split_kv is True
+    if q_seqlens[0] == 1:
+        assert plan.total_num_partial_rows >= plan.total_q
+        assert plan.split_kv is True
+    else:
+        assert plan.total_num_partial_rows == 0
+        assert plan.split_kv is False

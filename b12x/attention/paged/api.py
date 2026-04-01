@@ -16,10 +16,9 @@ from cutlass.cute.runtime import from_dlpack
 from b12x.cute.utils import current_cuda_stream
 
 from .forward_paged import (
-    PagedBf16ExtendRawForwardKernel,
     PagedForwardKernel,
-    PagedFp8ExtendRawForwardKernel,
 )
+from .forward_extend_generic import build_extend_forward_kernel
 from .merge import PagedPersistentMergeKernel, default_paged_persistent_ctas
 from .traits import PagedForwardTraits, select_paged_forward_traits_from_plan
 from .workspace import PagedAttentionWorkspace
@@ -73,41 +72,108 @@ def _attn_turbo_enabled(attn_mode: Literal["default", "turbo"] | None) -> bool:
     return os.environ.get("B12X_ATTN", "").upper() == "TURBO"
 
 
-def _use_fp8_extend_raw_specialization(
-    traits: PagedForwardTraits,
+@lru_cache(maxsize=16)
+def _dummy_plane_tma_desc_ptrs(device_index: int, num_heads: int) -> torch.Tensor:
+    return torch.zeros((num_heads,), dtype=torch.int64, device=torch.device("cuda", device_index))
+
+
+def _encode_plane_tma_descriptors(
+    cache: torch.Tensor,
     *,
-    split_kv: bool,
-) -> bool:
-    del split_kv
-    return (
-        traits.kv_dtype == torch.float8_e4m3fn
-        and traits.q_dtype == torch.bfloat16
-        and traits.o_dtype == torch.bfloat16
-        and traits.cta_tile_q in (32, 48)
-        and traits.head_dim_qk == 256
-        and traits.head_dim_vo == 256
+    plane_cols: int,
+    tile_rows: int | None = None,
+) -> torch.Tensor:
+    if cache.ndim != 4:
+        raise ValueError("cache must have shape [num_pages, page_size, kv_heads, head_dim]")
+    num_pages, page_size, kv_heads, head_dim = [int(dim) for dim in cache.shape]
+    if plane_cols <= 0 or head_dim % plane_cols != 0:
+        raise ValueError(f"plane_cols={plane_cols} must divide head_dim={head_dim}")
+    if tile_rows is None:
+        tile_rows = page_size
+    if tile_rows <= 0 or page_size % tile_rows != 0:
+        raise ValueError(f"tile_rows={tile_rows} must be positive and divide page_size={page_size}")
+
+    swizzle_name = os.environ.get("B12X_PAGED_KV_TMA_PLANE_SWIZZLE", "")
+    swizzle = (
+        cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_NONE
+        if swizzle_name == "none"
+        else cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B
     )
+    if cache.dtype == torch.float8_e4m3fn:
+        data_type = cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_UINT8
+        elem_bytes = 1
+    elif cache.dtype == torch.bfloat16:
+        data_type = cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
+        elem_bytes = 2
+    elif cache.dtype == torch.float16:
+        data_type = cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_FLOAT16
+        elem_bytes = 2
+    else:
+        raise TypeError(f"unsupported plane TMA cache dtype {cache.dtype}")
+    U64 = cuda.cuuint64_t
+    U32 = cuda.cuuint32_t
+    row_bytes = kv_heads * head_dim * elem_bytes
+    total_rows = num_pages * page_size
+    base_ptr = int(cache.view(torch.uint8).data_ptr())
+    head_stride_bytes = head_dim * elem_bytes
+
+    host_desc = torch.empty((kv_heads, 16), dtype=torch.uint64)
+    for kv_head_idx in range(kv_heads):
+        result, tensor_map = cuda.cuTensorMapEncodeTiled(
+            data_type,
+            2,
+            base_ptr + kv_head_idx * head_stride_bytes,
+            [U64(head_dim), U64(total_rows)],
+            [U64(row_bytes)],
+            [U32(plane_cols), U32(tile_rows)],
+            [U32(1), U32(1)],
+            cuda.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
+            swizzle,
+            cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            cuda.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+        )
+        if result != cuda.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"cuTensorMapEncodeTiled failed: {result}")
+        host_desc[kv_head_idx] = torch.tensor(
+            [int(word) for word in tensor_map.opaque],
+            dtype=torch.uint64,
+        )
+    return host_desc.to(device=cache.device, non_blocking=False)
 
 
-def _use_bf16_extend_raw_specialization(
-    traits: PagedForwardTraits,
+def _descriptor_row_ptrs(desc: torch.Tensor) -> torch.Tensor:
+    row_bytes = int(desc.stride(0)) * desc.element_size()
+    base_ptr = int(desc.data_ptr())
+    ptrs = [base_ptr + idx * row_bytes for idx in range(int(desc.shape[0]))]
+    return torch.tensor(ptrs, dtype=torch.int64, device=desc.device)
+
+
+def _get_cached_plane_tma_descs(
+    workspace: PagedAttentionWorkspace,
     *,
-    split_kv: bool,
-) -> bool:
-    del split_kv
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    plane_cols: int,
+    tile_rows: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor, torch.Tensor] | None:
+    cached = getattr(workspace, "_live_plane_tma_desc_cache", None)
+    if cached is None:
+        return None
+    key = (
+        int(k_cache.data_ptr()),
+        int(v_cache.data_ptr()),
+        tuple(k_cache.shape),
+        tuple(v_cache.shape),
+        plane_cols,
+        tile_rows,
+    )
+    if cached.get("key") != key:
+        return None
     return (
-        traits.kv_dtype == torch.bfloat16
-        and traits.q_dtype == torch.bfloat16
-        and traits.o_dtype == torch.bfloat16
-        and traits.num_warps_q == 4
-        and traits.num_warps_kv == 1
-        and traits.num_threads == 128
-        and traits.cta_tile_q == 64
-        and traits.cta_tile_kv == 16
-        and traits.num_mma_q == 1
-        and traits.num_mma_kv == 1
-        and traits.head_dim_qk == 256
-        and traits.head_dim_vo == 256
+        cached.get("k_desc"),
+        cached.get("v_desc"),
+        cached["k_ptrs"],
+        cached["v_ptrs"],
     )
 
 
@@ -224,31 +290,13 @@ def _build_forward_kernel(
     )
 
 
-@lru_cache(maxsize=16)
-def _build_fp8_extend_raw_forward_kernel(
+@lru_cache(maxsize=32)
+def _build_extend_forward_kernel(
     traits: PagedForwardTraits,
-    split_kv: bool,
     mxfp8_turbo: bool,
     enable_mxfp8_pv: bool,
-) -> PagedFp8ExtendRawForwardKernel:
-    del mxfp8_turbo, enable_mxfp8_pv
-    return PagedFp8ExtendRawForwardKernel(
-        split_kv=split_kv,
-        cta_tile_q=traits.cta_tile_q,
-    )
-
-
-@lru_cache(maxsize=16)
-def _build_bf16_extend_raw_forward_kernel(
-    traits: PagedForwardTraits,
-    split_kv: bool,
-    mxfp8_turbo: bool,
-    enable_mxfp8_pv: bool,
-) -> PagedBf16ExtendRawForwardKernel:
-    del traits, mxfp8_turbo, enable_mxfp8_pv
-    return PagedBf16ExtendRawForwardKernel(
-        split_kv=split_kv,
-    )
+) -> object:
+    return build_extend_forward_kernel(traits, mxfp8_turbo, enable_mxfp8_pv)
 
 
 @lru_cache(maxsize=16)
@@ -308,23 +356,11 @@ def paged_attention_forward(
     traits = select_paged_forward_traits_from_plan(plan)
     mxfp8_turbo = _attn_turbo_enabled(workspace.attn_mode) and plan.kv_dtype == torch.float8_e4m3fn
     enable_mxfp8_pv = mxfp8_turbo and plan.mode == "decode" and plan.kv_chunk_size <= 384
-    if _use_bf16_extend_raw_specialization(
-        traits,
-        split_kv=plan.split_kv,
-    ):
-        forward_kernel = _build_bf16_extend_raw_forward_kernel(
+    if plan.mode == "extend":
+        if plan.split_kv:
+            raise ValueError("extend plans no longer support split-kv")
+        forward_kernel = _build_extend_forward_kernel(
             traits,
-            plan.split_kv,
-            mxfp8_turbo,
-            enable_mxfp8_pv,
-        )
-    elif _use_fp8_extend_raw_specialization(
-        traits,
-        split_kv=plan.split_kv,
-    ):
-        forward_kernel = _build_fp8_extend_raw_forward_kernel(
-            traits,
-            plan.split_kv,
             mxfp8_turbo,
             enable_mxfp8_pv,
         )
@@ -368,28 +404,61 @@ def paged_attention_forward(
     block_valid_mask_arg = _to_kernel_tensor(workspace.block_valid_mask, cutlass.Int32, assumed_align=4)
     k_descale_arg = _to_kernel_tensor(k_descale, cutlass.Float32)
     v_descale_arg = _to_kernel_tensor(v_descale, cutlass.Float32)
+    k_tma_desc_ptrs: torch.Tensor | None = None
+    v_tma_desc_ptrs: torch.Tensor | None = None
+    k_tma_desc: torch.Tensor | None = None
+    v_tma_desc: torch.Tensor | None = None
+    if plan.mode == "extend" and (
+        getattr(forward_kernel, "use_paged_kv_tma_raw_desc_issue", False)
+        or getattr(forward_kernel, "use_paged_kv_tma_fp8_raw_issue", False)
+    ):
+        cached_descs = _get_cached_plane_tma_descs(
+            workspace,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            plane_cols=forward_kernel.kv_tma_plane_head_dim,
+            tile_rows=forward_kernel.stage_tile_rows,
+        )
+        if cached_descs is not None:
+            k_tma_desc, v_tma_desc, k_tma_desc_ptrs, v_tma_desc_ptrs = cached_descs
+        else:
+            k_tma_desc = _encode_plane_tma_descriptors(
+                k_cache,
+                plane_cols=forward_kernel.kv_tma_plane_head_dim,
+                tile_rows=forward_kernel.stage_tile_rows,
+            )
+            v_tma_desc = _encode_plane_tma_descriptors(
+                v_cache,
+                plane_cols=forward_kernel.kv_tma_plane_head_dim,
+                tile_rows=forward_kernel.stage_tile_rows,
+            )
+            k_tma_desc_ptrs = _descriptor_row_ptrs(k_tma_desc)
+            v_tma_desc_ptrs = _descriptor_row_ptrs(v_tma_desc)
+            workspace._live_plane_tma_desc_cache = {
+                "key": (
+                    int(k_cache.data_ptr()),
+                    int(v_cache.data_ptr()),
+                    tuple(k_cache.shape),
+                    tuple(v_cache.shape),
+                    forward_kernel.kv_tma_plane_head_dim,
+                    forward_kernel.stage_tile_rows,
+                ),
+                "k_desc": k_tma_desc,
+                "v_desc": v_tma_desc,
+                "k_ptrs": k_tma_desc_ptrs,
+                "v_ptrs": v_tma_desc_ptrs,
+            }
+    if k_tma_desc_ptrs is None or v_tma_desc_ptrs is None:
+        dummy_desc_ptrs = _dummy_plane_tma_desc_ptrs(
+            torch.cuda.current_device(),
+            plan.num_kv_heads,
+        )
+        k_tma_desc_ptrs = dummy_desc_ptrs
+        v_tma_desc_ptrs = dummy_desc_ptrs
+    workspace._live_plane_tma_descs = (k_tma_desc, v_tma_desc, k_tma_desc_ptrs, v_tma_desc_ptrs)
 
     stream = current_cuda_stream()
-    forward_args = (
-        q_arg,
-        k_cache_arg,
-        v_cache_arg,
-        page_table_arg,
-        cache_seqlens_arg,
-        cu_seqlens_q_arg,
-        request_indices_arg,
-        qo_tile_indices_arg,
-        kv_tile_indices_arg,
-        o_indptr_arg,
-        kv_chunk_size_arg,
-        block_valid_mask_arg,
-        forward_output_arg,
-        forward_lse_arg,
-        k_descale_arg,
-        v_descale_arg,
-        stream,
-    )
-    forward_cache_key = (
+    forward_cache_key = [
         _tensor_meta_key(q),
         _tensor_meta_key(k_cache),
         _tensor_meta_key(v_cache),
@@ -406,29 +475,60 @@ def paged_attention_forward(
         _tensor_meta_key(forward_lse),
         _tensor_meta_key(k_descale),
         _tensor_meta_key(v_descale),
-    )
+    ]
+    cache_key_labels = [
+        "q",
+        "k_cache",
+        "v_cache",
+        "page_table",
+        "cache_seqlens",
+        "cu_seqlens_q",
+        "request_indices",
+        "qo_tile_indices",
+        "kv_tile_indices",
+        "o_indptr",
+        "kv_chunk_size_ptr",
+        "block_valid_mask",
+        "forward_output",
+        "forward_lse",
+        "k_descale",
+        "v_descale",
+    ]
+    forward_args = [
+        q_arg,
+        k_cache_arg,
+        v_cache_arg,
+        page_table_arg,
+        cache_seqlens_arg,
+        cu_seqlens_q_arg,
+        request_indices_arg,
+        qo_tile_indices_arg,
+        kv_tile_indices_arg,
+        o_indptr_arg,
+        kv_chunk_size_arg,
+        block_valid_mask_arg,
+        forward_output_arg,
+        forward_lse_arg,
+        k_descale_arg,
+        v_descale_arg,
+    ]
+    if plan.mode == "extend":
+        k_tma_desc_arg = _to_kernel_tensor(k_tma_desc_ptrs, cutlass.Int64, assumed_align=8)
+        v_tma_desc_arg = _to_kernel_tensor(v_tma_desc_ptrs, cutlass.Int64, assumed_align=8)
+        forward_args.extend((k_tma_desc_arg, v_tma_desc_arg))
+        forward_cache_key.extend(
+            (
+                _tensor_meta_key(k_tma_desc_ptrs),
+                _tensor_meta_key(v_tma_desc_ptrs),
+            )
+        )
+        cache_key_labels.extend(("k_tma_desc_ptrs", "v_tma_desc_ptrs"))
+    forward_args.append(stream)
     _run_cached_host_launcher(
         forward_kernel,
-        forward_cache_key,
-        forward_args,
-        cache_key_labels=(
-            "q",
-            "k_cache",
-            "v_cache",
-            "page_table",
-            "cache_seqlens",
-            "cu_seqlens_q",
-            "request_indices",
-            "qo_tile_indices",
-            "kv_tile_indices",
-            "o_indptr",
-            "kv_chunk_size_ptr",
-            "block_valid_mask",
-            "forward_output",
-            "forward_lse",
-            "k_descale",
-            "v_descale",
-        ),
+        tuple(forward_cache_key),
+        tuple(forward_args),
+        cache_key_labels=tuple(cache_key_labels),
     )
 
     if plan.split_kv:
@@ -482,6 +582,5 @@ def paged_attention_forward(
 def clear_paged_caches() -> None:
     """Clear compiled-kernel caches for the primary paged backend."""
     _build_forward_kernel.cache_clear()
-    _build_fp8_extend_raw_forward_kernel.cache_clear()
-    _build_bf16_extend_raw_forward_kernel.cache_clear()
+    _build_extend_forward_kernel.cache_clear()
     _build_merge_kernel.cache_clear()

@@ -46,10 +46,20 @@ def _run_decode_graph_check(
     cache_seqlen: int,
     b12x_attn_mode: str = "default",
 ) -> tuple[torch.Tensor, torch.Tensor, str]:
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_uniform_paged_inputs(
+    (
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        capture_page_table,
+        capture_cache_seqlens,
+        cu_seqlens_q,
+    ) = _make_uniform_paged_inputs(
         batch=8,
         q_seqlen=1,
         cache_seqlen=cache_seqlen,
+        capture_cache_seqlen=None,
         page_size=64,
         q_heads=8,
         kv_heads=1,
@@ -69,12 +79,15 @@ def _run_decode_graph_check(
         v_cache=v_fp8,
         page_table=page_table,
         cache_seqlens=cache_seqlens,
+        capture_page_table=capture_page_table,
+        capture_cache_seqlens=capture_cache_seqlens,
         cu_seqlens_q=cu_seqlens_q,
         fixed_split_pages=None,
         k_descale=k_descale,
         v_descale=v_descale,
         warmup=1,
         b12x_attn_mode=b12x_attn_mode,
+        graph_ctas_per_sm=None,
     )
     _fa2_graph, fa2_out = _capture_flashinfer_fa2_graph(
         q=q,
@@ -82,6 +95,8 @@ def _run_decode_graph_check(
         v_cache=v_fp8,
         page_table=page_table,
         cache_seqlens=cache_seqlens,
+        capture_page_table=capture_page_table,
+        capture_cache_seqlens=capture_cache_seqlens,
         q_seqlen=1,
         page_size=64,
         q_heads=8,
@@ -179,7 +194,7 @@ def test_paged_forward_matches_reference_fp8_decode_short_context_batch8() -> No
 def test_paged_forward_turbo_matches_reference_fp8_decode_short_context_batch8() -> None:
     require_sm120()
     output, fa2_out, plan_desc = _run_decode_graph_check(cache_seqlen=64, b12x_attn_mode="turbo")
-    assert plan_desc == "chunk=128,split"
+    assert plan_desc == "chunk=64,split"
     assert (output - fa2_out).abs().max().item() <= 0.02
     assert _cosine_similarity(output, fa2_out) >= 0.998
 
@@ -219,7 +234,7 @@ def test_paged_forward_matches_reference_without_split_bf16_extend() -> None:
 
 
 @torch.inference_mode()
-def test_paged_forward_matches_reference_with_split_fp8_kv() -> None:
+def test_paged_forward_matches_reference_with_fp8_kv_extend() -> None:
     require_sm120()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[6, 5],
@@ -234,12 +249,8 @@ def test_paged_forward_matches_reference_with_split_fp8_kv() -> None:
         cache_seqlens,
     )
     workspace = _make_workspace(q, k_fp8, v_fp8, mode="extend")
-    workspace.prepare(
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        fixed_split_size=8,
-    )
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
+    assert workspace.plan.split_kv is False
     output, lse_base2 = workspace.run(
         q,
         k_fp8,
@@ -280,13 +291,13 @@ def test_paged_forward_matches_reference_with_split_fp8_decode() -> None:
 def test_paged_forward_turbo_matches_reference_with_split_fp8_decode() -> None:
     require_sm120()
     output, fa2_out, plan_desc = _run_decode_graph_check(cache_seqlen=8192, b12x_attn_mode="turbo")
-    assert plan_desc == "chunk=384,split"
+    assert plan_desc == "chunk=192,split"
     assert (output - fa2_out).abs().max().item() <= 0.01
     assert _cosine_similarity(output, fa2_out) >= 0.998
 
 
 @torch.inference_mode()
-def test_paged_forward_matches_reference_with_split_bf16_kv() -> None:
+def test_paged_forward_matches_reference_with_bf16_kv_extend() -> None:
     require_sm120()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[6, 5],
@@ -295,12 +306,8 @@ def test_paged_forward_matches_reference_with_split_bf16_kv() -> None:
         kv_dtype=torch.bfloat16,
     )
     workspace = _make_workspace(q, k_cache, v_cache, mode="extend")
-    workspace.prepare(
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        fixed_split_size=8,
-    )
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
+    assert workspace.plan.split_kv is False
     output, lse_base2 = workspace.run(q, k_cache, v_cache, output=torch.empty_like(q))
     torch.cuda.synchronize()
 

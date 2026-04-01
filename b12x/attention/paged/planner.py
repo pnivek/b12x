@@ -21,6 +21,34 @@ from typing import Literal
 import torch
 
 _FP8_KV_DTYPE = torch.float8_e4m3fn
+_PAGED_EXTEND_FP8_CHUNK_TABLE_PAGES = (
+    (1, 1),
+    (2, 1),
+    (4, 1),
+    (8, 1),
+    (16, 1),
+    (32, 2),
+    (64, 3),
+    (128, 6),
+    (256, 6),
+    (512, 24),
+    (1024, 24),
+    (2048, 24),
+)
+_PAGED_EXTEND_BF16_CHUNK_TABLE_PAGES = (
+    (1, 1),
+    (2, 1),
+    (4, 1),
+    (8, 1),
+    (16, 1),
+    (32, 2),
+    (64, 3),
+    (128, 6),
+    (256, 6),
+    (512, 32),
+    (1024, 32),
+    (2048, 32),
+)
 
 _DEFAULT_GRAPH_CTAS_PER_SM = 2
 
@@ -123,6 +151,16 @@ def _estimate_new_batch_size(
     return int(new_batch_size)
 
 
+def _lookup_chunk_pages_from_table(
+    max_effective_kv_pages: int,
+    table: tuple[tuple[int, int | None], ...],
+) -> int | None:
+    for max_pages, chunk_pages in table:
+        if max_effective_kv_pages <= max_pages:
+            return chunk_pages
+    return None
+
+
 def _q_lengths_from_cu_seqlens(cu_seqlens_q: torch.Tensor) -> list[int]:
     cu_seqlens_q_list = _metadata_to_cpu_int_list(cu_seqlens_q, name="cu_seqlens_q")
     q_lengths: list[int] = []
@@ -156,10 +194,8 @@ def _paged_determine_cta_tile_q(
     max_effective_kv_pages: int,
 ) -> int:
     cta_tile_q = _fa2_determine_cta_tile_q(packed_qo_len, head_dim)
-    if mode == "extend" and kv_dtype == _FP8_KV_DTYPE and cta_tile_q == 64:
-        if max_effective_kv_pages <= 8:
-            return 32
-        return 48
+    del max_effective_kv_pages
+    del mode, kv_dtype
     return cta_tile_q
 
 
@@ -176,8 +212,17 @@ def chunk_pages_for_family(
     gqa_group_size: int,
     max_effective_kv_pages: int,
 ) -> int | None:
-    if mode == "extend":
-        return 1
+    if page_size != 64 or head_dim_qk != 256 or head_dim_vo != 256 or gqa_group_size != 8:
+        return None
+    if q_dtype != torch.bfloat16:
+        return None
+    if mode == "extend" and not graph_chunk_policy and kv_dtype == _FP8_KV_DTYPE:
+        return _lookup_chunk_pages_from_table(max_effective_kv_pages, _PAGED_EXTEND_FP8_CHUNK_TABLE_PAGES)
+    if mode == "extend" and not graph_chunk_policy and kv_dtype == torch.bfloat16:
+        return _lookup_chunk_pages_from_table(
+            max_effective_kv_pages,
+            _PAGED_EXTEND_BF16_CHUNK_TABLE_PAGES,
+        )
 
     if (
         mode != "decode"
@@ -209,13 +254,63 @@ def chunk_pages_for_family(
         return None
 
 
+@dataclass(frozen=True)
+class PagedPlanBudget:
+    max_total_q: int | None = None
+    max_batch: int | None = None
+    max_page_table_width: int | None = None
+    max_work_items: int | None = None
+    max_partial_rows: int | None = None
+
+
+def _estimate_prefill_plan_usage(
+    *,
+    packed_qo_len_arr: list[int],
+    q_lengths: list[int],
+    kv_len_arr: list[int],
+    qo_chunk_size: int,
+    kv_chunk_size_pages: int,
+    force_split_kv: bool,
+) -> tuple[int, int]:
+    new_batch_size = 0
+    total_num_partial_rows = 0
+    split_kv = False
+    for packed_qo_len, qo_len, kv_len in zip(packed_qo_len_arr, q_lengths, kv_len_arr):
+        num_tiles_q = _ceil_div(packed_qo_len, qo_chunk_size)
+        num_chunks_kv = _ceil_div(max(kv_len, 1), kv_chunk_size_pages)
+        split_kv = split_kv or num_chunks_kv > 1
+        new_batch_size += num_tiles_q * num_chunks_kv
+        total_num_partial_rows += qo_len * num_chunks_kv
+    if force_split_kv:
+        split_kv = True
+    return int(new_batch_size), int(total_num_partial_rows if split_kv else 0)
+
+
+def _prefill_usage_fits_budget(
+    *,
+    budget: PagedPlanBudget | None,
+    new_batch_size: int,
+    total_num_partial_rows: int,
+) -> bool:
+    if budget is None:
+        return True
+    if budget.max_work_items is not None and new_batch_size > int(budget.max_work_items):
+        return False
+    if budget.max_partial_rows is not None and total_num_partial_rows > int(budget.max_partial_rows):
+        return False
+    return True
+
+
 def _prefill_binary_search_kv_chunk_size(
     *,
     enable_cuda_graph: bool,
     max_batch_size_if_split: int,
     packed_qo_len_arr: list[int],
+    q_lengths: list[int],
     kv_len_arr: list[int],
     qo_chunk_size: int,
+    force_split_kv: bool,
+    plan_budget: PagedPlanBudget | None = None,
     min_kv_chunk_size: int = 1,
 ) -> tuple[bool, int]:
     batch_size = len(packed_qo_len_arr)
@@ -224,15 +319,39 @@ def _prefill_binary_search_kv_chunk_size(
     high = max_kv_len
     while low < high:
         mid = (low + high) // 2
-        new_batch_size = 0
-        for i in range(batch_size):
-            new_batch_size += _ceil_div(packed_qo_len_arr[i], qo_chunk_size) * _ceil_div(
-                max(kv_len_arr[i], 1), mid
+        new_batch_size, total_num_partial_rows = _estimate_prefill_plan_usage(
+            packed_qo_len_arr=packed_qo_len_arr,
+            q_lengths=q_lengths,
+            kv_len_arr=kv_len_arr,
+            qo_chunk_size=qo_chunk_size,
+            kv_chunk_size_pages=mid,
+            force_split_kv=force_split_kv,
+        )
+        if (
+            new_batch_size > max_batch_size_if_split
+            or not _prefill_usage_fits_budget(
+                budget=plan_budget,
+                new_batch_size=new_batch_size,
+                total_num_partial_rows=total_num_partial_rows,
             )
-        if new_batch_size > max_batch_size_if_split:
+        ):
             low = mid + 1
         else:
             high = mid
+    final_new_batch_size, final_total_num_partial_rows = _estimate_prefill_plan_usage(
+        packed_qo_len_arr=packed_qo_len_arr,
+        q_lengths=q_lengths,
+        kv_len_arr=kv_len_arr,
+        qo_chunk_size=qo_chunk_size,
+        kv_chunk_size_pages=low,
+        force_split_kv=force_split_kv,
+    )
+    if final_new_batch_size > max_batch_size_if_split or not _prefill_usage_fits_budget(
+        budget=plan_budget,
+        new_batch_size=final_new_batch_size,
+        total_num_partial_rows=final_total_num_partial_rows,
+    ):
+        raise ValueError("paged prefill plan exceeds the configured eager workspace budget")
     return (enable_cuda_graph or low < max_kv_len, low)
 
 
@@ -360,6 +479,7 @@ def create_paged_plan(
     graph_chunk_policy: bool = False,
     max_batch_size_if_split: int | None = None,
     graph_ctas_per_sm: int | None = None,
+    plan_budget: PagedPlanBudget | None = None,
     window_left: int = -1,
 ) -> PagedPlan:
     if q.ndim != 3:
@@ -419,6 +539,25 @@ def create_paged_plan(
     mode = inferred_mode if mode is None else mode
     if force_split_kv is None:
         force_split_kv = mode == "decode"
+    if mode == "extend" and force_split_kv:
+        raise ValueError("extend plans no longer support split-kv")
+    if plan_budget is not None:
+        if plan_budget.max_total_q is not None and total_q > int(plan_budget.max_total_q):
+            raise ValueError(
+                f"paged plan total_q={total_q} exceeds workspace capacity {int(plan_budget.max_total_q)}"
+            )
+        if plan_budget.max_batch is not None and batch > int(plan_budget.max_batch):
+            raise ValueError(
+                f"paged plan batch={batch} exceeds workspace capacity {int(plan_budget.max_batch)}"
+            )
+        if (
+            plan_budget.max_page_table_width is not None
+            and max_pages_per_request > int(plan_budget.max_page_table_width)
+        ):
+            raise ValueError(
+                "paged plan page_table width="
+                f"{max_pages_per_request} exceeds workspace capacity {int(plan_budget.max_page_table_width)}"
+            )
 
     gqa_group_size = num_q_heads // num_kv_heads
     packed_qo_len_arr = [q_len * gqa_group_size for q_len in q_lengths]
@@ -483,7 +622,19 @@ def create_paged_plan(
         disable_split_kv = True
 
     min_kv_chunk_size = max(128 // page_size, 1)
-    if disable_split_kv and not force_split_kv:
+    if mode == "extend":
+        split_kv = False
+        disable_split_kv = True
+        required_kv_chunk_size_pages = max(max(effective_kv_len_arr), 1)
+        if fixed_split_size > 0:
+            if fixed_split_size < required_kv_chunk_size_pages:
+                raise ValueError(
+                    "extend fixed_split_size must cover the full effective KV span when split-kv is disabled"
+                )
+            kv_chunk_size_pages = fixed_split_size
+        else:
+            kv_chunk_size_pages = required_kv_chunk_size_pages
+    elif disable_split_kv and not force_split_kv:
         split_kv = False
         kv_chunk_size_pages = 1 << 30
     elif fixed_split_size > 0:
@@ -503,6 +654,7 @@ def create_paged_plan(
             max_effective_kv_pages=max(max(effective_kv_len_arr), 1),
         )
         heuristic_fits_graph_budget = True
+        heuristic_fits_plan_budget = True
         if heuristic_kv_chunk_size_pages is not None and enable_cuda_graph:
             heuristic_new_batch_size = _estimate_new_batch_size(
                 packed_qo_len_arr=packed_qo_len_arr,
@@ -511,7 +663,25 @@ def create_paged_plan(
                 kv_chunk_size_pages=heuristic_kv_chunk_size_pages,
             )
             heuristic_fits_graph_budget = heuristic_new_batch_size <= padded_batch_size
-        if heuristic_kv_chunk_size_pages is not None and heuristic_fits_graph_budget:
+        if heuristic_kv_chunk_size_pages is not None:
+            heuristic_new_batch_size, heuristic_total_num_partial_rows = _estimate_prefill_plan_usage(
+                packed_qo_len_arr=packed_qo_len_arr,
+                q_lengths=q_lengths,
+                kv_len_arr=effective_kv_len_arr,
+                qo_chunk_size=cta_tile_q,
+                kv_chunk_size_pages=heuristic_kv_chunk_size_pages,
+                force_split_kv=bool(force_split_kv),
+            )
+            heuristic_fits_plan_budget = _prefill_usage_fits_budget(
+                budget=plan_budget,
+                new_batch_size=heuristic_new_batch_size,
+                total_num_partial_rows=heuristic_total_num_partial_rows,
+            )
+        if (
+            heuristic_kv_chunk_size_pages is not None
+            and heuristic_fits_graph_budget
+            and heuristic_fits_plan_budget
+        ):
             split_kv = False
             kv_chunk_size_pages = heuristic_kv_chunk_size_pages
         else:
@@ -519,8 +689,11 @@ def create_paged_plan(
                 enable_cuda_graph=enable_cuda_graph,
                 max_batch_size_if_split=max_batch_size_if_split,
                 packed_qo_len_arr=packed_qo_len_arr,
+                q_lengths=q_lengths,
                 kv_len_arr=effective_kv_len_arr,
                 qo_chunk_size=cta_tile_q,
+                force_split_kv=bool(force_split_kv),
+                plan_budget=plan_budget,
                 min_kv_chunk_size=min_kv_chunk_size,
             )
 
@@ -555,6 +728,13 @@ def create_paged_plan(
         )
     if force_split_kv:
         split_kv = True
+    total_num_partial_rows = o_indptr[-1] if split_kv else 0
+    if not _prefill_usage_fits_budget(
+        budget=plan_budget,
+        new_batch_size=new_batch_size,
+        total_num_partial_rows=total_num_partial_rows,
+    ):
+        raise ValueError("paged prefill plan exceeds the configured eager workspace budget")
 
     block_valid_mask = [idx < new_batch_size for idx in range(padded_batch_size)]
     kv_chunk_size = kv_chunk_size_pages * page_size
@@ -601,7 +781,7 @@ def create_paged_plan(
         padded_batch_size=padded_batch_size,
         new_batch_size=new_batch_size,
         num_qo_tiles=total_num_qo_tiles,
-        total_num_partial_rows=o_indptr[-1],
+        total_num_partial_rows=total_num_partial_rows,
         page_size=page_size,
         num_kv_heads=num_kv_heads,
         gqa_group_size=gqa_group_size,

@@ -7,7 +7,7 @@ from typing import Literal
 
 import torch
 
-from .planner import PagedPlan, create_paged_plan, infer_paged_mode
+from .planner import PagedPlan, PagedPlanBudget, create_paged_plan, infer_paged_mode
 
 
 def _paged_lse_storage_shape(total_q: int, num_q_heads: int) -> tuple[int, int]:
@@ -58,6 +58,7 @@ class PagedAttentionWorkspace:
     attn_mode: Literal["default", "turbo"] | None = None
     page_size: int = 64
     use_cuda_graph: bool = False
+    fixed_capacity: bool = False
     request_indices: torch.Tensor | None = None
     qo_tile_indices: torch.Tensor | None = None
     kv_tile_indices: torch.Tensor | None = None
@@ -76,6 +77,7 @@ class PagedAttentionWorkspace:
     _plan_k_cache: torch.Tensor | None = None
     _plan_v_cache: torch.Tensor | None = None
     _plan: PagedPlan | None = None
+    _planner_budget: PagedPlanBudget | None = None
 
     # Pre-compiled kernel state (set by compile_paged_kernels in api.py).
     _compiled_forward: object | None = None
@@ -106,7 +108,11 @@ class PagedAttentionWorkspace:
             raise ValueError("max_total_q must be positive")
         if num_cache_pages <= 0:
             raise ValueError("num_cache_pages must be positive")
-        plan_q = torch.empty((max_total_q, num_q_heads, head_dim_qk), dtype=dtype, device=device)
+        plan_q = _shape_only_cuda_tensor(
+            (max_total_q, num_q_heads, head_dim_qk),
+            dtype=dtype,
+            device=device,
+        )
         plan_k_cache = _shape_only_cuda_tensor(
             (num_cache_pages, page_size, num_kv_heads, head_dim_qk),
             dtype=kv_dtype,
@@ -133,6 +139,61 @@ class PagedAttentionWorkspace:
             _plan_k_cache=plan_k_cache,
             _plan_v_cache=plan_v_cache,
         )
+
+    @classmethod
+    def for_fixed_capacity(
+        cls,
+        *,
+        mode: Literal["decode", "extend"],
+        device: torch.device | str,
+        dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        num_q_heads: int,
+        num_kv_heads: int,
+        head_dim_qk: int,
+        head_dim_vo: int,
+        page_size: int,
+        max_total_q: int,
+        max_batch: int,
+        max_page_table_width: int,
+        max_work_items: int,
+        max_partial_rows: int,
+        num_cache_pages: int,
+        use_cuda_graph: bool = False,
+        attn_mode: Literal["default", "turbo"] | None = None,
+    ) -> PagedAttentionWorkspace:
+        workspace = cls.for_contract(
+            mode=mode,
+            device=device,
+            dtype=dtype,
+            kv_dtype=kv_dtype,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            page_size=page_size,
+            max_total_q=max_total_q,
+            num_cache_pages=num_cache_pages,
+            use_cuda_graph=use_cuda_graph,
+            attn_mode=attn_mode,
+        )
+        workspace.fixed_capacity = True
+        workspace._planner_budget = PagedPlanBudget(
+            max_total_q=int(max_total_q),
+            max_batch=int(max_batch),
+            max_page_table_width=int(max_page_table_width),
+            max_work_items=int(max_work_items),
+            max_partial_rows=int(max_partial_rows),
+        )
+        workspace._allocate_runtime_buffers(
+            work_items_capacity=int(max_work_items),
+            block_valid_capacity=int(max_work_items),
+            total_q_capacity=int(max_total_q),
+            batch_capacity=int(max_batch),
+            page_table_width_capacity=int(max_page_table_width),
+            partial_rows_capacity=int(max_partial_rows),
+        )
+        return workspace
 
     @classmethod
     def for_tensors(
@@ -189,6 +250,10 @@ class PagedAttentionWorkspace:
             raise RuntimeError("paged workspace planning contract is not initialized")
         return int(self._plan_q.shape[0])
 
+    @property
+    def planner_budget(self) -> PagedPlanBudget | None:
+        return self._planner_budget
+
     def prepare(
         self,
         page_table: torch.Tensor,
@@ -231,6 +296,7 @@ class PagedAttentionWorkspace:
             disable_split_kv=disable_split_kv,
             enable_cuda_graph=self.use_cuda_graph,
             graph_chunk_policy=self.use_cuda_graph,
+            plan_budget=self.planner_budget if self.mode == "extend" and not self.use_cuda_graph else None,
         )
         self._ensure_capacity(plan)
         self._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
@@ -266,7 +332,11 @@ class PagedAttentionWorkspace:
             raise ValueError(
                 "graph-mode paged workspace capacity exceeded; construct a larger workspace or capture a larger graph bucket"
             )
-        self._plan_q = torch.empty(
+        if self.fixed_capacity:
+            raise ValueError(
+                "fixed-capacity paged workspace exceeded; construct a larger eager extend workspace"
+            )
+        self._plan_q = _shape_only_cuda_tensor(
             (active_total_q, self.num_q_heads, self.head_dim_qk),
             dtype=self.dtype,
             device=self.device,
@@ -356,6 +426,10 @@ class PagedAttentionWorkspace:
             raise ValueError(
                 "graph-mode paged workspace capacity exceeded; construct a larger workspace or capture a larger graph bucket"
             )
+        if self.fixed_capacity and self.request_indices is not None:
+            raise ValueError(
+                "fixed-capacity paged workspace exceeded; construct a larger eager extend workspace"
+            )
 
         work_items_capacity = max(work_items_capacity, work_items_needed)
         block_valid_capacity = max(block_valid_capacity, block_valid_needed)
@@ -364,6 +438,25 @@ class PagedAttentionWorkspace:
         page_table_width_capacity = max(page_table_width_capacity, page_table_width_needed)
         partial_rows_capacity = max(partial_rows_capacity, partial_rows_needed)
 
+        self._allocate_runtime_buffers(
+            work_items_capacity=work_items_capacity,
+            block_valid_capacity=block_valid_capacity,
+            total_q_capacity=total_q_capacity,
+            batch_capacity=batch_capacity,
+            page_table_width_capacity=page_table_width_capacity,
+            partial_rows_capacity=partial_rows_capacity,
+        )
+
+    def _allocate_runtime_buffers(
+        self,
+        *,
+        work_items_capacity: int,
+        block_valid_capacity: int,
+        total_q_capacity: int,
+        batch_capacity: int,
+        page_table_width_capacity: int,
+        partial_rows_capacity: int,
+    ) -> None:
         self.request_indices = torch.empty(work_items_capacity, dtype=torch.int32, device=self.device)
         self.qo_tile_indices = torch.empty(work_items_capacity, dtype=torch.int32, device=self.device)
         self.kv_tile_indices = torch.empty(work_items_capacity, dtype=torch.int32, device=self.device)
@@ -446,5 +539,5 @@ class PagedAttentionWorkspace:
         self.o_indptr[: o_indptr.shape[0]].copy_(o_indptr)
         self.block_valid_mask.zero_()
         self.block_valid_mask[: block_valid_mask.shape[0]].copy_(block_valid_mask)
-        self.kv_chunk_size_ptr[0] = int(plan.kv_chunk_size if plan.split_kv else 0)
+        self.kv_chunk_size_ptr[0] = int(plan.kv_chunk_size)
         self.total_num_rows_ptr[0] = int(plan.total_q)
