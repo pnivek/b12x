@@ -7,13 +7,15 @@ import argparse
 import pathlib
 import statistics
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
+from b12x.attention.reference import paged_attention_reference
+from b12x.attention.paged.tuning import get_decode_graph_policy
 from b12x.integration.attention import (
     PagedAttentionWorkspace,
     clear_attention_caches,
@@ -112,6 +114,14 @@ def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     a_f = a.to(torch.float32).reshape(-1)
     b_f = b.to(torch.float32).reshape(-1)
     return torch.nn.functional.cosine_similarity(a_f, b_f, dim=0).item()
+
+
+def _relative_l2_error(a: torch.Tensor, b: torch.Tensor) -> float:
+    a_f = a.to(torch.float32)
+    b_f = b.to(torch.float32)
+    diff_norm = (a_f - b_f).norm().item()
+    ref_norm = max(b_f.norm().item(), 1e-12)
+    return diff_norm / ref_norm
 
 
 def _parse_csv_ints(value: str) -> list[int]:
@@ -335,6 +345,409 @@ def _make_flashinfer_page_metadata(
     return qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len
 
 
+def _format_plan_desc(*, kv_chunk_size: int, split_kv: bool) -> str:
+    desc = f"chunk={int(kv_chunk_size)}"
+    return f"{desc},split" if split_kv else f"{desc},nosplit"
+
+
+def _build_backend_graph_plan(
+    *,
+    workspace: PagedAttentionWorkspace,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    fixed_split_pages: int | None,
+    graph_ctas_per_sm: int | None,
+) -> object:
+    assert workspace._plan_q is not None
+    assert workspace._plan_k_cache is not None
+    assert workspace._plan_v_cache is not None
+    active_total_q = int(cu_seqlens_q[-1].item())
+    return create_paged_plan(
+        workspace._plan_q[:active_total_q],
+        workspace._plan_k_cache,
+        workspace._plan_v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        mode=workspace.mode,
+        fixed_split_size=-1 if fixed_split_pages is None else int(fixed_split_pages),
+        disable_split_kv=False,
+        enable_cuda_graph=True,
+        graph_chunk_policy=True,
+        graph_ctas_per_sm=graph_ctas_per_sm,
+    )
+
+
+def _load_backend_graph_plan(
+    *,
+    workspace: PagedAttentionWorkspace,
+    plan: object,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+) -> str:
+    workspace._ensure_capacity(plan)
+    workspace._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
+    workspace._copy_plan_metadata(plan)
+    workspace._plan = plan
+    return _format_plan_desc(kv_chunk_size=plan.kv_chunk_size, split_kv=plan.split_kv)
+
+
+def _decode_effective_cache_tokens(
+    *,
+    context_tokens: int,
+    q_seqlen: int = 1,
+) -> int:
+    if context_tokens < 0:
+        raise ValueError("decode context_tokens must be non-negative")
+    if q_seqlen <= 0:
+        raise ValueError("decode q_seqlen must be positive")
+    return int(context_tokens + q_seqlen)
+
+
+def _make_decode_context_metadata(
+    *,
+    batch: int,
+    context_tokens: int,
+    page_size: int,
+    num_pages: int,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _make_uniform_page_metadata(
+        batch=batch,
+        cache_seqlen=_decode_effective_cache_tokens(context_tokens=context_tokens),
+        page_size=page_size,
+        num_pages=num_pages,
+        seed=seed,
+    )
+
+
+@dataclass(frozen=True)
+class DecodeReplayCase:
+    batch: int
+    context_tokens: int
+
+    @property
+    def effective_cache_tokens(self) -> int:
+        return _decode_effective_cache_tokens(context_tokens=self.context_tokens)
+
+def _decode_graph_case_blocker(
+    *,
+    case: DecodeReplayCase,
+) -> str | None:
+    if case.context_tokens == 0:
+        return "zero-context-replay-mismatch"
+    return None
+
+
+def _build_decode_replay_cases(
+    *,
+    batch_buckets: list[int],
+    context_tokens: list[int],
+) -> list[DecodeReplayCase]:
+    if not batch_buckets:
+        raise ValueError("expected at least one batch bucket")
+    if not context_tokens:
+        raise ValueError("expected at least one decode context")
+    if any(batch <= 0 for batch in batch_buckets):
+        raise ValueError("decode batch buckets must be positive")
+    if any(context < 0 for context in context_tokens):
+        raise ValueError("decode contexts must be non-negative")
+    return [
+        DecodeReplayCase(
+            batch=int(batch),
+            context_tokens=int(context),
+        )
+        for batch in sorted(dict.fromkeys(batch_buckets))
+        for context in sorted(dict.fromkeys(context_tokens))
+    ]
+
+
+@dataclass(frozen=True)
+class DecodeGraphBucketPolicy:
+    batch: int
+    capture_context_tokens: int
+    capture_page_count: int
+    capture_fixed_split_pages: int | None
+    replay_fixed_split_pages: int | None
+    graph_ctas_per_sm: int | None
+    source: str
+
+    @property
+    def effective_capture_tokens(self) -> int:
+        return _decode_effective_cache_tokens(context_tokens=self.capture_context_tokens)
+
+
+def _dtype_tuning_key(dtype: torch.dtype) -> str:
+    if dtype == torch.bfloat16:
+        return "bf16"
+    if dtype == torch.float16:
+        return "fp16"
+    if dtype == torch.float8_e4m3fn:
+        return "fp8_e4m3fn"
+    raise ValueError(f"unsupported tuning dtype {dtype}")
+
+
+def _resolve_decode_graph_bucket_policy(
+    *,
+    batch: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    page_size: int,
+    decode_contexts: list[int],
+    capture_context_override: int,
+    fixed_split_pages_override: int,
+    graph_ctas_per_sm_override: int,
+) -> DecodeGraphBucketPolicy:
+    tuned_policy = None
+    if q_dtype == torch.bfloat16 and page_size == 64:
+        try:
+            tuned_policy = get_decode_graph_policy(
+                kv_dtype=_dtype_tuning_key(kv_dtype),
+                regime="decode",
+                batch=batch,
+            )
+        except KeyError:
+            tuned_policy = None
+
+    if capture_context_override > 0:
+        capture_context_tokens = int(capture_context_override)
+        source = "manual"
+    elif tuned_policy is not None and tuned_policy.capture_page_count is not None:
+        capture_context_tokens = int(tuned_policy.capture_page_count * page_size - 1)
+        source = "tuning"
+    else:
+        capture_context_tokens = int(max(decode_contexts))
+        source = "fallback"
+
+    if capture_context_tokens < max(decode_contexts):
+        raise ValueError("decode graph capture context must cover the largest replay context")
+
+    if fixed_split_pages_override > 0:
+        capture_fixed_split_pages = int(fixed_split_pages_override)
+        replay_fixed_split_pages = int(fixed_split_pages_override)
+        source = "manual"
+    else:
+        capture_fixed_split_pages = None if tuned_policy is None else tuned_policy.capture_fixed_split_pages
+        replay_fixed_split_pages = None
+
+    if graph_ctas_per_sm_override > 0:
+        graph_ctas_per_sm = int(graph_ctas_per_sm_override)
+        source = "manual"
+    else:
+        graph_ctas_per_sm = None if tuned_policy is None else tuned_policy.graph_ctas_per_sm
+
+    return DecodeGraphBucketPolicy(
+        batch=int(batch),
+        capture_context_tokens=int(capture_context_tokens),
+        capture_page_count=(int(_decode_effective_cache_tokens(context_tokens=capture_context_tokens)) + page_size - 1)
+        // page_size,
+        capture_fixed_split_pages=capture_fixed_split_pages,
+        replay_fixed_split_pages=replay_fixed_split_pages,
+        graph_ctas_per_sm=graph_ctas_per_sm,
+        source=source,
+    )
+
+
+@dataclass(frozen=True)
+class DecodeBucketSharedInputs:
+    batch: int
+    q: torch.Tensor
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
+    capture_page_table: torch.Tensor
+    capture_cache_seqlens: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    k_descale: torch.Tensor | None
+    v_descale: torch.Tensor | None
+    k_scale: float | None
+    v_scale: float | None
+    seed: int
+
+
+def _make_decode_bucket_shared_inputs(
+    *,
+    batch: int,
+    capture_context_tokens: int,
+    page_size: int,
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    seed: int,
+) -> DecodeBucketSharedInputs:
+    (
+        q,
+        k_cache,
+        v_cache,
+        capture_page_table,
+        capture_cache_seqlens,
+        _capture_page_table_dup,
+        _capture_cache_seqlens_dup,
+        cu_seqlens_q,
+    ) = _make_uniform_paged_inputs(
+        batch=batch,
+        q_seqlen=1,
+        cache_seqlen=_decode_effective_cache_tokens(context_tokens=capture_context_tokens),
+        capture_cache_seqlen=_decode_effective_cache_tokens(context_tokens=capture_context_tokens),
+        page_size=page_size,
+        q_heads=q_heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+        seed=seed,
+    )
+    k_descale = None
+    v_descale = None
+    k_scale = None
+    v_scale = None
+    if kv_dtype == torch.float8_e4m3fn:
+        k_cache, v_cache, k_descale, v_descale, k_scale, v_scale = _quantize_paged_kv_cache_global_e4m3(
+            k_cache,
+            v_cache,
+            batch=batch,
+            kv_heads=kv_heads,
+        )
+    return DecodeBucketSharedInputs(
+        batch=batch,
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        capture_page_table=capture_page_table,
+        capture_cache_seqlens=capture_cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        seed=seed,
+    )
+
+
+@dataclass
+class B12xDecodeGraphBucket:
+    shared: DecodeBucketSharedInputs
+    workspace: PagedAttentionWorkspace
+    graph: torch.cuda.CUDAGraph
+    output: torch.Tensor
+    capture_fixed_split_pages: int | None
+    replay_fixed_split_pages: int | None
+    graph_ctas_per_sm: int | None
+    current_page_table: torch.Tensor
+    current_cache_seqlens: torch.Tensor
+    current_plan_desc: str
+
+    @property
+    def batch(self) -> int:
+        return self.shared.batch
+
+    @property
+    def q(self) -> torch.Tensor:
+        return self.shared.q
+
+    @property
+    def k_cache(self) -> torch.Tensor:
+        return self.shared.k_cache
+
+    @property
+    def v_cache(self) -> torch.Tensor:
+        return self.shared.v_cache
+
+    @property
+    def cu_seqlens_q(self) -> torch.Tensor:
+        return self.shared.cu_seqlens_q
+
+    @property
+    def k_descale(self) -> torch.Tensor | None:
+        return self.shared.k_descale
+
+    @property
+    def v_descale(self) -> torch.Tensor | None:
+        return self.shared.v_descale
+
+    def prepare_replay(self, *, context_tokens: int) -> None:
+        page_table, cache_seqlens = _make_decode_context_metadata(
+            batch=self.batch,
+            context_tokens=context_tokens,
+            page_size=int(self.k_cache.shape[1]),
+            num_pages=int(self.k_cache.shape[0]),
+            seed=self.shared.seed,
+        )
+        replay_plan = _build_backend_graph_plan(
+            workspace=self.workspace,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=self.cu_seqlens_q,
+            fixed_split_pages=self.replay_fixed_split_pages,
+            graph_ctas_per_sm=self.graph_ctas_per_sm,
+        )
+        self.current_plan_desc = _load_backend_graph_plan(
+            workspace=self.workspace,
+            plan=replay_plan,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=self.cu_seqlens_q,
+        )
+        self.current_page_table = page_table
+        self.current_cache_seqlens = cache_seqlens
+
+
+@dataclass
+class FlashinferDecodeGraphBucket:
+    shared: DecodeBucketSharedInputs
+    wrapper: object
+    graph: torch.cuda.CUDAGraph
+    output: torch.Tensor
+    page_size: int
+    q_heads: int
+    kv_heads: int
+    head_dim: int
+    q_dtype: torch.dtype
+    kv_dtype: torch.dtype
+    current_page_table: torch.Tensor
+    current_cache_seqlens: torch.Tensor
+
+    @property
+    def batch(self) -> int:
+        return self.shared.batch
+
+    @property
+    def output_view(self) -> torch.Tensor:
+        return self.output.view(-1, self.q_heads, self.head_dim)
+
+    def prepare_replay(self, *, context_tokens: int) -> None:
+        page_table, cache_seqlens = _make_decode_context_metadata(
+            batch=self.batch,
+            context_tokens=context_tokens,
+            page_size=self.page_size,
+            num_pages=int(self.shared.k_cache.shape[0]),
+            seed=self.shared.seed,
+        )
+        qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len = _make_flashinfer_page_metadata(
+            batch=self.batch,
+            q_seqlen=1,
+            cache_seqlens=cache_seqlens,
+            page_table=page_table,
+            page_size=self.page_size,
+        )
+        self.wrapper.plan(
+            indptr=paged_kv_indptr,
+            indices=paged_kv_indices,
+            last_page_len=paged_kv_last_page_len,
+            num_qo_heads=self.q_heads,
+            num_kv_heads=self.kv_heads,
+            head_dim=self.head_dim,
+            page_size=self.page_size,
+            q_data_type=self.q_dtype,
+            kv_data_type=self.kv_dtype,
+            sm_scale=self.head_dim ** -0.5,
+        )
+        self.current_page_table = page_table
+        self.current_cache_seqlens = cache_seqlens
+
+
 def _capture_backend_graph(
     *,
     q: torch.Tensor,
@@ -362,38 +775,31 @@ def _capture_backend_graph(
         use_cuda_graph=False,
         attn_mode=b12x_attn_mode,
     )
-    assert workspace._plan_q is not None
-    assert workspace._plan_k_cache is not None
-    assert workspace._plan_v_cache is not None
-    active_total_q = int(cu_seqlens_q[-1].item())
-
-    def graph_plan_for(
-        runtime_page_table: torch.Tensor,
-        runtime_cache_seqlens: torch.Tensor,
-    ):
-        return create_paged_plan(
-            workspace._plan_q[:active_total_q],
-            workspace._plan_k_cache,
-            workspace._plan_v_cache,
-            runtime_page_table,
-            runtime_cache_seqlens,
-            cu_seqlens_q,
-            mode=mode,
-            fixed_split_size=-1 if fixed_split_pages is None else int(fixed_split_pages),
-            disable_split_kv=False,
-            enable_cuda_graph=True,
-            graph_chunk_policy=True,
-            graph_ctas_per_sm=graph_ctas_per_sm,
-        )
-
-    replay_plan = graph_plan_for(page_table, cache_seqlens)
-    capture_plan = graph_plan_for(capture_page_table, capture_cache_seqlens)
-    workspace._ensure_capacity(replay_plan)
+    replay_plan = _build_backend_graph_plan(
+        workspace=workspace,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        fixed_split_pages=fixed_split_pages,
+        graph_ctas_per_sm=graph_ctas_per_sm,
+    )
+    capture_plan = _build_backend_graph_plan(
+        workspace=workspace,
+        page_table=capture_page_table,
+        cache_seqlens=capture_cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        fixed_split_pages=fixed_split_pages,
+        graph_ctas_per_sm=graph_ctas_per_sm,
+    )
     workspace._ensure_capacity(capture_plan)
     workspace.use_cuda_graph = True
-    workspace._copy_runtime_metadata(capture_page_table, capture_cache_seqlens, cu_seqlens_q)
-    workspace._copy_plan_metadata(capture_plan)
-    workspace._plan = capture_plan
+    _load_backend_graph_plan(
+        workspace=workspace,
+        plan=capture_plan,
+        page_table=capture_page_table,
+        cache_seqlens=capture_cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+    )
 
     def run() -> None:
         workspace.run(
@@ -406,14 +812,13 @@ def _capture_backend_graph(
         )
 
     graph = _capture_graph(run, warmup=warmup)
-    workspace._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
-    workspace._copy_plan_metadata(replay_plan)
-    workspace._plan = replay_plan
-    chunk_desc = f"chunk={workspace.plan.kv_chunk_size}"
-    if workspace.plan.split_kv:
-        chunk_desc += ",split"
-    else:
-        chunk_desc += ",nosplit"
+    chunk_desc = _load_backend_graph_plan(
+        workspace=workspace,
+        plan=replay_plan,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+    )
     return BackendCapture(graph=graph, output=output, plan_desc=chunk_desc)
 
 
@@ -561,37 +966,166 @@ def _capture_flashinfer_fa2_graph(
     return graph, output
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--batch", type=int, default=8)
-    parser.add_argument("--q-seqlens", type=str, default="1,6")
-    parser.add_argument("--cache-seqlens", type=str, default="64,512,2048,8192")
-    parser.add_argument("--page-size", type=int, default=64)
-    parser.add_argument("--q-heads", type=int, default=8)
-    parser.add_argument("--kv-heads", type=int, default=1)
-    parser.add_argument("--head-dim", type=int, default=256)
-    parser.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
-    parser.add_argument("--kv-dtype", choices=["same", "bf16", "fp16", "fp8_e4m3fn"], default="same")
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--replays", type=int, default=1000)
-    parser.add_argument("--flashinfer-workspace-mb", type=int, default=512)
-    parser.add_argument("--fixed-split-pages", type=int, default=0)
-    parser.add_argument("--capture-cache-seqlen", type=int, default=0)
-    parser.add_argument("--graph-ctas-per-sm", type=int, default=0)
-    parser.add_argument("--b12x-attn-mode", choices=["default", "turbo"], default="default")
-    parser.add_argument("--ci-level", type=float, default=0.95)
-    parser.add_argument("--compare-fa2", action="store_true", default=True)
-    parser.add_argument("--no-compare-fa2", action="store_false", dest="compare_fa2")
-    parser.add_argument("--check", action="store_true")
-    args = parser.parse_args()
+def _capture_b12x_decode_graph_bucket(
+    *,
+    shared: DecodeBucketSharedInputs,
+    capture_fixed_split_pages: int | None,
+    replay_fixed_split_pages: int | None,
+    warmup: int,
+    b12x_attn_mode: str,
+    graph_ctas_per_sm: int | None,
+) -> B12xDecodeGraphBucket:
+    workspace = PagedAttentionWorkspace.for_tensors(
+        mode="decode",
+        q=shared.q,
+        k_cache=shared.k_cache,
+        v_cache=shared.v_cache,
+        use_cuda_graph=False,
+        attn_mode=b12x_attn_mode,
+    )
+    capture_plan = _build_backend_graph_plan(
+        workspace=workspace,
+        page_table=shared.capture_page_table,
+        cache_seqlens=shared.capture_cache_seqlens,
+        cu_seqlens_q=shared.cu_seqlens_q,
+        fixed_split_pages=capture_fixed_split_pages,
+        graph_ctas_per_sm=graph_ctas_per_sm,
+    )
+    workspace._ensure_capacity(capture_plan)
+    workspace.use_cuda_graph = True
+    capture_plan_desc = _load_backend_graph_plan(
+        workspace=workspace,
+        plan=capture_plan,
+        page_table=shared.capture_page_table,
+        cache_seqlens=shared.capture_cache_seqlens,
+        cu_seqlens_q=shared.cu_seqlens_q,
+    )
+    output = torch.empty_like(shared.q)
 
-    require_sm120()
-    if args.replays < 100:
-        raise ValueError("--replays must be at least 100 for graph-replay benchmarking")
-    if not 0.0 < args.ci_level < 1.0:
-        raise ValueError("--ci-level must be between 0 and 1")
-    clear_attention_caches()
+    def run() -> None:
+        workspace.run(
+            shared.q,
+            shared.k_cache,
+            shared.v_cache,
+            output=output,
+            k_descale=shared.k_descale,
+            v_descale=shared.v_descale,
+        )
 
+    graph = _capture_graph(run, warmup=warmup)
+    return B12xDecodeGraphBucket(
+        shared=shared,
+        workspace=workspace,
+        graph=graph,
+        output=output,
+        capture_fixed_split_pages=capture_fixed_split_pages,
+        replay_fixed_split_pages=replay_fixed_split_pages,
+        graph_ctas_per_sm=graph_ctas_per_sm,
+        current_page_table=shared.capture_page_table,
+        current_cache_seqlens=shared.capture_cache_seqlens,
+        current_plan_desc=capture_plan_desc,
+    )
+
+
+def _capture_flashinfer_decode_graph_bucket(
+    *,
+    shared: DecodeBucketSharedInputs,
+    page_size: int,
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    workspace_bytes: int,
+    warmup: int,
+) -> FlashinferDecodeGraphBucket:
+    flashinfer = _import_flashinfer()
+    (
+        capture_qo_indptr,
+        capture_paged_kv_indptr,
+        capture_paged_kv_indices,
+        capture_paged_kv_last_page_len,
+    ) = _make_flashinfer_page_metadata(
+        batch=shared.batch,
+        q_seqlen=1,
+        cache_seqlens=shared.capture_cache_seqlens,
+        page_table=shared.capture_page_table,
+        page_size=page_size,
+    )
+    float_workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=shared.q.device)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        float_workspace,
+        kv_layout="NHD",
+        use_cuda_graph=True,
+        use_tensor_cores=True,
+        paged_kv_indptr_buffer=capture_paged_kv_indptr.clone(),
+        paged_kv_indices_buffer=capture_paged_kv_indices.clone(),
+        paged_kv_last_page_len_buffer=capture_paged_kv_last_page_len.clone(),
+        backend="fa2",
+    )
+    wrapper.plan(
+        indptr=capture_paged_kv_indptr,
+        indices=capture_paged_kv_indices,
+        last_page_len=capture_paged_kv_last_page_len,
+        num_qo_heads=q_heads,
+        num_kv_heads=kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        q_data_type=q_dtype,
+        kv_data_type=kv_dtype,
+        sm_scale=head_dim ** -0.5,
+    )
+    q_input = shared.q.view(shared.batch, q_heads, head_dim)
+    output = torch.empty_like(q_input)
+
+    def run() -> None:
+        wrapper.run(
+            q_input,
+            (shared.k_cache, shared.v_cache),
+            out=output,
+            k_scale=shared.k_scale,
+            v_scale=shared.v_scale,
+        )
+
+    graph = _capture_graph(run, warmup=warmup)
+    return FlashinferDecodeGraphBucket(
+        shared=shared,
+        wrapper=wrapper,
+        graph=graph,
+        output=output,
+        page_size=page_size,
+        q_heads=q_heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        current_page_table=shared.capture_page_table,
+        current_cache_seqlens=shared.capture_cache_seqlens,
+    )
+
+
+def _decode_reference_output(
+    *,
+    shared: DecodeBucketSharedInputs,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+) -> torch.Tensor:
+    ref_out, _ = paged_attention_reference(
+        shared.q,
+        shared.k_cache,
+        shared.v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        k_descale=shared.k_descale,
+        v_descale=shared.v_descale,
+        causal=True,
+    )
+    return ref_out
+
+
+def _run_legacy_matrix(args: argparse.Namespace) -> None:
     dtype = _dtype_from_name(args.dtype)
     kv_dtype = _resolve_kv_dtype(args.kv_dtype, dtype)
     flashinfer_workspace_bytes = args.flashinfer_workspace_mb * 1024 * 1024
@@ -606,6 +1140,7 @@ def main() -> None:
     print(
         "shape matrix:",
         {
+            "mode": args.mode,
             "batch": args.batch,
             "q_seqlens": q_seqlens,
             "cache_seqlens": cache_seqlens,
@@ -635,19 +1170,17 @@ def main() -> None:
             capture_page_table,
             capture_cache_seqlens,
             cu_seqlens_q,
-        ) = (
-            _make_uniform_paged_inputs(
-                batch=case.batch,
-                q_seqlen=case.q_seqlen,
-                cache_seqlen=case.cache_seqlen,
-                capture_cache_seqlen=args.capture_cache_seqlen if args.capture_cache_seqlen > 0 else None,
-                page_size=args.page_size,
-                q_heads=args.q_heads,
-                kv_heads=args.kv_heads,
-                head_dim=args.head_dim,
-                dtype=dtype,
-                seed=1 + case_idx,
-            )
+        ) = _make_uniform_paged_inputs(
+            batch=case.batch,
+            q_seqlen=case.q_seqlen,
+            cache_seqlen=case.cache_seqlen,
+            capture_cache_seqlen=args.capture_cache_seqlen if args.capture_cache_seqlen > 0 else None,
+            page_size=args.page_size,
+            q_heads=args.q_heads,
+            kv_heads=args.kv_heads,
+            head_dim=args.head_dim,
+            dtype=dtype,
+            seed=1 + case_idx,
         )
         k_descale = None
         v_descale = None
@@ -765,6 +1298,286 @@ def main() -> None:
 
     if speedups:
         print(f"geomean fa2/b12x: {statistics.geometric_mean(speedups):.3f}x")
+
+
+def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
+    if args.q_seqlens != "1":
+        raise ValueError("decode-graph-buckets mode only supports --q-seqlens 1")
+    dtype = _dtype_from_name(args.dtype)
+    kv_dtype = _resolve_kv_dtype(args.kv_dtype, dtype)
+    flashinfer_workspace_bytes = args.flashinfer_workspace_mb * 1024 * 1024
+    batch_buckets = _parse_csv_ints(args.batch_buckets)
+    decode_contexts = _parse_csv_ints(args.decode_contexts)
+    cases = _build_decode_replay_cases(
+        batch_buckets=batch_buckets,
+        context_tokens=decode_contexts,
+    )
+
+    print(
+        "decode graph buckets:",
+        {
+            "mode": args.mode,
+            "batch_buckets": sorted(dict.fromkeys(batch_buckets)),
+            "decode_context_tokens": sorted(dict.fromkeys(decode_contexts)),
+            "capture_context_override": None if args.capture_context <= 0 else int(args.capture_context),
+            "page_size": args.page_size,
+            "q_heads": args.q_heads,
+            "kv_heads": args.kv_heads,
+            "head_dim": args.head_dim,
+            "q_dtype": str(dtype),
+            "kv_dtype": str(kv_dtype),
+            "fixed_split_pages": args.fixed_split_pages,
+            "graph_ctas_per_sm": args.graph_ctas_per_sm,
+            "b12x_attn_mode": args.b12x_attn_mode,
+            "replays": args.replays,
+            "flashinfer_fa2": args.compare_fa2,
+        },
+    )
+
+    speedups: list[float] = []
+    for bucket_idx, batch in enumerate(sorted(dict.fromkeys(batch_buckets))):
+        bucket_policy = _resolve_decode_graph_bucket_policy(
+            batch=batch,
+            q_dtype=dtype,
+            kv_dtype=kv_dtype,
+            page_size=args.page_size,
+            decode_contexts=decode_contexts,
+            capture_context_override=int(args.capture_context),
+            fixed_split_pages_override=int(args.fixed_split_pages),
+            graph_ctas_per_sm_override=int(args.graph_ctas_per_sm),
+        )
+        shared = _make_decode_bucket_shared_inputs(
+            batch=batch,
+            capture_context_tokens=bucket_policy.capture_context_tokens,
+            page_size=args.page_size,
+            q_heads=args.q_heads,
+            kv_heads=args.kv_heads,
+            head_dim=args.head_dim,
+            dtype=dtype,
+            kv_dtype=kv_dtype,
+            seed=1 + bucket_idx,
+        )
+        capture_fallback_error: Exception | None = None
+        try:
+            b12x_bucket = _capture_b12x_decode_graph_bucket(
+                shared=shared,
+                capture_fixed_split_pages=bucket_policy.capture_fixed_split_pages,
+                replay_fixed_split_pages=bucket_policy.replay_fixed_split_pages,
+                warmup=args.warmup,
+                b12x_attn_mode=args.b12x_attn_mode,
+                graph_ctas_per_sm=bucket_policy.graph_ctas_per_sm,
+            )
+        except Exception as exc:
+            if args.fixed_split_pages > 0 or bucket_policy.capture_fixed_split_pages is None:
+                raise
+            capture_fallback_error = exc
+            bucket_policy = replace(
+                bucket_policy,
+                capture_fixed_split_pages=None,
+                source=f"{bucket_policy.source}+capture-auto",
+            )
+            b12x_bucket = _capture_b12x_decode_graph_bucket(
+                shared=shared,
+                capture_fixed_split_pages=bucket_policy.capture_fixed_split_pages,
+                replay_fixed_split_pages=bucket_policy.replay_fixed_split_pages,
+                warmup=args.warmup,
+                b12x_attn_mode=args.b12x_attn_mode,
+                graph_ctas_per_sm=bucket_policy.graph_ctas_per_sm,
+            )
+        print(
+            f"decode-graph-bucket "
+            f"bs={batch:2d} "
+            f"source={bucket_policy.source:>20s} "
+            f"capture_ctx={bucket_policy.capture_context_tokens:6d} "
+            f"capture_kv={bucket_policy.effective_capture_tokens:6d} "
+            f"capture_pages={bucket_policy.capture_page_count:4d} "
+            f"capture_split={str(bucket_policy.capture_fixed_split_pages):>4s} "
+            f"replay_split={str(bucket_policy.replay_fixed_split_pages):>4s} "
+            f"graph_ctas_per_sm={str(bucket_policy.graph_ctas_per_sm):>4s}"
+        )
+        if capture_fallback_error is not None:
+            print(
+                f"decode-graph-bucket "
+                f"bs={batch:2d} "
+                f"capture_split_fallback=None "
+                f"reason={type(capture_fallback_error).__name__}:{capture_fallback_error}"
+            )
+        fa2_bucket = (
+            _capture_flashinfer_decode_graph_bucket(
+                shared=shared,
+                page_size=args.page_size,
+                q_heads=args.q_heads,
+                kv_heads=args.kv_heads,
+                head_dim=args.head_dim,
+                q_dtype=dtype,
+                kv_dtype=kv_dtype,
+                workspace_bytes=flashinfer_workspace_bytes,
+                warmup=args.warmup,
+            )
+            if args.compare_fa2
+            else None
+        )
+
+        for case in (case for case in cases if case.batch == batch):
+            blocker = _decode_graph_case_blocker(case=case)
+            if blocker is not None:
+                print(
+                    f"decode-graph "
+                    f"bs={case.batch:2d} "
+                    f"ctx={case.context_tokens:6d} "
+                    f"kv={case.effective_cache_tokens:6d} "
+                    f"cap={bucket_policy.capture_context_tokens:6d} "
+                    f"blocked={blocker}"
+                )
+                continue
+            try:
+                b12x_bucket.prepare_replay(context_tokens=case.context_tokens)
+            except Exception as exc:
+                print(
+                    f"decode-graph "
+                    f"bs={case.batch:2d} "
+                    f"ctx={case.context_tokens:6d} "
+                    f"kv={case.effective_cache_tokens:6d} "
+                    f"cap={bucket_policy.capture_context_tokens:6d} "
+                    f"blocked={type(exc).__name__}:{exc}"
+                )
+                continue
+            backend_times_ms = _bench_graph(b12x_bucket.graph, replays=args.replays)
+            backend_ci_low_ms, backend_ci_high_ms, backend_sem_ms = _mean_ci(
+                backend_times_ms,
+                ci_level=args.ci_level,
+            )
+            backend_metrics = CaseMetrics(
+                backend="b12x",
+                mean_us=statistics.fmean(backend_times_ms) * 1000.0,
+                min_us=min(backend_times_ms) * 1000.0,
+                ci_low_us=backend_ci_low_ms * 1000.0,
+                ci_high_us=backend_ci_high_ms * 1000.0,
+                sem_us=backend_sem_ms * 1000.0,
+            )
+
+            flashinfer_metrics: CaseMetrics | None = None
+            flashinfer_output: torch.Tensor | None = None
+            if fa2_bucket is not None:
+                fa2_bucket.prepare_replay(context_tokens=case.context_tokens)
+                flashinfer_times_ms = _bench_graph(fa2_bucket.graph, replays=args.replays)
+                flashinfer_ci_low_ms, flashinfer_ci_high_ms, flashinfer_sem_ms = _mean_ci(
+                    flashinfer_times_ms,
+                    ci_level=args.ci_level,
+                )
+                flashinfer_metrics = CaseMetrics(
+                    backend="flashinfer-fa2",
+                    mean_us=statistics.fmean(flashinfer_times_ms) * 1000.0,
+                    min_us=min(flashinfer_times_ms) * 1000.0,
+                    ci_low_us=flashinfer_ci_low_ms * 1000.0,
+                    ci_high_us=flashinfer_ci_high_ms * 1000.0,
+                    sem_us=flashinfer_sem_ms * 1000.0,
+                )
+                flashinfer_output = fa2_bucket.output_view
+                speedups.append(flashinfer_metrics.mean_us / backend_metrics.mean_us)
+
+            check_suffix = ""
+            if args.check:
+                ref_out = _decode_reference_output(
+                    shared=shared,
+                    page_table=b12x_bucket.current_page_table,
+                    cache_seqlens=b12x_bucket.current_cache_seqlens,
+                    cu_seqlens_q=b12x_bucket.cu_seqlens_q,
+                )
+                b12x_ref_rel_l2 = _relative_l2_error(b12x_bucket.output, ref_out)
+                b12x_ref_cos = _cosine_similarity(b12x_bucket.output, ref_out)
+                check_suffix = f" | b12x/ref rel_l2={b12x_ref_rel_l2:.6f} cos={b12x_ref_cos:.8f}"
+                if flashinfer_output is not None:
+                    fa2_ref_rel_l2 = _relative_l2_error(flashinfer_output, ref_out)
+                    fa2_ref_cos = _cosine_similarity(flashinfer_output, ref_out)
+                    cross_rel_l2 = _relative_l2_error(b12x_bucket.output, flashinfer_output)
+                    cross_cos = _cosine_similarity(b12x_bucket.output, flashinfer_output)
+                    check_suffix += (
+                        f" | fa2/ref rel_l2={fa2_ref_rel_l2:.6f} cos={fa2_ref_cos:.8f}"
+                        f" | b12x/fa2 rel_l2={cross_rel_l2:.6f} cos={cross_cos:.8f}"
+                    )
+
+            line = (
+                f"decode-graph "
+                f"bs={case.batch:2d} "
+                f"ctx={case.context_tokens:6d} "
+                f"kv={case.effective_cache_tokens:6d} "
+                f"cap={bucket_policy.capture_context_tokens:6d} "
+                f"{b12x_bucket.current_plan_desc:>17s} "
+                f"| {backend_metrics.backend} mean={backend_metrics.mean_us:8.1f} us "
+                f"min={backend_metrics.min_us:8.1f} us "
+                f"{int(args.ci_level * 100)}%CI=[{backend_metrics.ci_low_us:8.1f},{backend_metrics.ci_high_us:8.1f}] us"
+            )
+            if flashinfer_metrics is not None:
+                ratio = flashinfer_metrics.mean_us / backend_metrics.mean_us
+                ratio_ci_low, ratio_ci_high = _ratio_mean_ci(
+                    flashinfer_metrics.mean_us,
+                    flashinfer_metrics.sem_us,
+                    backend_metrics.mean_us,
+                    backend_metrics.sem_us,
+                    ci_level=args.ci_level,
+                )
+                line += (
+                    f" | fa2 mean={flashinfer_metrics.mean_us:8.1f} us "
+                    f"min={flashinfer_metrics.min_us:8.1f} us "
+                    f" {int(args.ci_level * 100)}%CI=[{flashinfer_metrics.ci_low_us:8.1f},{flashinfer_metrics.ci_high_us:8.1f}] us "
+                    f"| fa2/{backend_metrics.backend}="
+                    f"{ratio:6.3f}x"
+                    f" {int(args.ci_level * 100)}%CI=[{ratio_ci_low:5.3f},{ratio_ci_high:5.3f}]"
+                )
+            print(line + check_suffix)
+
+        del fa2_bucket
+        del b12x_bucket
+        del shared
+        torch.cuda.empty_cache()
+
+    if speedups:
+        print(f"geomean fa2/b12x: {statistics.geometric_mean(speedups):.3f}x")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        choices=["legacy-matrix", "decode-graph-buckets"],
+        default="decode-graph-buckets",
+    )
+    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--batch-buckets", type=str, default="1,2,4,8,12,16")
+    parser.add_argument("--decode-contexts", type=str, default="0,16384,32768,65536,131072")
+    parser.add_argument("--capture-context", type=int, default=0)
+    parser.add_argument("--q-seqlens", type=str, default="1")
+    parser.add_argument("--cache-seqlens", type=str, default="64,512,2048,8192")
+    parser.add_argument("--page-size", type=int, default=64)
+    parser.add_argument("--q-heads", type=int, default=8)
+    parser.add_argument("--kv-heads", type=int, default=1)
+    parser.add_argument("--head-dim", type=int, default=256)
+    parser.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
+    parser.add_argument("--kv-dtype", choices=["same", "bf16", "fp16", "fp8_e4m3fn"], default="same")
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--replays", type=int, default=1000)
+    parser.add_argument("--flashinfer-workspace-mb", type=int, default=512)
+    parser.add_argument("--fixed-split-pages", type=int, default=0)
+    parser.add_argument("--capture-cache-seqlen", type=int, default=0)
+    parser.add_argument("--graph-ctas-per-sm", type=int, default=0)
+    parser.add_argument("--b12x-attn-mode", choices=["default", "turbo"], default="default")
+    parser.add_argument("--ci-level", type=float, default=0.95)
+    parser.add_argument("--compare-fa2", action="store_true", default=True)
+    parser.add_argument("--no-compare-fa2", action="store_false", dest="compare_fa2")
+    parser.add_argument("--check", action="store_true")
+    args = parser.parse_args()
+
+    require_sm120()
+    if args.replays < 100:
+        raise ValueError("--replays must be at least 100 for graph-replay benchmarking")
+    if not 0.0 < args.ci_level < 1.0:
+        raise ValueError("--ci-level must be between 0 and 1")
+    clear_attention_caches()
+    if args.mode == "legacy-matrix":
+        _run_legacy_matrix(args)
+        return
+    _run_decode_graph_buckets(args)
 
 
 if __name__ == "__main__":

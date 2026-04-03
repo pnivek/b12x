@@ -391,7 +391,7 @@ def decode_chunk_pages_for_graph(
         mode="decode",
         q_dtype=q_dtype,
         kv_dtype=kv_dtype,
-        batch=batch,
+        policy_batch=batch,
         graph_chunk_policy=True,
         page_size=page_size,
         head_dim_qk=head_dim_qk,
