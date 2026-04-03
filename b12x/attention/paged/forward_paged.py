@@ -1108,6 +1108,7 @@ def _literal_qk_mma_into_sfrag_plane_fp8_raw(
             k_offset = k_offset_cur - Int32(num_mma_kv * 16 * upcast_stride_full)
 
 
+@cute.jit
 def _literal_qk_mma_into_sfrag_mxfp8_raw(
     s_frag: cute.Tensor,
     q_base_addr: Int32,
