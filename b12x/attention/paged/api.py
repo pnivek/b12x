@@ -85,9 +85,7 @@ def _resolve_mxfp8_turbo_flags(
         mxfp8_turbo
         and plan.mode in ("decode", "verify")
     ):
-        if plan.enable_cuda_graph and plan.total_q > _DECODE_MXFP8_TURBO_MAX_SMALL_BATCH:
-            decode_runtime_chunk_guard = True
-        elif (
+        if (
             plan.total_q > _DECODE_MXFP8_TURBO_MAX_SMALL_BATCH
             and plan.kv_chunk_size < _DECODE_MXFP8_TURBO_MIN_LONG_CHUNK_PAGES * plan.page_size
         ):
