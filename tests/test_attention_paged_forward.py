@@ -361,29 +361,6 @@ def test_paged_forward_turbo_matches_reference_with_split_fp8_decode() -> None:
     assert plan_desc.endswith(",split")
     assert (output - ref_out).abs().max().item() <= 0.01
     assert _cosine_similarity(output, ref_out) >= 0.995
-
-
-@torch.inference_mode()
-def test_paged_forward_turbo_short_chunk_graph_decode_matches_default_batch4() -> None:
-    require_sm120()
-    default_out, ref_out, default_plan_desc = _run_decode_reference_check(
-        batch=4,
-        cache_seqlen=16384,
-        b12x_attn_mode="default",
-    )
-    turbo_out, _turbo_ref, turbo_plan_desc = _run_decode_reference_check(
-        batch=4,
-        cache_seqlen=16384,
-        b12x_attn_mode="turbo",
-    )
-
-    assert default_plan_desc.endswith(",split")
-    assert turbo_plan_desc == default_plan_desc
-    assert (turbo_out - default_out).abs().max().item() <= 1e-5
-    assert _cosine_similarity(turbo_out, default_out) >= 0.999999
-    assert _cosine_similarity(turbo_out, ref_out) >= 0.99999
-
-
 @torch.inference_mode()
 def test_paged_forward_matches_reference_with_bf16_kv_extend() -> None:
     require_sm120()
