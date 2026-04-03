@@ -575,7 +575,7 @@ class PagedAttentionWorkspace:
             and self._plan.enable_cuda_graph
             and self._plan.split_kv
             and self._plan.num_qo_tiles == self._plan.page_table_shape[0]
-            and self._plan.page_table_shape[0] in (4, 12, 16)
+            and self._plan.page_table_shape[0] == 16
         )
 
         self._validate_decode_graph_replay_capacity(

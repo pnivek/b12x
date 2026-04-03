@@ -383,7 +383,7 @@ def paged_attention_forward(
             and plan.enable_cuda_graph
             and plan.split_kv
             and plan.num_qo_tiles == plan.page_table_shape[0]
-            and plan.page_table_shape[0] in (4, 12, 16)
+            and plan.page_table_shape[0] == 16
         )
         forward_kernel = _build_forward_kernel(
             traits,
