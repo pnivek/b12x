@@ -1758,6 +1758,7 @@ class PagedForwardKernel:
         traits: PagedForwardTraits,
         split_kv: bool,
         single_request_decode_graph: bool = False,
+        single_qtile_decode_graph: bool = False,
         mxfp8_turbo: bool = False,
         enable_mxfp8_pv: bool = False,
     ):
@@ -1768,6 +1769,7 @@ class PagedForwardKernel:
         self.traits = traits
         self.split_kv = split_kv
         self.single_request_decode_graph = single_request_decode_graph
+        self.single_qtile_decode_graph = single_qtile_decode_graph
         self.kv_is_fp8 = dtype_kv == cutlass.Float8E4M3FN
         self.vec_size = traits.head_dim_vo // 32
         self.total_warps = traits.num_warps_q * traits.num_warps_kv
@@ -2261,21 +2263,41 @@ class PagedForwardKernel:
             _exit_thread()
         if const_expr(self.single_request_decode_graph):
             request_idx = Int32(0)
-            qo_tile_idx = Int32(0)
+            q_start = Int32(0)
+            q_end = Int32(1)
+            qo_len = Int32(1)
             kv_tile_idx = work_idx
+            request_partial_start = Int32(0)
+            request_partial_end = mOIndptr[1]
+        elif const_expr(self.single_qtile_decode_graph):
+            request_idx = mRequestIndices[work_idx]
+            q_start = request_idx
+            q_end = request_idx + 1
+            qo_len = Int32(1)
+            request_partial_start = mOIndptr[request_idx]
+            request_partial_end = mOIndptr[request_idx + 1]
+            kv_tile_idx = work_idx - request_partial_start
         else:
             request_idx = mRequestIndices[work_idx]
             qo_tile_idx = mQoTileIndices[work_idx]
             kv_tile_idx = mKvTileIndices[work_idx]
-        q_start = mCuSeqlensQ[request_idx]
-        q_end = mCuSeqlensQ[request_idx + 1]
-        qo_len = q_end - q_start
+            q_start = mCuSeqlensQ[request_idx]
+            q_end = mCuSeqlensQ[request_idx + 1]
+            qo_len = q_end - q_start
+            request_partial_start = mOIndptr[request_idx]
+            request_partial_end = mOIndptr[request_idx + 1]
         cache_len = mCacheSeqlens[request_idx]
         group_size = mQ.shape[1] // mKCache.shape[2]
         packed_qo_len = qo_len * group_size
-        packed_tile_start = qo_tile_idx * self.traits.cta_tile_q
-        packed_tile_limit = packed_tile_start + self.traits.cta_tile_q
-        packed_tile_end = cutlass.select_(packed_tile_limit < packed_qo_len, packed_tile_limit, packed_qo_len)
+        if const_expr(self.single_request_decode_graph or self.single_qtile_decode_graph):
+            packed_tile_start = Int32(0)
+            packed_tile_end = packed_qo_len
+        else:
+            packed_tile_start = qo_tile_idx * self.traits.cta_tile_q
+            packed_tile_limit = packed_tile_start + self.traits.cta_tile_q
+            packed_tile_end = cutlass.select_(
+                packed_tile_limit < packed_qo_len, packed_tile_limit, packed_qo_len
+            )
         kv_chunk_size = mKvChunkSizePtr[0]
 
         chunk_start = kv_tile_idx * kv_chunk_size if const_expr(self.split_kv) else 0
@@ -2288,13 +2310,14 @@ class PagedForwardKernel:
             if const_expr(self.split_kv)
             else cache_len
         )
-        request_partial_start = mOIndptr[request_idx]
-        request_partial_end = mOIndptr[request_idx + 1]
-        num_chunks_kv = (
-            (request_partial_end - request_partial_start) // qo_len
-            if const_expr(self.split_kv)
-            else 1
-        )
+        if const_expr(self.split_kv):
+            num_chunks_kv = (
+                request_partial_end - request_partial_start
+                if const_expr(self.single_request_decode_graph or self.single_qtile_decode_graph)
+                else (request_partial_end - request_partial_start) // qo_len
+            )
+        else:
+            num_chunks_kv = 1
         page_size = mKCache.shape[1]
         stage_tile_rows = self.stage_tile_rows
         q_bytes = self.traits.q_smem_bytes

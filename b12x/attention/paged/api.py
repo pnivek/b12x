@@ -269,6 +269,7 @@ def _build_forward_kernel(
     traits: PagedForwardTraits,
     split_kv: bool,
     single_request_decode_graph: bool,
+    single_qtile_decode_graph: bool,
     mxfp8_turbo: bool,
     enable_mxfp8_pv: bool,
 ) -> PagedForwardKernel:
@@ -280,6 +281,7 @@ def _build_forward_kernel(
         traits=traits,
         split_kv=split_kv,
         single_request_decode_graph=single_request_decode_graph,
+        single_qtile_decode_graph=single_qtile_decode_graph,
         mxfp8_turbo=mxfp8_turbo,
         enable_mxfp8_pv=enable_mxfp8_pv,
     )
@@ -360,14 +362,25 @@ def paged_attention_forward(
             enable_mxfp8_pv,
         )
     else:
-        forward_kernel = _build_forward_kernel(
-            traits,
-            plan.split_kv,
+        single_request_decode_graph = (
             plan.mode == "decode"
             and plan.enable_cuda_graph
             and plan.split_kv
             and plan.num_qo_tiles == 1
-            and plan.page_table_shape[0] == 1,
+            and plan.page_table_shape[0] == 1
+        )
+        single_qtile_decode_graph = (
+            plan.mode == "decode"
+            and plan.enable_cuda_graph
+            and plan.split_kv
+            and plan.page_table_shape[0] > 1
+            and max(plan.qo_tile_indices, default=0) == 0
+        )
+        forward_kernel = _build_forward_kernel(
+            traits,
+            plan.split_kv,
+            single_request_decode_graph,
+            single_qtile_decode_graph,
             mxfp8_turbo,
             enable_mxfp8_pv,
         )
