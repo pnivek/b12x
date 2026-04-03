@@ -3406,16 +3406,17 @@ class PagedForwardKernel:
         if const_expr(self.traits.num_warps_kv > 1):
             if const_expr(decode_qwen_single_row_fastpath):
                 packed_row_local = Int32(lane_group)
-                if lane_pair_base == 0:
-                    sSyncMD[warp_kv_idx, packed_row_local, 0] = m_frag[0, 0]
-                    sSyncMD[warp_kv_idx, packed_row_local, 1] = d_frag[0, 0]
-                for mma_d in cutlass.range_constexpr(num_mma_d_vo):
-                    dim_low = mma_d * 16 + lane_pair_base
-                    dim_high = dim_low + 8
-                    sSyncO[warp_kv_idx, packed_row_local, dim_low + 0] = o_frag[0, mma_d, 0]
-                    sSyncO[warp_kv_idx, packed_row_local, dim_low + 1] = o_frag[0, mma_d, 1]
-                    sSyncO[warp_kv_idx, packed_row_local, dim_high + 0] = o_frag[0, mma_d, 4]
-                    sSyncO[warp_kv_idx, packed_row_local, dim_high + 1] = o_frag[0, mma_d, 5]
+                if warp_kv_idx != 0:
+                    if lane_pair_base == 0:
+                        sSyncMD[warp_kv_idx, packed_row_local, 0] = m_frag[0, 0]
+                        sSyncMD[warp_kv_idx, packed_row_local, 1] = d_frag[0, 0]
+                    for mma_d in cutlass.range_constexpr(num_mma_d_vo):
+                        dim_low = mma_d * 16 + lane_pair_base
+                        dim_high = dim_low + 8
+                        sSyncO[warp_kv_idx, packed_row_local, dim_low + 0] = o_frag[0, mma_d, 0]
+                        sSyncO[warp_kv_idx, packed_row_local, dim_low + 1] = o_frag[0, mma_d, 1]
+                        sSyncO[warp_kv_idx, packed_row_local, dim_high + 0] = o_frag[0, mma_d, 4]
+                        sSyncO[warp_kv_idx, packed_row_local, dim_high + 1] = o_frag[0, mma_d, 5]
             elif const_expr(self.single_request_decode_graph or self.single_qtile_decode_graph):
                 for mma_q in cutlass.range_constexpr(num_mma_q):
                     packed_row_local = row_local_idx[mma_q, 0]
@@ -3464,8 +3465,8 @@ class PagedForwardKernel:
                     merged_m = Float32(-Float32.inf)
                     merged_d = Float32(1.0)
                     inv_d = Float32(0.0)
-                    part_m0 = sSyncMD[0, packed_row_local, 0]
-                    part_d0 = sSyncMD[0, packed_row_local, 1]
+                    part_m0 = m_frag[0, 0]
+                    part_d0 = d_frag[0, 0]
                     part_m1 = sSyncMD[1, packed_row_local, 0]
                     part_d1 = sSyncMD[1, packed_row_local, 1]
                     part_m2 = sSyncMD[2, packed_row_local, 0]
@@ -3510,25 +3511,25 @@ class PagedForwardKernel:
                         out_high1 = Float32(0.0)
                         if merged_m != -Float32.inf:
                             out_low0 = Float32(
-                                sSyncO[0, packed_row_local, dim_low + 0] * norm0
+                                o_frag[0, mma_d, 0] * norm0
                                 + sSyncO[1, packed_row_local, dim_low + 0] * norm1
                                 + sSyncO[2, packed_row_local, dim_low + 0] * norm2
                                 + sSyncO[3, packed_row_local, dim_low + 0] * norm3
                             )
                             out_low1 = Float32(
-                                sSyncO[0, packed_row_local, dim_low + 1] * norm0
+                                o_frag[0, mma_d, 1] * norm0
                                 + sSyncO[1, packed_row_local, dim_low + 1] * norm1
                                 + sSyncO[2, packed_row_local, dim_low + 1] * norm2
                                 + sSyncO[3, packed_row_local, dim_low + 1] * norm3
                             )
                             out_high0 = Float32(
-                                sSyncO[0, packed_row_local, dim_high + 0] * norm0
+                                o_frag[0, mma_d, 4] * norm0
                                 + sSyncO[1, packed_row_local, dim_high + 0] * norm1
                                 + sSyncO[2, packed_row_local, dim_high + 0] * norm2
                                 + sSyncO[3, packed_row_local, dim_high + 0] * norm3
                             )
                             out_high1 = Float32(
-                                sSyncO[0, packed_row_local, dim_high + 1] * norm0
+                                o_frag[0, mma_d, 5] * norm0
                                 + sSyncO[1, packed_row_local, dim_high + 1] * norm1
                                 + sSyncO[2, packed_row_local, dim_high + 1] * norm2
                                 + sSyncO[3, packed_row_local, dim_high + 1] * norm3
