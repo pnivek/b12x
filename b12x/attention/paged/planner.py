@@ -51,6 +51,7 @@ _PAGED_EXTEND_BF16_CHUNK_TABLE_PAGES = (
 )
 
 _DEFAULT_GRAPH_CTAS_PER_SM = 2
+_PagedMode = Literal["decode", "extend", "verify"]
 
 
 def _merge_backend_supports_split_kv(
@@ -92,9 +93,9 @@ def _kv_dtype_tuning_key(kv_dtype: torch.dtype) -> str:
 
 def _resolve_graph_ctas_per_sm(
     *,
-    mode: Literal["decode", "extend"],
+    mode: _PagedMode,
     kv_dtype: torch.dtype,
-    batch: int,
+    policy_batch: int,
     max_effective_kv_pages: int,
     graph_ctas_per_sm: int | None,
 ) -> int:
@@ -104,7 +105,8 @@ def _resolve_graph_ctas_per_sm(
             raise ValueError("graph_ctas_per_sm must be positive")
         return resolved_graph_ctas_per_sm
 
-    if mode != "decode":
+    tuning_regime = "decode" if mode == "verify" else mode
+    if tuning_regime != "decode":
         return _DEFAULT_GRAPH_CTAS_PER_SM
 
     try:
@@ -116,8 +118,8 @@ def _resolve_graph_ctas_per_sm(
         resolved_graph_ctas_per_sm = int(
             get_decode_graph_policy(
                 kv_dtype=_kv_dtype_tuning_key(kv_dtype),
-                regime=mode,
-                batch=batch,
+                regime=tuning_regime,
+                batch=policy_batch,
             ).graph_ctas_per_sm
         )
     except KeyError:
@@ -171,6 +173,17 @@ def _q_lengths_from_cu_seqlens(cu_seqlens_q: torch.Tensor) -> list[int]:
     return q_lengths
 
 
+def _graph_policy_batch(
+    *,
+    mode: _PagedMode,
+    batch: int,
+    total_q: int,
+) -> int:
+    if mode == "verify":
+        return max(int(total_q), 1)
+    return max(int(batch), 1)
+
+
 def infer_paged_mode(cu_seqlens_q: torch.Tensor) -> Literal["decode", "extend"]:
     q_lengths = _q_lengths_from_cu_seqlens(cu_seqlens_q)
     return "decode" if q_lengths and all(q_len == 1 for q_len in q_lengths) else "extend"
@@ -187,12 +200,19 @@ def _fa2_determine_cta_tile_q(avg_packed_qo_len: int, head_dim: int) -> int:
 
 def _paged_determine_cta_tile_q(
     *,
-    mode: Literal["decode", "extend"],
+    mode: _PagedMode,
     kv_dtype: torch.dtype,
     packed_qo_len: int,
     head_dim: int,
     max_effective_kv_pages: int,
 ) -> int:
+    if mode == "verify":
+        del kv_dtype, head_dim, max_effective_kv_pages
+        return 16
+    if mode == "extend" and packed_qo_len <= 32:
+        del kv_dtype, head_dim, max_effective_kv_pages
+        return 16
+
     cta_tile_q = _fa2_determine_cta_tile_q(packed_qo_len, head_dim)
     del max_effective_kv_pages
     del mode, kv_dtype
@@ -201,10 +221,10 @@ def _paged_determine_cta_tile_q(
 
 def chunk_pages_for_family(
     *,
-    mode: Literal["decode", "extend"],
+    mode: _PagedMode,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
-    batch: int | None,
+    policy_batch: int | None,
     graph_chunk_policy: bool,
     page_size: int,
     head_dim_qk: int,
@@ -224,10 +244,11 @@ def chunk_pages_for_family(
             _PAGED_EXTEND_BF16_CHUNK_TABLE_PAGES,
         )
 
+    tuning_regime = "decode" if mode == "verify" else mode
     if (
-        mode != "decode"
+        tuning_regime != "decode"
         or not graph_chunk_policy
-        or batch is None
+        or policy_batch is None
         or q_dtype != torch.bfloat16
         or page_size != 64
         or head_dim_qk != 256
@@ -245,8 +266,8 @@ def chunk_pages_for_family(
         return int(
             lookup_decode_graph_chunk_pages(
                 kv_dtype=_kv_dtype_tuning_key(kv_dtype),
-                regime=mode,
-                batch=int(batch),
+                regime=tuning_regime,
+                batch=int(policy_batch),
                 page_count=max(max_effective_kv_pages, 1),
             )
         )
@@ -425,7 +446,7 @@ class PagedPlanKey:
     page_table_shape: tuple[int, ...]
     dtype: torch.dtype
     kv_dtype: torch.dtype
-    mode: Literal["decode", "extend"]
+    mode: _PagedMode
     cta_tile_q: int
     kv_chunk_size: int
     split_kv: bool
@@ -471,7 +492,7 @@ def create_paged_plan(
     cache_seqlens: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     *,
-    mode: Literal["decode", "extend"] | None = None,
+    mode: _PagedMode | None = None,
     fixed_split_size: int = -1,
     disable_split_kv: bool = False,
     force_split_kv: bool | None = None,
@@ -537,8 +558,10 @@ def create_paged_plan(
 
     inferred_mode = infer_paged_mode(cu_seqlens_q)
     mode = inferred_mode if mode is None else mode
+    if mode == "verify" and inferred_mode != "extend":
+        raise ValueError(f"verify mode requires q_len > 1, got inferred mode {inferred_mode}")
     if force_split_kv is None:
-        force_split_kv = mode == "decode"
+        force_split_kv = mode in ("decode", "verify")
     if mode == "extend" and force_split_kv:
         raise ValueError("extend plans no longer support split-kv")
     if plan_budget is not None:
@@ -562,6 +585,11 @@ def create_paged_plan(
     gqa_group_size = num_q_heads // num_kv_heads
     packed_qo_len_arr = [q_len * gqa_group_size for q_len in q_lengths]
     kv_len_arr = list(cache_pages_arr)
+    policy_batch = _graph_policy_batch(
+        mode=mode,
+        batch=batch,
+        total_q=total_q,
+    )
 
     if enable_cuda_graph:
         total_num_rows = total_q
@@ -603,7 +631,7 @@ def create_paged_plan(
         resolved_graph_ctas_per_sm = _resolve_graph_ctas_per_sm(
             mode=mode,
             kv_dtype=k_cache.dtype,
-            batch=batch,
+            policy_batch=policy_batch,
             max_effective_kv_pages=max(max(effective_kv_len_arr), 1),
             graph_ctas_per_sm=graph_ctas_per_sm,
         )
@@ -645,7 +673,7 @@ def create_paged_plan(
             mode=mode,
             q_dtype=q.dtype,
             kv_dtype=k_cache.dtype,
-            batch=batch,
+            policy_batch=policy_batch,
             graph_chunk_policy=bool(enable_cuda_graph and graph_chunk_policy),
             page_size=page_size,
             head_dim_qk=head_dim_qk,

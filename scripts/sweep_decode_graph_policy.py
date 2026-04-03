@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sweep decode graph CTA and chunk policies and emit raw JSON measurements.
+"""Sweep graph CTA and chunk policies and emit raw JSON measurements.
 
 For each batch bucket this script:
 
@@ -60,7 +60,7 @@ class CtaContext:
 
 
 @dataclass(frozen=True)
-class SharedDecodeInputs:
+class SharedPagedInputs:
     q: torch.Tensor
     k_cache: torch.Tensor
     v_cache: torch.Tensor
@@ -422,7 +422,8 @@ def _render_output_payload(
         "version": 1,
         "config": {
             "kv_dtype": normalize_kv_dtype_key(args.kv_dtype),
-            "mode": "decode",
+            "mode": str(args.mode),
+            "q_seqlen": int(args.q_seqlen),
             "batch_list": batch_list,
             "page_range": [int(args.page_start), int(args.page_stop), int(args.page_step)],
             "capture_page_count": int(args.capture_page_count),
@@ -477,6 +478,8 @@ def _worker_cache_key(
     capacity_probe_page_counts: list[int],
 ) -> tuple[object, ...]:
     return (
+        str(args.mode),
+        int(args.q_seqlen),
         normalize_kv_dtype_key(args.kv_dtype),
         str(args.b12x_attn_mode),
         int(args.batch),
@@ -702,7 +705,7 @@ def _capture_cta_context(
     graph_ctas_per_sm: int,
     candidate_splits: list[int],
     capacity_probe_page_counts: list[int],
-    shared_inputs: SharedDecodeInputs,
+    shared_inputs: SharedPagedInputs,
 ) -> CtaContext:
     _log_summary(
         f"# ctas={graph_ctas_per_sm} capture start capture_page_count={args.capture_page_count}"
@@ -714,7 +717,7 @@ def _capture_cta_context(
     v_descale = shared_inputs.v_descale
 
     workspace = PagedAttentionWorkspace.for_tensors(
-        mode="decode",
+        mode=str(args.mode),
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -743,7 +746,7 @@ def _capture_cta_context(
             plan_page_table[:batch, :max_pages_per_request],
             plan_cache_seqlens[:batch],
             plan_cu_seqlens_q[: batch + 1],
-            mode="decode",
+            mode=str(args.mode),
             fixed_split_size=int(fixed_split_pages),
             disable_split_kv=False,
             enable_cuda_graph=True,
@@ -818,10 +821,10 @@ def _capture_cta_context(
     )
 
 
-def _build_shared_decode_inputs(
+def _build_shared_paged_inputs(
     *,
     args: argparse.Namespace,
-) -> SharedDecodeInputs:
+) -> SharedPagedInputs:
     cache_seqlen = int(args.capture_page_count * args.page_size)
     (
         q,
@@ -834,7 +837,7 @@ def _build_shared_decode_inputs(
         cu_seqlens_q,
     ) = _make_uniform_paged_inputs(
         batch=args.batch,
-        q_seqlen=1,
+        q_seqlen=int(args.q_seqlen),
         cache_seqlen=cache_seqlen,
         capture_cache_seqlen=None,
         page_size=args.page_size,
@@ -854,7 +857,7 @@ def _build_shared_decode_inputs(
             batch=args.batch,
             kv_heads=args.kv_heads,
         )
-    return SharedDecodeInputs(
+    return SharedPagedInputs(
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -868,6 +871,7 @@ def _build_shared_decode_inputs(
 
 def _prepare_chunk_candidate_for_page(
     *,
+    mode: str,
     context: CtaContext,
     cache_seqlen: int,
     fixed_split_pages: int,
@@ -895,7 +899,7 @@ def _prepare_chunk_candidate_for_page(
         workspace.page_table[:batch, :max_pages_per_request],
         workspace.cache_seqlens[:batch],
         workspace.cu_seqlens_q[: batch + 1],
-        mode="decode",
+        mode=str(mode),
         fixed_split_size=int(fixed_split_pages),
         disable_split_kv=False,
         enable_cuda_graph=True,
@@ -1044,6 +1048,7 @@ def _measure_page_for_cta(
         try:
             candidates.append(
                 _prepare_chunk_candidate_for_page(
+                    mode=str(args.mode),
                     context=context,
                     cache_seqlen=cache_seqlen,
                     fixed_split_pages=fixed_split_pages,
@@ -1466,7 +1471,7 @@ def _build_worker_cache(
     global _WORKER_CACHE_KEY, _WORKER_CONTEXTS, _WORKER_CAPTURE_ERRORS
     contexts: dict[int, CtaContext] = {}
     capture_errors: dict[int, str] = {}
-    shared_inputs = _build_shared_decode_inputs(args=args)
+    shared_inputs = _build_shared_paged_inputs(args=args)
     for graph_ctas_per_sm in cache_candidate_ctas_per_sm:
         try:
             contexts[graph_ctas_per_sm] = _capture_cta_context(
@@ -2170,6 +2175,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--summary", action="store_true")
+    parser.add_argument("--mode", choices=["decode", "verify"], default="decode")
+    parser.add_argument("--q-seqlen", type=int, default=1)
     parser.add_argument("--batch-list", type=str, default="8")
     parser.add_argument("--batch", type=int, default=8, help=argparse.SUPPRESS)
     parser.add_argument("--page-start", type=int, default=1)
@@ -2211,6 +2218,12 @@ def main() -> None:
         raise ValueError("expected 1 <= page-start <= page-stop and page-step > 0")
     if args.page_size != 64:
         raise ValueError("primary paged backend expects page_size=64")
+    if args.q_seqlen <= 0:
+        raise ValueError("--q-seqlen must be positive")
+    if args.mode == "decode" and args.q_seqlen != 1:
+        raise ValueError("--mode decode requires --q-seqlen=1")
+    if args.mode == "verify" and args.q_seqlen <= 1:
+        raise ValueError("--mode verify requires --q-seqlen > 1")
     if args.q_heads % args.kv_heads != 0:
         raise ValueError("q-heads must be divisible by kv-heads")
     if args.replays <= 0 or args.probe_batch_replays <= 0:

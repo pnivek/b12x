@@ -8,7 +8,7 @@ import cutlass.cute as cute
 from cutlass.base_dsl.dsl import BaseDSL
 
 import b12x.cute.runtime_patches as runtime_patches
-from b12x.cute.runtime_patches import _build_compile_disk_cache_key
+from b12x.cute.runtime_patches import _build_compile_disk_cache_key, _structural_cache_key
 from b12x.cute.utils import make_ptr
 
 
@@ -111,3 +111,30 @@ def test_compile_disk_cache_key_changes_with_toolchain_key(monkeypatch) -> None:
     )
 
     assert key_a != key_b
+
+
+def test_structural_cache_key_handles_symbolic_fake_compact_tensor_dims() -> None:
+    class FakeSymInt:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def __int__(self) -> int:
+            raise TypeError("symbolic dim")
+
+        def __str__(self) -> str:
+            return self.name
+
+    FakeCompactTensor = type("_FakeCompactTensor", (), {})
+    FakeCompactTensor.__module__ = "cutlass.cute.runtime"
+    fake = FakeCompactTensor()
+    fake._dtype = cutlass.Int32
+    fake._shape = (FakeSymInt("s0"), 8)
+    fake._stride_order = (1, 0)
+    fake._memspace = cute.AddressSpace.gmem
+    fake._assumed_align = 4
+    fake._use_32bit_stride = True
+
+    key = _structural_cache_key(fake)
+
+    assert key[0] == "fake_compact_tensor"
+    assert key[2][0] == ("symbolic_dim", FakeSymInt.__module__, FakeSymInt.__qualname__, "s0")

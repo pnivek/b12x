@@ -167,14 +167,7 @@ def _get_cached_plane_tma_descs(
         plane_cols,
         tile_rows,
     )
-    if cached.get("key") != key:
-        return None
-    return (
-        cached.get("k_desc"),
-        cached.get("v_desc"),
-        cached["k_ptrs"],
-        cached["v_ptrs"],
-    )
+    return cached.get(key)
 
 
 def _tensor_meta_key(
@@ -250,9 +243,6 @@ def _run_cached_host_launcher(
     *,
     cache_key_labels: tuple[str, ...] | None = None,
 ) -> None:
-    if torch.cuda.is_current_stream_capturing():
-        kernel(*args)
-        return
     cache, compiled = _launcher_cache_lookup(kernel, cache_key)
     if compiled is None:
         if os.environ.get("B12X_PAGED_DEBUG_COMPILE", "0") == "1":
@@ -267,6 +257,9 @@ def _run_cached_host_launcher(
         cache[cache_key] = compiled
         if len(cache) > _EAGER_HOST_LAUNCHER_CACHE_SIZE:
             cache.popitem(last=False)
+    if torch.cuda.is_current_stream_capturing():
+        kernel(*args)
+        return
     exe_args, _ = compiled.generate_execution_args(*args)
     compiled.run_compiled_program(exe_args)
 
@@ -355,7 +348,7 @@ def paged_attention_forward(
 
     traits = select_paged_forward_traits_from_plan(plan)
     mxfp8_turbo = _attn_turbo_enabled(workspace.attn_mode) and plan.kv_dtype == torch.float8_e4m3fn
-    enable_mxfp8_pv = mxfp8_turbo and plan.mode == "decode" and plan.kv_chunk_size <= 384
+    enable_mxfp8_pv = mxfp8_turbo and plan.mode in ("decode", "verify") and plan.kv_chunk_size <= 384
     if plan.mode == "extend":
         if plan.split_kv:
             raise ValueError("extend plans no longer support split-kv")
@@ -434,20 +427,21 @@ def paged_attention_forward(
             )
             k_tma_desc_ptrs = _descriptor_row_ptrs(k_tma_desc)
             v_tma_desc_ptrs = _descriptor_row_ptrs(v_tma_desc)
-            workspace._live_plane_tma_desc_cache = {
-                "key": (
+            workspace._live_plane_tma_desc_cache[
+                (
                     int(k_cache.data_ptr()),
                     int(v_cache.data_ptr()),
                     tuple(k_cache.shape),
                     tuple(v_cache.shape),
                     forward_kernel.kv_tma_plane_head_dim,
                     forward_kernel.stage_tile_rows,
-                ),
-                "k_desc": k_tma_desc,
-                "v_desc": v_tma_desc,
-                "k_ptrs": k_tma_desc_ptrs,
-                "v_ptrs": v_tma_desc_ptrs,
-            }
+                )
+            ] = (
+                k_tma_desc,
+                v_tma_desc,
+                k_tma_desc_ptrs,
+                v_tma_desc_ptrs,
+            )
     if k_tma_desc_ptrs is None or v_tma_desc_ptrs is None:
         dummy_desc_ptrs = _dummy_plane_tma_desc_ptrs(
             torch.cuda.current_device(),
@@ -458,7 +452,7 @@ def paged_attention_forward(
     workspace._live_plane_tma_descs = (k_tma_desc, v_tma_desc, k_tma_desc_ptrs, v_tma_desc_ptrs)
 
     stream = current_cuda_stream()
-    use_capacity_contract = plan.mode == "extend" and workspace.fixed_capacity
+    use_capacity_contract = plan.mode in ("extend", "verify") and workspace.fixed_capacity
     q_cache_tensor = workspace._plan_q if use_capacity_contract and workspace._plan_q is not None else q
     output_cache_tensor = (
         workspace._plan_output

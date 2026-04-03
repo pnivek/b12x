@@ -141,6 +141,20 @@ def _make_workspace(
     )
 
 
+def _make_req_to_token(
+    page_table: torch.Tensor,
+    *,
+    row_stride: int,
+    page_size: int,
+) -> torch.Tensor:
+    batch, max_pages = [int(dim) for dim in page_table.shape]
+    req_to_token = torch.zeros((batch, row_stride), dtype=torch.int64, device=page_table.device)
+    for req_idx in range(batch):
+        for page_idx in range(max_pages):
+            req_to_token[req_idx, page_idx * page_size] = int(page_table[req_idx, page_idx].item()) * page_size
+    return req_to_token
+
+
 @pytest.mark.parametrize("fixed_split_size", [None, 4])
 def test_paged_workspace_matches_reference_for_qwen_like_extend_shape(
     fixed_split_size: int | None,
@@ -736,6 +750,132 @@ def test_prepare_for_capacity_primes_extend_graph_bucket() -> None:
     assert int(workspace.cache_seqlens[0].item()) == 4096
 
 
+def test_prepare_decode_graph_replay_state_is_batch_specific() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    num_pages = 512
+    page_size = 64
+    head_dim = 256
+    num_kv_heads = 1
+
+    q1 = torch.randn(1, 8, head_dim, device="cuda", dtype=torch.bfloat16) / 4
+    q8 = torch.randn(8, 8, head_dim, device="cuda", dtype=torch.bfloat16) / 4
+    k_cache = torch.randn(num_pages, page_size, num_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16) / 4
+    v_cache = torch.randn(num_pages, page_size, num_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16) / 4
+
+    workspace_bs1 = _make_workspace(
+        q=q1,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        use_cuda_graph=True,
+    )
+    workspace_bs8 = _make_workspace(
+        q=q8,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cu_seqlens_q=torch.arange(0, 9, dtype=torch.int32, device="cuda"),
+        use_cuda_graph=True,
+    )
+
+    workspace_bs1.prepare_decode_graph_replay_state(
+        batch=1,
+        total_q_capacity=1,
+        max_page_table_width=128,
+        max_cache_page_count=128,
+    )
+    workspace_bs8.prepare_decode_graph_replay_state(
+        batch=8,
+        total_q_capacity=8,
+        max_page_table_width=128,
+        max_cache_page_count=128,
+    )
+
+    page_table_bs1 = torch.arange(0, 128, dtype=torch.int32, device="cuda").view(1, 128)
+    page_table_bs8 = torch.stack(
+        [
+            torch.remainder(
+                torch.arange(req_idx * 128, (req_idx + 1) * 128, dtype=torch.int32, device="cuda"),
+                num_pages,
+            )
+            for req_idx in range(8)
+        ],
+        dim=0,
+    )
+    cache_seqlens_bs1 = torch.tensor([128 * page_size], dtype=torch.int32, device="cuda")
+    cache_seqlens_bs8 = torch.full((8,), 128 * page_size, dtype=torch.int32, device="cuda")
+
+    workspace_bs1.bind_cuda_graph_runtime_metadata(
+        page_table=page_table_bs1.clone(),
+        cache_seqlens=cache_seqlens_bs1.clone(),
+        cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+    )
+    workspace_bs8.bind_cuda_graph_runtime_metadata(
+        page_table=page_table_bs8.clone(),
+        cache_seqlens=cache_seqlens_bs8.clone(),
+        cu_seqlens_q=torch.arange(0, 9, dtype=torch.int32, device="cuda"),
+    )
+
+    workspace_bs1.update_decode_graph_replay_metadata(
+        req_to_token=_make_req_to_token(page_table_bs1, row_stride=128 * page_size, page_size=page_size),
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device="cuda"),
+    )
+    workspace_bs8.update_decode_graph_replay_metadata(
+        req_to_token=_make_req_to_token(page_table_bs8, row_stride=128 * page_size, page_size=page_size),
+        req_pool_indices=torch.arange(0, 8, dtype=torch.int64, device="cuda"),
+    )
+
+    assert int(workspace_bs1.kv_chunk_size_ptr[0].item()) == 64
+    assert int(workspace_bs8.kv_chunk_size_ptr[0].item()) == 384
+
+
+def test_update_decode_graph_replay_metadata_updates_workspace_buffers() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, _cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[1, 1, 1, 1],
+        cache_seqlens=[4096, 2048, 1024, 512],
+        page_size=64,
+        seed=101,
+        page_table_width=64,
+        num_pages=512,
+    )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cu_seqlens_q=torch.arange(0, 5, dtype=torch.int32, device=q.device),
+        use_cuda_graph=True,
+    )
+    workspace.prepare_decode_graph_replay_state(
+        batch=4,
+        total_q_capacity=4,
+        max_page_table_width=int(page_table.shape[1]),
+        max_cache_page_count=int(page_table.shape[1]),
+    )
+
+    bound_page_table = torch.empty_like(page_table)
+    bound_cache_seqlens = cache_seqlens.clone()
+    bound_cu_seqlens_q = torch.arange(0, 5, dtype=torch.int32, device=q.device)
+    workspace.bind_cuda_graph_runtime_metadata(
+        page_table=bound_page_table,
+        cache_seqlens=bound_cache_seqlens,
+        cu_seqlens_q=bound_cu_seqlens_q,
+    )
+
+    workspace.update_decode_graph_replay_metadata(
+        req_to_token=_make_req_to_token(page_table, row_stride=int(page_table.shape[1]) * 64, page_size=64),
+        req_pool_indices=torch.arange(0, 4, dtype=torch.int64, device=q.device),
+    )
+
+    assert torch.equal(workspace.page_table, page_table)
+    assert torch.equal(workspace.cache_seqlens, cache_seqlens)
+    assert torch.equal(workspace.o_indptr[:5], workspace.merge_indptr[:5])
+    assert int(workspace.kv_chunk_size_ptr[0].item()) > 0
+
+
 def test_workspace_mode_validation_rejects_mismatched_prepare() -> None:
     require_sm120()
     clear_attention_caches()
@@ -754,6 +894,30 @@ def test_workspace_mode_validation_rejects_mismatched_prepare() -> None:
     )
     with pytest.raises(ValueError, match="workspace mode decode does not match prepared mode extend"):
         workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
+
+
+def test_extend_workspace_accepts_single_token_extend_prepare() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, _ = _make_paged_inputs(
+        q_seqlens=[1],
+        cache_seqlens=[1],
+        page_size=64,
+        seed=49,
+    )
+    cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device=q.device)
+    workspace = PagedAttentionWorkspace.for_tensors(
+        mode="extend",
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+    )
+
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
+
+    assert workspace.plan.mode == "extend"
+    assert workspace.active_total_q == 1
 
 
 def test_workspace_fixed_split_size_pins_chunk_pages() -> None:

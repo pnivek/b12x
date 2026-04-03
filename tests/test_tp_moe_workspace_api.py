@@ -32,6 +32,10 @@ def _make_spec() -> ModelSpec:
     )
 
 
+def _dynamic_token_count(spec: ModelSpec) -> int:
+    return (tp_moe._get_static_compact_cutover_pairs() // spec.top_k) + 1
+
+
 def test_workspace_pool_handles_chunked_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     require_sm120()
     _require_model_weights()
@@ -41,7 +45,12 @@ def test_workspace_pool_handles_chunked_calls(monkeypatch: pytest.MonkeyPatch) -
     device = torch.device("cuda")
     spec = _make_spec()
     weights = load_expert_weights(MODEL_PATH, spec, layer_idx=0)
-    x, topk_ids, topk_weights = make_routed_inputs(spec, 39, seed=321, device=device)
+    x, topk_ids, topk_weights = make_routed_inputs(
+        spec,
+        _dynamic_token_count(spec),
+        seed=321,
+        device=device,
+    )
 
     exact_workspace = allocate_tp_moe_workspace(
         x,
@@ -373,7 +382,12 @@ def test_dynamic_workspace_uses_compact_storage() -> None:
     device = torch.device("cuda")
     spec = _make_spec()
     weights = load_expert_weights(MODEL_PATH, spec, layer_idx=0)
-    x, topk_ids, _topk_weights = make_routed_inputs(spec, 13, seed=777, device=device)
+    x, topk_ids, _topk_weights = make_routed_inputs(
+        spec,
+        _dynamic_token_count(spec),
+        seed=777,
+        device=device,
+    )
 
     workspace = allocate_tp_moe_workspace(
         x,
@@ -418,7 +432,12 @@ def test_dynamic_workspace_pool_uses_eager_routing_geometry() -> None:
     device = torch.device("cuda")
     spec = _make_spec()
     weights = load_expert_weights(MODEL_PATH, spec, layer_idx=0)
-    x, _topk_ids, _topk_weights = make_routed_inputs(spec, 23, seed=1701, device=device)
+    x, _topk_ids, _topk_weights = make_routed_inputs(
+        spec,
+        _dynamic_token_count(spec),
+        seed=1701,
+        device=device,
+    )
     topk_ids = torch.arange(spec.top_k, dtype=torch.int32, device=device).expand(x.shape[0], -1).contiguous()
     topk_weights = torch.full(
         (x.shape[0], spec.top_k),

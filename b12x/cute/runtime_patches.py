@@ -181,6 +181,21 @@ def _normalize_compile_target(func: Any, visited: set[int]) -> Any:
     return ("callable", type(func).__module__, type(func).__qualname__, repr(func))
 
 
+def _structural_dim_key(dim: Any, visited: set[int]) -> Any:
+    if dim is None or isinstance(dim, (bool, int, float, str)):
+        return dim
+    try:
+        return int(dim)
+    except (TypeError, ValueError):
+        pass
+    return (
+        "symbolic_dim",
+        type(dim).__module__,
+        type(dim).__qualname__,
+        str(dim),
+    )
+
+
 def _structural_cache_key(value: Any, visited: set[int] | None = None) -> Any:
     if visited is None:
         visited = set()
@@ -222,8 +237,8 @@ def _structural_cache_key(value: Any, visited: set[int] | None = None) -> Any:
         return ("cuda_stream",)
     if type_module == "cutlass.cute.runtime" and type_name == "_Tensor":
         dtype = getattr(value, "_dtype", getattr(value, "element_type", None))
-        shape = tuple(int(dim) for dim in value.shape)
-        stride = tuple(int(dim) for dim in value.stride)
+        shape = tuple(_structural_dim_key(dim, visited) for dim in value.shape)
+        stride = tuple(_structural_dim_key(dim, visited) for dim in value.stride)
         memspace = getattr(value, "memspace", getattr(value, "_memspace", None))
         assumed_align = getattr(value, "_assumed_align", None)
         is_dynamic = getattr(value, "_is_dynamic", None)
@@ -240,8 +255,8 @@ def _structural_cache_key(value: Any, visited: set[int] | None = None) -> Any:
         )
     if type_module == "cutlass.cute.runtime" and type_name == "_FakeCompactTensor":
         dtype = getattr(value, "_dtype", None)
-        shape = tuple(int(dim) for dim in getattr(value, "_shape", ()))
-        stride_order = tuple(int(dim) for dim in getattr(value, "_stride_order", ()))
+        shape = tuple(_structural_dim_key(dim, visited) for dim in getattr(value, "_shape", ()))
+        stride_order = tuple(_structural_dim_key(dim, visited) for dim in getattr(value, "_stride_order", ()))
         memspace = getattr(value, "_memspace", None)
         assumed_align = getattr(value, "_assumed_align", None)
         use_32bit_stride = getattr(value, "_use_32bit_stride", None)

@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import torch
 
-from .planner import PagedPlan, PagedPlanBudget, create_paged_plan, infer_paged_mode
+from .planner import (
+    PagedPlan,
+    PagedPlanBudget,
+    build_decode_chunk_pages_lut,
+    create_paged_plan,
+    infer_paged_mode,
+)
 
 
 def _paged_lse_storage_shape(total_q: int, num_q_heads: int) -> tuple[int, int]:
@@ -47,7 +53,7 @@ def _shape_only_cuda_tensor(
 
 @dataclass(kw_only=True)
 class PagedAttentionWorkspace:
-    mode: Literal["decode", "extend"]
+    mode: Literal["decode", "extend", "verify"]
     device: torch.device
     dtype: torch.dtype
     kv_dtype: torch.dtype
@@ -85,6 +91,11 @@ class PagedAttentionWorkspace:
     _compiled_merge: object | None = None
     _compiled_forward_kernel: object | None = None
     _compiled_key: tuple | None = None
+    _decode_graph_chunk_pages_lut: torch.Tensor | None = None
+    _decode_graph_max_chunks_per_req: int | None = None
+    _live_plane_tma_desc_cache: dict[tuple[int, int, tuple[int, ...], tuple[int, ...], int, int], tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor, torch.Tensor]] = field(
+        default_factory=dict
+    )
 
     @staticmethod
     def eager_extend_work_items_capacity(
@@ -104,7 +115,7 @@ class PagedAttentionWorkspace:
     def for_contract(
         cls,
         *,
-        mode: Literal["decode", "extend"],
+        mode: Literal["decode", "extend", "verify"],
         device: torch.device | str,
         dtype: torch.dtype,
         kv_dtype: torch.dtype,
@@ -165,7 +176,7 @@ class PagedAttentionWorkspace:
     def for_fixed_capacity(
         cls,
         *,
-        mode: Literal["decode", "extend"],
+        mode: Literal["decode", "extend", "verify"],
         device: torch.device | str,
         dtype: torch.dtype,
         kv_dtype: torch.dtype,
@@ -220,6 +231,7 @@ class PagedAttentionWorkspace:
     def for_eager_extend_capacity(
         cls,
         *,
+        mode: Literal["extend", "verify"] = "extend",
         device: torch.device | str,
         dtype: torch.dtype,
         kv_dtype: torch.dtype,
@@ -236,7 +248,7 @@ class PagedAttentionWorkspace:
         attn_mode: Literal["default", "turbo"] | None = None,
     ) -> PagedAttentionWorkspace:
         return cls.for_fixed_capacity(
-            mode="extend",
+            mode=mode,
             device=device,
             dtype=dtype,
             kv_dtype=kv_dtype,
@@ -263,7 +275,7 @@ class PagedAttentionWorkspace:
     def for_tensors(
         cls,
         *,
-        mode: Literal["decode", "extend"],
+        mode: Literal["decode", "extend", "verify"],
         q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
@@ -336,7 +348,11 @@ class PagedAttentionWorkspace:
             return self
 
         inferred_mode = infer_paged_mode(cu_seqlens_q)
-        if inferred_mode != self.mode:
+        if inferred_mode != self.mode and not (
+            self.mode == "extend" and inferred_mode == "decode"
+        ) and not (
+            self.mode == "verify" and inferred_mode == "extend"
+        ):
             raise ValueError(f"workspace mode {self.mode} does not match prepared mode {inferred_mode}")
         active_total_q = int(cu_seqlens_q[-1].item())
         self._ensure_plan_contract(active_total_q)
@@ -360,7 +376,11 @@ class PagedAttentionWorkspace:
             disable_split_kv=disable_split_kv,
             enable_cuda_graph=self.use_cuda_graph,
             graph_chunk_policy=self.use_cuda_graph,
-            plan_budget=self.planner_budget if self.mode == "extend" and not self.use_cuda_graph else None,
+            plan_budget=(
+                self.planner_budget
+                if self.mode in ("extend", "verify") and not self.use_cuda_graph
+                else None
+            ),
         )
         self._ensure_capacity(plan)
         self._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
@@ -386,6 +406,70 @@ class PagedAttentionWorkspace:
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
         )
+
+    def bind_cuda_graph_runtime_metadata(
+        self,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+    ) -> PagedAttentionWorkspace:
+        if not self.use_cuda_graph:
+            raise RuntimeError("bind_cuda_graph_runtime_metadata is only valid for graph-mode workspaces")
+        inferred_mode = infer_paged_mode(cu_seqlens_q)
+        if inferred_mode != self.mode and not (
+            self.mode == "extend" and inferred_mode == "decode"
+        ) and not (
+            self.mode == "verify" and inferred_mode == "extend"
+        ):
+            raise ValueError(f"workspace mode {self.mode} does not match bound mode {inferred_mode}")
+        if page_table.device != self.device or cache_seqlens.device != self.device or cu_seqlens_q.device != self.device:
+            raise ValueError("bound graph metadata must stay on the workspace device")
+        self.page_table = page_table
+        self.cache_seqlens = cache_seqlens
+        self.cu_seqlens_q = cu_seqlens_q
+        return self
+
+    def prepare_decode_graph_replay_state(
+        self,
+        *,
+        batch: int,
+        total_q_capacity: int,
+        max_page_table_width: int,
+        max_cache_page_count: int,
+    ) -> PagedAttentionWorkspace:
+        if not self.use_cuda_graph:
+            raise RuntimeError("prepare_decode_graph_replay_state is only valid for graph-mode workspaces")
+        if self.mode != "decode":
+            raise RuntimeError("prepare_decode_graph_replay_state is only valid for decode workspaces")
+        if max_cache_page_count <= 0:
+            raise ValueError("max_cache_page_count must be positive")
+
+        from .graph_replay import make_decode_chunk_pages_lut_tensor, summarize_decode_chunk_pages_lut
+
+        decode_chunk_pages_lut = build_decode_chunk_pages_lut(
+            q_dtype=self.dtype,
+            kv_dtype=self.kv_dtype,
+            batch=batch,
+            page_size=self.page_size,
+            head_dim_qk=self.head_dim_qk,
+            head_dim_vo=self.head_dim_vo,
+            gqa_group_size=self.num_q_heads // self.num_kv_heads,
+            max_effective_kv_pages=max_cache_page_count,
+        )
+        worst_page_count, max_chunks_per_req = summarize_decode_chunk_pages_lut(decode_chunk_pages_lut)
+        self._decode_graph_chunk_pages_lut = make_decode_chunk_pages_lut_tensor(
+            decode_chunk_pages_lut,
+            device=self.device,
+        )
+        self._decode_graph_max_chunks_per_req = int(max_chunks_per_req)
+        self.prepare_for_capacity(
+            batch=batch,
+            total_q_capacity=total_q_capacity,
+            max_page_table_width=max_page_table_width,
+            max_cache_seqlen=worst_page_count * self.page_size,
+        )
+        self._validate_decode_graph_replay_capacity(batch=batch)
+        return self
 
     def prepare_for_capacity(
         self,
@@ -457,6 +541,52 @@ class PagedAttentionWorkspace:
             dtype=self.dtype,
             device=self.device,
         )
+
+    def update_decode_graph_replay_metadata(
+        self,
+        *,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+    ) -> PagedAttentionWorkspace:
+        if not self.use_cuda_graph:
+            raise RuntimeError("update_decode_graph_replay_metadata is only valid for graph-mode workspaces")
+        if self.mode != "decode":
+            raise RuntimeError("update_decode_graph_replay_metadata is only valid for decode workspaces")
+        if self._decode_graph_chunk_pages_lut is None:
+            raise RuntimeError("decode graph replay policy has not been prepared")
+        if self.page_table is None:
+            raise RuntimeError("decode graph workspace is missing page_table")
+        if self.cache_seqlens is None:
+            raise RuntimeError("decode graph workspace is missing cache_seqlens")
+        if self.cu_seqlens_q is None:
+            raise RuntimeError("decode graph workspace is missing cu_seqlens_q")
+        if self.request_indices is None:
+            raise RuntimeError("decode graph workspace is missing request indices")
+        if self.block_valid_mask is None:
+            raise RuntimeError("decode graph workspace is missing block_valid_mask")
+        if self.merge_indptr is None or self.o_indptr is None:
+            raise RuntimeError("decode graph workspace is missing indptr buffers")
+        if self.kv_chunk_size_ptr is None:
+            raise RuntimeError("decode graph workspace is missing kv_chunk_size_ptr")
+
+        self._validate_decode_graph_replay_capacity(batch=int(self.cache_seqlens.shape[0]))
+
+        from .graph_replay import update_decode_graph_replay_metadata
+
+        update_decode_graph_replay_metadata(
+            req_to_token=req_to_token,
+            req_pool_indices=req_pool_indices,
+            page_table=self.page_table,
+            cache_seqlens=self.cache_seqlens,
+            request_indices=self.request_indices,
+            merge_indptr=self.merge_indptr,
+            o_indptr=self.o_indptr,
+            block_valid_mask=self.block_valid_mask,
+            kv_chunk_size_ptr=self.kv_chunk_size_ptr,
+            decode_chunk_pages_lut=self._decode_graph_chunk_pages_lut,
+            page_size=self.page_size,
+        )
+        return self
 
     @torch._dynamo.disable
     def run(
@@ -605,6 +735,30 @@ class PagedAttentionWorkspace:
         else:
             self.tmp_output = None
             self.tmp_lse = None
+
+    def _validate_decode_graph_replay_capacity(
+        self,
+        *,
+        batch: int,
+    ) -> None:
+        if self._decode_graph_max_chunks_per_req is None:
+            raise RuntimeError("decode graph replay policy has not been prepared")
+        if self.request_indices is None:
+            raise RuntimeError("decode graph workspace is missing request indices")
+        if batch <= 0:
+            raise ValueError("decode graph replay requires bs > 0")
+        work_items_capacity = int(self.request_indices.shape[0])
+        if work_items_capacity % batch != 0:
+            raise RuntimeError(
+                "decode graph workspace request_indices shape is incompatible with the batch bucket"
+            )
+        max_chunks_per_req = work_items_capacity // batch
+        if max_chunks_per_req <= 0:
+            raise RuntimeError("decode graph workspace must allocate at least one chunk per request")
+        if self._decode_graph_max_chunks_per_req > max_chunks_per_req:
+            raise RuntimeError(
+                "decode graph workspace capacity is too small for the current chunking policy"
+            )
 
     def _copy_runtime_metadata(
         self,

@@ -159,6 +159,76 @@ def test_paged_fp8_auto_chunk_heuristic_uses_larger_decode_chunks() -> None:
     assert plan.split_kv is True
 
 
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_paged_short_extend_plan_uses_cta_tile_q_16(
+    kv_dtype: torch.dtype,
+) -> None:
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+        q_seqlens=[4],
+        cache_seqlens=[4096],
+        kv_dtype=kv_dtype,
+    )
+    plan = create_paged_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+    )
+
+    assert plan.mode == "extend"
+    assert plan.cta_tile_q == 16
+    assert plan.split_kv is False
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_paged_verify_plan_uses_decode_style_split_kv(
+    kv_dtype: torch.dtype,
+) -> None:
+    kv_key = "bf16" if kv_dtype == torch.bfloat16 else "fp8_e4m3fn"
+    register_decode_graph_policy(
+        kv_dtype=kv_key,
+        regime="decode",
+        batch=1,
+        graph_ctas_per_sm=5,
+        page_size=64,
+        chunk_ladder=((64, 7), (4096, 11)),
+    )
+    register_decode_graph_policy(
+        kv_dtype=kv_key,
+        regime="decode",
+        batch=4,
+        graph_ctas_per_sm=9,
+        page_size=64,
+        chunk_ladder=((64, 13), (4096, 17)),
+    )
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+        q_seqlens=[4],
+        cache_seqlens=[4096],
+        kv_dtype=kv_dtype,
+    )
+    plan = create_paged_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        mode="verify",
+        enable_cuda_graph=True,
+        graph_chunk_policy=True,
+    )
+
+    assert plan.mode == "verify"
+    assert plan.cta_tile_q == 16
+    assert plan.split_kv is True
+    assert plan.kv_chunk_size == 13 * 64
+    assert plan.graph_ctas_per_sm == 9
+    assert plan.total_num_partial_rows > 0
+    assert plan.new_batch_size > 2
+
+
 def test_paged_plan_disables_split_kv_when_merge_backend_is_unsupported() -> None:
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[6] * 8,
