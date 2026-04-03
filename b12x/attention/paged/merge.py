@@ -93,7 +93,10 @@ def default_paged_persistent_ctas(
     # Match FlashInfer's persistent merge launch shape more closely: size the
     # resident grid by useful blocks-per-SM rather than pinning it to 1 CTA/SM.
     blocks_per_sm = min(3, _ceil_div(total_work, num_sms))
-    return int(num_sms * max(blocks_per_sm, 1))
+    persistent_ctas = int(num_sms * max(blocks_per_sm, 1))
+    if int(total_rows) == 8:
+        return int(min(persistent_ctas, total_work))
+    return persistent_ctas
 
 
 @cute.jit
