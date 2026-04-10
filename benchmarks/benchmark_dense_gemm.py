@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Benchmark: b12x dense_gemm vs FlashInfer mm_fp4 (cuDNN and CUTLASS backends).
+"""Benchmark: b12x dense_gemm vs FlashInfer-CUTLASS with CUDA graph replay.
 
-Compares block-scaled FP4 dense GEMM performance on realistic Qwen3.5-397B
-(TP=4) shapes: attention projections, shared expert MLP, at decode batch
-sizes 1, 2, 4, 8.
+Compares block-scaled FP4 dense GEMM performance on GLM-5.1 layer-0 dense MLP
+shapes assuming TP=8, across realistic logical serving batch sizes.
 
 Note: M and N must be multiples of 128 for our kernel's tile constraints,
 so shapes are padded up accordingly.
@@ -12,6 +11,7 @@ so shapes are padded up accordingly.
 from __future__ import annotations
 
 import argparse
+import math
 import pathlib
 import statistics
 import sys
@@ -20,12 +20,12 @@ from typing import Callable, List
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
+import torch.nn.functional as F
 
 from b12x.cute.fp4 import quantize_grouped_nvfp4_torch
 from b12x.cute.utils import convert_sf_from_mma_layout
 from b12x.gemm.dense import dense_gemm
 
-from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
 from flashinfer.gemm import mm_fp4
 
 
@@ -33,32 +33,34 @@ def _align128(x: int) -> int:
     return ((x + 127) // 128) * 128
 
 
-# Qwen3.5-397B at TP=4 — all non-MoE GEMMs
-# Shape: (M, N, K) where M=batch tokens, padded to 128-multiples
-#
-# Linear attention (45/60 layers):
-#   QKV: [M, 4096] x [4096, 4608] -> Q=8x256 + K=4x128 + V=16x128
-#   O:   [M, 2048] x [2048, 4096]
-#
-# Full attention (15/60 layers):
-#   QKV: [M, 4096] x [4096, 3072] -> Q=8x256 + KV=2x2x256
-#   O:   [M, 2048] x [2048, 4096]
-#
-# Shared expert MLP (60/60 layers):
-#   FC1 gate+up: [M, 4096] x [4096, 512]
-#   FC2 down:    [M, 256]  x [256, 4096]
+# GLM-5.1 layer 0 is a dense SwiGLU MLP before the routed-MoE stack begins.
+# At TP=8, gate/up shard the intermediate dimension and down consumes that
+# shard on input:
+#   gate/up: [M, 6144] x [6144, 1536]
+#   down:    [M, 1536] x [1536, 6144]
+GLM5_HIDDEN_SIZE = 6144
+GLM5_INTERMEDIATE_SIZE = 12288
+GLM5_TP_SIZE = 8
+GLM5_INTERMEDIATE_TP = GLM5_INTERMEDIATE_SIZE // GLM5_TP_SIZE
 
 GEMM_SPECS = [
-    # (name, K, N, layers_per_60)
-    ("Linear attn QKV", 4096, 4608, 45),
-    ("Linear attn O",   2048, 4096, 45),
-    ("Full attn QKV",   4096, 3072, 15),
-    ("Full attn O",     2048, 4096, 15),
-    ("Shared expert FC1 gate+up", 4096, 512, 60),
-    ("Shared expert FC2 down",    256, 4096, 60),
+    # (name, K, N, note)
+    ("GLM5 dense MLP gate/up", GLM5_HIDDEN_SIZE, GLM5_INTERMEDIATE_TP, "x2 per layer"),
+    ("GLM5 dense MLP down", GLM5_INTERMEDIATE_TP, GLM5_HIDDEN_SIZE, "x1 per layer"),
 ]
 
-BATCH_SIZES = [1, 2, 4, 8]
+BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
+REFERENCE_BACKEND = "cutlass"
+REFERENCE_LABEL = "FlashInfer CUTLASS"
+COSINE_THRESHOLD = 0.999999
+
+
+class BenchmarkAbort(RuntimeError):
+    """Fatal benchmark failure that should stop the run without a summary."""
+
+
+class CorrectnessError(BenchmarkAbort):
+    """Raised when replay outputs fail the correctness gate."""
 
 
 def bench_events(fn: Callable[[], None], *, warmup: int, iters: int) -> List[float]:
@@ -81,6 +83,62 @@ def fmt_us(times_ms: List[float]) -> str:
     return f"{med:7.1f} us (min {mn:.1f})"
 
 
+def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
+    a_f = a.to(torch.float32).reshape(-1)
+    b_f = b.to(torch.float32).reshape(-1)
+    return F.cosine_similarity(a_f, b_f, dim=0).item()
+
+
+def check_outputs(
+    candidate: torch.Tensor,
+    reference: torch.Tensor,
+    *,
+    label: str,
+    cosine_threshold: float,
+) -> None:
+    cand_finite = bool(torch.isfinite(candidate).all().item())
+    ref_finite = bool(torch.isfinite(reference).all().item())
+    if not cand_finite or not ref_finite:
+        raise CorrectnessError(
+            f"non-finite output detected during correctness check vs {label}: "
+            f"candidate_finite={cand_finite}, reference_finite={ref_finite}"
+        )
+    diff = (candidate.float() - reference.float()).abs()
+    max_abs = diff.max().item()
+    rmse = diff.square().mean().sqrt().item()
+    cos = cosine_similarity(candidate, reference)
+    print(
+        f"    check vs {label}: max_abs={max_abs:.8f} "
+        f"rmse={rmse:.8f} cos={cos:.10f}"
+    )
+    if not math.isfinite(cos):
+        raise CorrectnessError(
+            f"cosine similarity vs {label} is non-finite: "
+            f"max_abs={max_abs:.8f}, rmse={rmse:.8f}, cos={cos}"
+        )
+    if cos < cosine_threshold:
+        raise CorrectnessError(
+            f"cosine similarity vs {label} fell below threshold "
+            f"{cosine_threshold:.6f}: got {cos:.10f}"
+        )
+
+
+def capture_graph_replay(fn: Callable[[], None]) -> Callable[[], None]:
+    # Warm eager launch state before capture so compile/cache work does not leak
+    # into the replay measurement.
+    for _ in range(3):
+        fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn()
+
+    def replay(g: torch.cuda.CUDAGraph = graph) -> None:
+        g.replay()
+
+    return replay
+
+
 def make_quantized_operand(M: int, K: int):
     source = torch.randn(1, M, K, device="cuda", dtype=torch.bfloat16) / 4
     row_counts = torch.full((1,), M, dtype=torch.int32, device="cuda")
@@ -93,8 +151,16 @@ def make_quantized_operand(M: int, K: int):
     return packed, scales, global_scale
 
 
-def bench_one(M: int, N: int, K: int, *, warmup: int, iters: int):
-    """Benchmark one (M,N,K) problem. Returns (b12x_med, cudnn_med, cutlass_med) in us."""
+def bench_one(
+    M: int,
+    N: int,
+    K: int,
+    *,
+    warmup: int,
+    iters: int,
+    check: bool,
+):
+    """Benchmark one (M,N,K) problem with CUDA graph replay timing."""
     torch.manual_seed(42)
     a_packed, a_sf, a_gs = make_quantized_operand(M, K)
     b_packed, b_sf, b_gs = make_quantized_operand(N, K)
@@ -109,47 +175,54 @@ def bench_one(M: int, N: int, K: int, *, warmup: int, iters: int):
 
     # b12x
     try:
-        b12x_out = [None]
+        b12x_out = torch.empty((M, N, 1), device="cuda", dtype=torch.bfloat16)
 
         def b12x_launch():
-            b12x_out[0] = dense_gemm(
+            dense_gemm(
                 (a_packed, a_sf), (b_packed, b_sf), alpha=alpha,
                 ab_dtype="float4_e2m1fn", sf_dtype="float8_e4m3fn",
-                c_dtype="bfloat16", sf_vec_size=16,
+                c_dtype="bfloat16", sf_vec_size=16, out=b12x_out,
             )
-        b12x_launch()
-        results["b12x"] = bench_events(b12x_launch, warmup=warmup, iters=iters)
+        b12x_replay = capture_graph_replay(b12x_launch)
+        results["b12x_replay"] = b12x_replay
+        results["b12x_out"] = b12x_out
+        results["b12x"] = bench_events(b12x_replay, warmup=warmup, iters=iters)
     except Exception as exc:
         results["b12x"] = None
         print(f"      b12x FAILED: {exc}")
 
-    # cuDNN
+    # FlashInfer CUTLASS reference
     try:
-        def cudnn_launch():
-            return mm_fp4(
-                a_fp4_2d, b_fp4_2d.T, a_sf_2d, b_sf_2d.T,
-                alpha, torch.bfloat16, block_size=16,
-                use_8x4_sf_layout=False, backend="cudnn", use_nvfp4=True,
-            )
-        cudnn_launch()
-        results["cuDNN"] = bench_events(cudnn_launch, warmup=warmup, iters=iters)
-    except Exception as exc:
-        results["cuDNN"] = None
-        print(f"      cuDNN FAILED: {exc}")
+        ref_out = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
 
-    # CUTLASS
-    try:
         def cutlass_launch():
-            return mm_fp4(
+            mm_fp4(
                 a_fp4_2d, b_fp4_2d.T, a_sf_2d, b_sf_2d.T,
-                alpha, torch.bfloat16, block_size=16,
-                use_8x4_sf_layout=False, backend="cutlass", use_nvfp4=True,
+                alpha, torch.bfloat16, ref_out, block_size=16,
+                use_8x4_sf_layout=False, backend=REFERENCE_BACKEND, use_nvfp4=True,
             )
-        cutlass_launch()
-        results["CUTLASS"] = bench_events(cutlass_launch, warmup=warmup, iters=iters)
+        ref_replay = capture_graph_replay(cutlass_launch)
+        results["ref_replay"] = ref_replay
+        results["ref_out"] = ref_out
+        results[REFERENCE_LABEL] = bench_events(ref_replay, warmup=warmup, iters=iters)
     except Exception as exc:
-        results["CUTLASS"] = None
-        print(f"      CUTLASS FAILED: {exc}")
+        results[REFERENCE_LABEL] = None
+        print(f"      {REFERENCE_LABEL} FAILED: {exc}")
+
+    if check:
+        if results.get("b12x_replay") is None or results.get("ref_replay") is None:
+            raise BenchmarkAbort(
+                "correctness check requires both b12x and reference replays"
+            )
+        results["b12x_replay"]()
+        results["ref_replay"]()
+        torch.cuda.synchronize()
+        check_outputs(
+            results["b12x_out"][:, :, 0],
+            results["ref_out"],
+            label=REFERENCE_LABEL,
+            cosine_threshold=COSINE_THRESHOLD,
+        )
 
     return results
 
@@ -159,63 +232,87 @@ def main():
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=BATCH_SIZES)
+    parser.set_defaults(check=True)
+    parser.add_argument(
+        "--check",
+        dest="check",
+        action="store_true",
+        help="Run correctness checks against FlashInfer CUTLASS and fail hard when cosine similarity falls below the threshold (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-check",
+        dest="check",
+        action="store_false",
+        help="Disable correctness checks before timing.",
+    )
     args = parser.parse_args()
 
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) != (12, 0):
         raise RuntimeError(f"Requires sm_120, got sm_{major}{minor}")
-    if not CUDNN_AVAILABLE:
-        raise RuntimeError("cuDNN Python bindings not installed")
     torch.empty(1, device="cuda")
 
-    print("Dense FP4 GEMM: b12x vs cuDNN vs CUTLASS")
-    print("Qwen3.5-397B shapes at TP=4")
+    print(f"Dense FP4 GEMM: b12x vs {REFERENCE_LABEL}")
+    print(f"GLM-5.1 layer-0 dense MLP shapes at TP={GLM5_TP_SIZE}")
+    print("Timing mode: CUDA graph replay")
+    if args.check:
+        print(f"Correctness check: on (cos >= {COSINE_THRESHOLD:.6f})")
+    else:
+        print("Correctness check: off")
     print(f"warmup={args.warmup}, iters={args.iters}")
     print()
 
     # Collect all results for summary
-    all_results = []  # (name, bs, M, N, K, b12x_med, cudnn_med, cutlass_med)
+    all_results = []  # (name, bs, M, N, K, b12x_med, ref_med)
 
-    for name, K, N_raw, layers in GEMM_SPECS:
+    for name, K, N_raw, note in GEMM_SPECS:
         N = _align128(N_raw)
         pad_note = f" (padded from {N_raw})" if N != N_raw else ""
         print(f"{'=' * 75}")
-        print(f"  {name}  K={K} N={N}{pad_note}  [{layers}/60 layers]")
+        print(f"  {name}  K={K} N={N}{pad_note}  [{note}]")
         print(f"{'=' * 75}")
 
         for bs in args.batch_sizes:
             M = _align128(bs)
-            results = bench_one(M, N, K, warmup=args.warmup, iters=args.iters)
+            try:
+                results = bench_one(
+                    M,
+                    N,
+                    K,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                    check=args.check,
+                )
+            except BenchmarkAbort as exc:
+                print(
+                    f"ERROR: benchmark aborted for {name} "
+                    f"(bs={bs}, M={M}, N={N}, K={K}): {exc}",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
 
             b12x_med = statistics.median(results["b12x"]) * 1000 if results.get("b12x") else None
-            cudnn_med = statistics.median(results["cuDNN"]) * 1000 if results.get("cuDNN") else None
-            cutlass_med = statistics.median(results["CUTLASS"]) * 1000 if results.get("CUTLASS") else None
+            ref_med = statistics.median(results[REFERENCE_LABEL]) * 1000 if results.get(REFERENCE_LABEL) else None
 
             parts = [f"  bs={bs:<3} (M={M:>4})"]
             if b12x_med is not None:
                 parts.append(f"b12x={b12x_med:6.1f}")
-            if cudnn_med is not None:
-                parts.append(f"cuDNN={cudnn_med:6.1f}")
-            if cutlass_med is not None:
-                parts.append(f"CUTLASS={cutlass_med:6.1f}")
+            if ref_med is not None:
+                parts.append(f"CUTLASS={ref_med:6.1f}")
 
             ratios = []
-            if b12x_med and cudnn_med:
-                r = b12x_med / cudnn_med
-                ratios.append(f"b12x/cuDNN={r:.2f}x")
-            if b12x_med and cutlass_med:
-                r = b12x_med / cutlass_med
-                ratios.append(f"b12x/CUTLASS={r:.2f}x")
+            if b12x_med and ref_med:
+                r = b12x_med / ref_med
+                ratios.append(f"b12x/flashinfer-cutlass={r:.2f}x")
 
-            print("  ".join(parts) + "  " + "  ".join(ratios) + "  (us)")
+            print("  ".join(parts) + "  " + "  ".join(ratios) + "  (graph us)")
 
-            all_results.append((name, bs, M, N, K, b12x_med, cudnn_med, cutlass_med))
+            all_results.append((name, bs, M, N, K, b12x_med, ref_med))
 
         print()
 
-    # --- Summary tables ---
     print(f"\n{'=' * 75}")
-    print("  SUMMARY: b12x / cuDNN (lower = b12x faster)")
+    print(f"  SUMMARY: b12x / {REFERENCE_LABEL} (CUDA graph replay, lower = b12x faster)")
     print(f"{'=' * 75}")
     header = f"  {'GEMM':<30}"
     for bs in args.batch_sizes:
@@ -223,8 +320,8 @@ def main():
     print(header)
     print("  " + "-" * 70)
 
-    cudnn_ratios = []
-    for name, K, N_raw, layers in GEMM_SPECS:
+    ref_ratios = []
+    for name, K, N_raw, note in GEMM_SPECS:
         N = _align128(N_raw)
         row = f"  {name:<30}"
         for bs in args.batch_sizes:
@@ -233,44 +330,16 @@ def main():
             if match and match[0][5] and match[0][6]:
                 ratio = match[0][5] / match[0][6]
                 row += f"  {ratio:.2f}x "
-                cudnn_ratios.append(ratio)
+                ref_ratios.append(ratio)
             else:
                 row += f"  {'n/a':>6}"
         print(row)
 
-    if cudnn_ratios:
+    if ref_ratios:
         geo = 1.0
-        for r in cudnn_ratios:
+        for r in ref_ratios:
             geo *= r
-        geo **= 1.0 / len(cudnn_ratios)
-        print(f"\n  geo mean: {geo:.2f}x")
-
-    print(f"\n{'=' * 75}")
-    print("  SUMMARY: b12x / CUTLASS (lower = b12x faster)")
-    print(f"{'=' * 75}")
-    print(header)
-    print("  " + "-" * 70)
-
-    cutlass_ratios = []
-    for name, K, N_raw, layers in GEMM_SPECS:
-        N = _align128(N_raw)
-        row = f"  {name:<30}"
-        for bs in args.batch_sizes:
-            M = _align128(bs)
-            match = [r for r in all_results if r[0] == name and r[1] == bs]
-            if match and match[0][5] and match[0][7]:
-                ratio = match[0][5] / match[0][7]
-                row += f"  {ratio:.2f}x "
-                cutlass_ratios.append(ratio)
-            else:
-                row += f"  {'n/a':>6}"
-        print(row)
-
-    if cutlass_ratios:
-        geo = 1.0
-        for r in cutlass_ratios:
-            geo *= r
-        geo **= 1.0 / len(cutlass_ratios)
+        geo **= 1.0 / len(ref_ratios)
         print(f"\n  geo mean: {geo:.2f}x")
 
 

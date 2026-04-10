@@ -104,7 +104,7 @@ its own SM120-first implementation and does not depend on FlashInfer at runtime.
     - stage 1 picks `graph_ctas_per_sm` for a specific batch size
     - stage 2 fills the dense per-page chunk table for that same batch size
 - `benchmarks/benchmark_dense_gemm.py`
-  - Dense FP4 GEMM vs FlashInfer/cuDNN/CUTLASS
+  - Dense FP4 GEMM vs FlashInfer CUTLASS with CUDA graph replay on GLM-5.1 dense MLP TP=8 shapes
 - `benchmarks/benchmark_mxfp8_pv.py`
   - MXFP8 PV microbenchmark (turbo mode throughput)
 
