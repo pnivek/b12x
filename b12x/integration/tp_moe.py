@@ -184,6 +184,7 @@ _DYNAMIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 _MAC_CACHE: Dict[Tuple[int, str], int] = {}  # (device_idx, impl) → max_active_clusters
 _PLAIN_PARAM_CACHE: Dict[Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtype, torch.dtype, int], torch.Tensor] = {}
 _MICRO_COMPACT_CUTOVER_PAIRS_DEFAULT = 20
+_MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK_DEFAULT = 40
 _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
 _MICRO_COMPACT_CUTOVER_PAIRS_CACHE: int | None = None
 _STATIC_COMPACT_CUTOVER_PAIRS_CACHE: int | None = None
@@ -1087,6 +1088,17 @@ def _get_impl_mac(impl: str, *, routed_rows: int | None = None) -> int:
     return mac
 
 
+def _select_micro_mma_tiler_mn(max_rows: int, n: int) -> tuple[int, int]:
+    sm_count = get_num_sm(torch.device("cuda"))
+    coarse_tile = (128, 128)
+    coarse_tiles = ((max_rows + coarse_tile[0] - 1) // coarse_tile[0]) * (
+        (n + coarse_tile[1] - 1) // coarse_tile[1]
+    )
+    if max_rows <= 128 and coarse_tiles < max(1, sm_count // 2):
+        return (64, 128)
+    return (128, 128)
+
+
 def _get_static_kernel(
     state_E: int,
     weight_E: int,
@@ -1103,10 +1115,13 @@ def _get_static_kernel(
 ):
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("static")
+    mma_tiler_mn = (128, 128)
+    if num_topk > 1:
+        mma_tiler_mn = _select_micro_mma_tiler_mn(max_rows, n)
 
     global _LAST_KERNEL
     cache_key = (
-        "static", state_E, weight_E, m, k, n, num_topk, max_rows, mac, topk_ids_dtype,
+        "static", state_E, weight_E, m, k, n, num_topk, max_rows, mac, mma_tiler_mn, topk_ids_dtype,
         input_scales_are_reciprocal, fast_math,
     )
     last_kkey, last_kval = _LAST_KERNEL
@@ -1127,8 +1142,8 @@ def _get_static_kernel(
 
     kernel = MoEStaticKernel(
         sf_vec_size=sf_vec_size,
-        mma_tiler_mn=(128, 128),
-        output_tile_count_n=max(1, (n + 128 - 1) // 128),
+        mma_tiler_mn=mma_tiler_mn,
+        output_tile_count_n=max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1]),
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
     )
@@ -1241,10 +1256,11 @@ def _get_micro_kernel(
 ):
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("micro")
+    mma_tiler_mn = _select_micro_mma_tiler_mn(max_rows, n)
 
     global _LAST_KERNEL
     cache_key = (
-        "micro", state_E, weight_E, m, k, n, num_topk, max_rows, mac, topk_ids_dtype,
+        "micro", state_E, weight_E, m, k, n, num_topk, max_rows, mac, mma_tiler_mn, topk_ids_dtype,
         input_scales_are_reciprocal, fast_math,
     )
     last_kkey, last_kval = _LAST_KERNEL
@@ -1264,8 +1280,8 @@ def _get_micro_kernel(
 
     kernel = MoEMicroKernel(
         sf_vec_size=sf_vec_size,
-        mma_tiler_mn=(128, 128),
-        output_tile_count_n=max(1, (n + 128 - 1) // 128),
+        mma_tiler_mn=mma_tiler_mn,
+        output_tile_count_n=max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1]),
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
     )
@@ -1704,7 +1720,13 @@ def _launch_compact_static(
     fast_math: bool,
     stream,
 ) -> None:
-    use_micro = routed_rows <= _get_micro_compact_cutover_pairs()
+    micro_cutover_pairs = _get_micro_compact_cutover_pairs()
+    if (
+        micro_cutover_pairs == _MICRO_COMPACT_CUTOVER_PAIRS_DEFAULT
+        and num_topk > 1
+    ):
+        micro_cutover_pairs = _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK_DEFAULT
+    use_micro = routed_rows <= micro_cutover_pairs
     static_mac = _get_impl_mac("static", routed_rows=routed_rows)
     if not use_micro and routed_rows < 40:
         # Tiny compact launches have very little FC2 tile work, so capping
