@@ -1,11 +1,11 @@
 [project]
 name = "b12x"
-version = "0.7.2"
+version = "0.8.1"
 description = "Unapologetically SM120-only CuTe DSL kernels for NVFP4 GEMM and MoE."
 readme = "README.md"
 requires-python = ">=3.10,<4.0"
 authors = [{ name = "Luke" }]
-license = "Apache-2.0"
+license = { text = "Apache-2.0" }
 dependencies = [
   "torch>=2.10.0",
   "cuda-python",
@@ -33,6 +33,9 @@ b12x-serve = "serve.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["b12x*", "serve*"]
+
+[tool.setuptools.package-data]
+"b12x.attention.paged.tuning" = ["*.decode.bs*.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "B", "SIM"]
