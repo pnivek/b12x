@@ -1089,6 +1089,8 @@ def _get_impl_mac(impl: str, *, routed_rows: int | None = None) -> int:
 
 
 def _select_micro_mma_tiler_mn(max_rows: int, n: int) -> tuple[int, int]:
+    if os.environ.get("B12X_MOE_TILE_MN"):
+        return tuple(int(x) for x in os.environ["B12X_MOE_TILE_MN"].split("x"))
     sm_count = get_num_sm(torch.device("cuda"))
     coarse_tile = (128, 128)
     coarse_tiles = ((max_rows + coarse_tile[0] - 1) // coarse_tile[0]) * (
