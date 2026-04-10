@@ -5,6 +5,23 @@ from .attention import (
     infer_paged_attention_mode,
     paged_attention_forward,
 )
+from .mla import (
+    MLASparseDecodeMetadata,
+    MLASparseExtendMetadata,
+    MLAWorkspace,
+    clear_mla_caches,
+    sparse_mla_decode_forward,
+    sparse_mla_extend_forward,
+)
+from .nsa_indexer import (
+    NSAIndexerDecodeMetadata,
+    NSAIndexerExtendMetadata,
+    clear_nsa_indexer_caches,
+    pack_nsa_index_k_cache_reference,
+    sparse_nsa_index_decode_topk,
+    sparse_nsa_index_extend_topk,
+    unpack_nsa_index_k_cache_reference,
+)
 from .tp_moe import (
     B12XFP4ExpertWeights,
     B12XTopKRouting,
@@ -19,6 +36,19 @@ __all__ = [
     "create_paged_plan",
     "infer_paged_attention_mode",
     "paged_attention_forward",
+    "MLAWorkspace",
+    "MLASparseDecodeMetadata",
+    "MLASparseExtendMetadata",
+    "clear_mla_caches",
+    "sparse_mla_decode_forward",
+    "sparse_mla_extend_forward",
+    "NSAIndexerDecodeMetadata",
+    "NSAIndexerExtendMetadata",
+    "clear_nsa_indexer_caches",
+    "pack_nsa_index_k_cache_reference",
+    "sparse_nsa_index_decode_topk",
+    "sparse_nsa_index_extend_topk",
+    "unpack_nsa_index_k_cache_reference",
     "B12XFP4ExpertWeights",
     "B12XTopKRouting",
     "b12x_moe_fp4",
