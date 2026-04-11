@@ -1261,16 +1261,35 @@ def mxfp8_mma_m16n8k32_f32_e4m3(
     b1: Uint32,
     sfa: Uint32,
     sfb: Uint32,
+    bid_a: int = 0,
+    tid_a: int = 0,
+    bid_b: int = 0,
+    tid_b: int = 0,
     *,
     loc=None,
     ip=None,
 ) -> Tuple[Float32, Float32, Float32, Float32]:
     """Warp MMA helper for SM120 MXFP8 block-scaled `m16n8k32` E4M3/E4M3."""
     i16_ty = cutlass._mlir.ir.IntegerType.get_signless(16)
-    zero_i16 = cutlass._mlir.ir.Operation.create(
+    bid_a_i16 = cutlass._mlir.ir.Operation.create(
         "llvm.mlir.constant",
         results=[i16_ty],
-        attributes={"value": cutlass._mlir.ir.IntegerAttr.get(i16_ty, 0)},
+        attributes={"value": cutlass._mlir.ir.IntegerAttr.get(i16_ty, int(bid_a))},
+    ).result
+    tid_a_i16 = cutlass._mlir.ir.Operation.create(
+        "llvm.mlir.constant",
+        results=[i16_ty],
+        attributes={"value": cutlass._mlir.ir.IntegerAttr.get(i16_ty, int(tid_a))},
+    ).result
+    bid_b_i16 = cutlass._mlir.ir.Operation.create(
+        "llvm.mlir.constant",
+        results=[i16_ty],
+        attributes={"value": cutlass._mlir.ir.IntegerAttr.get(i16_ty, int(bid_b))},
+    ).result
+    tid_b_i16 = cutlass._mlir.ir.Operation.create(
+        "llvm.mlir.constant",
+        results=[i16_ty],
+        attributes={"value": cutlass._mlir.ir.IntegerAttr.get(i16_ty, int(tid_b))},
     ).result
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
@@ -1282,18 +1301,18 @@ def mxfp8_mma_m16n8k32_f32_e4m3(
             Uint32(b0).ir_value(loc=loc, ip=ip),
             Uint32(b1).ir_value(loc=loc, ip=ip),
             Uint32(sfa).ir_value(loc=loc, ip=ip),
-            zero_i16,
-            zero_i16,
+            bid_a_i16,
+            tid_a_i16,
             Uint32(sfb).ir_value(loc=loc, ip=ip),
-            zero_i16,
-            zero_i16,
+            bid_b_i16,
+            tid_b_i16,
             Float32(d0).ir_value(loc=loc, ip=ip),
             Float32(d1).ir_value(loc=loc, ip=ip),
             Float32(d2).ir_value(loc=loc, ip=ip),
             Float32(d3).ir_value(loc=loc, ip=ip),
         ],
         """
-        mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.f32.e4m3.e4m3.f32.ue8m0
+        mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0
         {$0, $1, $2, $3},
         {$4, $5, $6, $7},
         {$8, $9},

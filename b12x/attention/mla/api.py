@@ -14,6 +14,11 @@ from .kernel import (
     supports_sparse_mla_kernel,
 )
 from .reference import sparse_mla_reference
+from .split import (
+    clear_sparse_mla_split_kernel_cache,
+    run_sparse_mla_split_decode,
+    select_sparse_mla_split_decode_config,
+)
 from .workspace import MLAWorkspace
 
 
@@ -40,6 +45,11 @@ class MLASparseExtendMetadata:
 def clear_mla_caches() -> None:
     """Clear any cached MLA runtime state."""
     clear_sparse_mla_kernel_cache()
+    clear_sparse_mla_split_kernel_cache()
+
+
+def _is_cuda_graph_capture_active(device: torch.device) -> bool:
+    return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
 
 
 def sparse_mla_decode_forward(
@@ -149,25 +159,51 @@ def _run_sparse_mla(
         )
 
     use_reference = os.environ.get("B12X_MLA_FORCE_REFERENCE", "0") == "1"
-    if not use_reference and supports_sparse_mla_kernel(
+    sm_scale_tensor = _get_sm_scale_tensor(workspace=workspace, device=q_all.device, sm_scale=sm_scale)
+    split_cfg = None
+    if not use_reference and workspace.mode == "decode":
+        split_cfg = select_sparse_mla_split_decode_config(
+            q_all=q_all,
+            kv_cache=kv_cache,
+            page_table_1=page_table_1,
+            output_dtype=q_all.dtype,
+            v_head_dim=v_head_dim,
+        )
+    if split_cfg is not None:
+        if workspace.tmp_output is None or workspace.tmp_lse is None:
+            raise RuntimeError("decode workspace is missing split MLA buffers")
+        workspace.set_decode_chunk_config(
+            kv_chunk_size=split_cfg.chunk_size,
+            num_chunks=split_cfg.num_chunks,
+        )
+        launch_num_chunks = (
+            workspace.max_chunks_per_row if (workspace.fixed_capacity or workspace.use_cuda_graph) else split_cfg.num_chunks
+        )
+        output = torch.empty(
+            (q_all.shape[0], q_all.shape[1], v_head_dim),
+            dtype=q_all.dtype,
+            device=q_all.device,
+        )
+        assert workspace.kv_chunk_size_ptr is not None
+        assert workspace.num_chunks_ptr is not None
+        run_sparse_mla_split_decode(
+            q_all=q_all,
+            kv_cache=kv_cache,
+            page_table_1=page_table_1,
+            sm_scale=sm_scale_tensor,
+            kv_chunk_size_ptr=workspace.kv_chunk_size_ptr,
+            num_chunks_ptr=workspace.num_chunks_ptr,
+            tmp_output=workspace.tmp_output,
+            tmp_lse=workspace.tmp_lse,
+            output=output,
+            launch_num_chunks=launch_num_chunks,
+        )
+    elif not use_reference and supports_sparse_mla_kernel(
         q_all=q_all,
         kv_cache=kv_cache,
         page_table_1=page_table_1,
         v_head_dim=v_head_dim,
     ):
-        sm_scale_tensor = workspace.sm_scale_tensor
-        if (
-            sm_scale_tensor is None
-            or sm_scale_tensor.device != q_all.device
-            or sm_scale_tensor.dtype != torch.float32
-        ):
-            sm_scale_tensor = torch.empty((1,), dtype=torch.float32, device=q_all.device)
-            workspace.sm_scale_tensor = sm_scale_tensor
-            workspace.sm_scale_value = None
-        sm_scale_value = float(sm_scale)
-        if workspace.sm_scale_value != sm_scale_value:
-            sm_scale_tensor[0] = sm_scale_value
-            workspace.sm_scale_value = sm_scale_value
         output = torch.empty(
             (q_all.shape[0], q_all.shape[1], v_head_dim),
             dtype=q_all.dtype,
@@ -181,6 +217,11 @@ def _run_sparse_mla(
             output=output,
         )
     else:
+        if _is_cuda_graph_capture_active(q_all.device):
+            raise RuntimeError(
+                "b12x MLA fell back to the PyTorch reference during CUDA graph capture; "
+                "the current q/kv/page-table contract is not supported by the compiled kernel path"
+            )
         output = sparse_mla_reference(
             q_all=q_all,
             kv_cache=kv_cache,
@@ -189,3 +230,25 @@ def _run_sparse_mla(
             v_head_dim=v_head_dim,
         )
     return output
+
+
+def _get_sm_scale_tensor(
+    *,
+    workspace: MLAWorkspace,
+    device: torch.device,
+    sm_scale: float,
+) -> torch.Tensor:
+    sm_scale_tensor = workspace.sm_scale_tensor
+    if (
+        sm_scale_tensor is None
+        or sm_scale_tensor.device != device
+        or sm_scale_tensor.dtype != torch.float32
+    ):
+        sm_scale_tensor = torch.empty((1,), dtype=torch.float32, device=device)
+        workspace.sm_scale_tensor = sm_scale_tensor
+        workspace.sm_scale_value = None
+    sm_scale_value = float(sm_scale)
+    if workspace.sm_scale_value != sm_scale_value:
+        sm_scale_tensor[0] = sm_scale_value
+        workspace.sm_scale_value = sm_scale_value
+    return sm_scale_tensor

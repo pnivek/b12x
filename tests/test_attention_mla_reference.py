@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
+from b12x.attention.mla.kernel import run_sparse_mla_kernel
 from b12x.attention.mla.reference import (
     dense_mla_reference,
     pack_mla_kv_cache_reference,
@@ -20,6 +21,7 @@ from b12x.integration.mla import (
     MLASparseDecodeMetadata,
     MLASparseExtendMetadata,
     MLAWorkspace,
+    clear_mla_caches,
     sparse_mla_decode_forward,
     sparse_mla_extend_forward,
 )
@@ -216,6 +218,7 @@ def _make_workspace(
     max_batch: int,
     topk: int,
     cfg: GLMMLAConfig,
+    use_cuda_graph: bool = False,
 ) -> MLAWorkspace:
     return MLAWorkspace.for_fixed_capacity(
         mode=mode,
@@ -228,6 +231,7 @@ def _make_workspace(
         topk=topk,
         max_total_q=max_total_q,
         max_batch=max_batch,
+        use_cuda_graph=use_cuda_graph,
     )
 
 
@@ -495,6 +499,368 @@ def test_glm51_layer0_extend_api_handles_sparse_indices_and_padding() -> None:
     )
     expected = dense_mla_reference(
         q_all=q_all,
+        k_nope=k_nope,
+        k_rope=k_rope,
+        page_table_1=page_table_1,
+        sm_scale=cfg.sm_scale,
+        v_head_dim=cfg.kv_lora_rank,
+    )
+    torch.cuda.synchronize(device)
+
+    max_abs, rmse, cos = _compare(actual, expected)
+    assert max_abs <= 0.10, f"max_abs={max_abs:.6f}"
+    assert rmse <= 0.005, f"rmse={rmse:.6f}"
+    assert cos >= 0.9995, f"cos={cos:.6f}"
+
+
+@pytest.mark.parametrize("width", [129, 257, 511, 769, 1024, 1537, 2048])
+def test_glm51_layer0_decode_api_matches_dense_oracle_for_split_widths(width: int) -> None:
+    device = require_sm120()
+    _require_glm_weights()
+
+    cache_len = max(width, 2050)
+    cfg, q_all, k_nope, k_rope = _make_glm_case(
+        cache_len=cache_len,
+        q_len=1,
+        seed=47_000 + width,
+        device=device,
+    )
+    packed = pack_mla_kv_cache_reference(k_nope, k_rope)
+    page_table_1 = torch.arange(width, dtype=torch.int32, device=device).unsqueeze(0)
+    cache_seqlens = torch.tensor([cache_len], dtype=torch.int32, device=device)
+    metadata = MLASparseDecodeMetadata(
+        page_table_1=page_table_1,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=cache_seqlens,
+        max_seq_len_k=cache_len,
+    )
+    workspace = _make_workspace(
+        mode="decode",
+        device=device,
+        max_total_q=1,
+        max_batch=1,
+        topk=width,
+        cfg=cfg,
+    )
+
+    actual = sparse_mla_decode_forward(
+        q_all=q_all,
+        kv_cache=packed,
+        metadata=metadata,
+        workspace=workspace,
+        sm_scale=cfg.sm_scale,
+        v_head_dim=cfg.kv_lora_rank,
+    )
+    expected = dense_mla_reference(
+        q_all=q_all,
+        k_nope=k_nope,
+        k_rope=k_rope,
+        page_table_1=page_table_1,
+        sm_scale=cfg.sm_scale,
+        v_head_dim=cfg.kv_lora_rank,
+    )
+    torch.cuda.synchronize(device)
+
+    max_abs, rmse, cos = _compare(actual, expected)
+    assert max_abs <= 0.10, f"width={width}: max_abs={max_abs:.6f}"
+    assert rmse <= 0.005, f"width={width}: rmse={rmse:.6f}"
+    assert cos >= 0.9995, f"width={width}: cos={cos:.6f}"
+
+
+@pytest.mark.parametrize("width", [129, 257, 511, 769, 1024, 1537, 2048])
+def test_glm51_layer0_decode_api_split_handles_sparse_padding(width: int) -> None:
+    device = require_sm120()
+    _require_glm_weights()
+
+    cache_len = max(width + 17, 2050)
+    valid_per_row = max(37, width - width // 3)
+    cfg, q_all, k_nope, k_rope = _make_glm_case(
+        cache_len=cache_len,
+        q_len=1,
+        seed=48_000 + width,
+        device=device,
+    )
+    packed = pack_mla_kv_cache_reference(k_nope, k_rope)
+
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(48_000 + width)
+    valid = torch.randperm(cache_len, generator=gen, dtype=torch.int64)[:valid_per_row].to(torch.int32)
+    page_table_1 = torch.full((1, width), -1, dtype=torch.int32, device=device)
+    page_table_1[0, :valid_per_row] = valid.to(device=device)
+    cache_seqlens = torch.tensor([cache_len], dtype=torch.int32, device=device)
+    metadata = MLASparseDecodeMetadata(
+        page_table_1=page_table_1,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=cache_seqlens,
+        max_seq_len_k=cache_len,
+    )
+    workspace = _make_workspace(
+        mode="decode",
+        device=device,
+        max_total_q=1,
+        max_batch=1,
+        topk=width,
+        cfg=cfg,
+    )
+
+    actual = sparse_mla_decode_forward(
+        q_all=q_all,
+        kv_cache=packed,
+        metadata=metadata,
+        workspace=workspace,
+        sm_scale=cfg.sm_scale,
+        v_head_dim=cfg.kv_lora_rank,
+    )
+    expected = dense_mla_reference(
+        q_all=q_all,
+        k_nope=k_nope,
+        k_rope=k_rope,
+        page_table_1=page_table_1,
+        sm_scale=cfg.sm_scale,
+        v_head_dim=cfg.kv_lora_rank,
+    )
+    torch.cuda.synchronize(device)
+
+    max_abs, rmse, cos = _compare(actual, expected)
+    assert max_abs <= 0.10, f"width={width}: max_abs={max_abs:.6f}"
+    assert rmse <= 0.005, f"width={width}: rmse={rmse:.6f}"
+    assert cos >= 0.9995, f"width={width}: cos={cos:.6f}"
+
+
+@pytest.mark.parametrize("width", [129, 2048])
+def test_glm51_layer0_decode_split_api_matches_unsplit_kernel(width: int) -> None:
+    device = require_sm120()
+    _require_glm_weights()
+
+    cache_len = max(width, 2050)
+    cfg, q_all, k_nope, k_rope = _make_glm_case(
+        cache_len=cache_len,
+        q_len=1,
+        seed=49_000 + width,
+        device=device,
+    )
+    packed = pack_mla_kv_cache_reference(k_nope, k_rope)
+    page_table_1 = torch.arange(width, dtype=torch.int32, device=device).unsqueeze(0)
+    cache_seqlens = torch.tensor([cache_len], dtype=torch.int32, device=device)
+    metadata = MLASparseDecodeMetadata(
+        page_table_1=page_table_1,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=cache_seqlens,
+        max_seq_len_k=cache_len,
+    )
+    workspace = _make_workspace(
+        mode="decode",
+        device=device,
+        max_total_q=1,
+        max_batch=1,
+        topk=width,
+        cfg=cfg,
+    )
+
+    actual = sparse_mla_decode_forward(
+        q_all=q_all,
+        kv_cache=packed,
+        metadata=metadata,
+        workspace=workspace,
+        sm_scale=cfg.sm_scale,
+        v_head_dim=cfg.kv_lora_rank,
+    )
+    expected = torch.empty_like(actual)
+    sm_scale_tensor = torch.tensor([cfg.sm_scale], dtype=torch.float32, device=device)
+    run_sparse_mla_kernel(
+        q_all=q_all,
+        kv_cache=packed,
+        page_table_1=page_table_1,
+        sm_scale=sm_scale_tensor,
+        output=expected,
+    )
+    torch.cuda.synchronize(device)
+
+    max_abs, rmse, cos = _compare(actual, expected)
+    assert max_abs <= 0.10, f"width={width}: max_abs={max_abs:.6f}"
+    assert rmse <= 0.005, f"width={width}: rmse={rmse:.6f}"
+    assert cos >= 0.9995, f"width={width}: cos={cos:.6f}"
+
+
+def test_glm51_layer0_decode_split_graph_replay_handles_runtime_padding_changes() -> None:
+    device = require_sm120()
+    _require_glm_weights()
+
+    cache_len = 2050
+    width = 2048
+    replay_valid = 1537
+    cfg, q_all, k_nope, k_rope = _make_glm_case(
+        cache_len=cache_len,
+        q_len=1,
+        seed=49_537,
+        device=device,
+    )
+    packed = pack_mla_kv_cache_reference(k_nope, k_rope)
+    page_table_1 = torch.arange(width, dtype=torch.int32, device=device).unsqueeze(0)
+    cache_seqlens = torch.tensor([cache_len], dtype=torch.int32, device=device)
+    metadata = MLASparseDecodeMetadata(
+        page_table_1=page_table_1,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=cache_seqlens,
+        max_seq_len_k=cache_len,
+    )
+    workspace = _make_workspace(
+        mode="decode",
+        device=device,
+        max_total_q=1,
+        max_batch=1,
+        topk=width,
+        cfg=cfg,
+        use_cuda_graph=True,
+    )
+
+    clear_mla_caches()
+    captured_out = None
+
+    def run() -> None:
+        nonlocal captured_out
+        captured_out = sparse_mla_decode_forward(
+            q_all=q_all,
+            kv_cache=packed,
+            metadata=metadata,
+            workspace=workspace,
+            sm_scale=cfg.sm_scale,
+            v_head_dim=cfg.kv_lora_rank,
+        )
+
+    run()
+    torch.cuda.synchronize(device)
+    run()
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    torch.cuda.synchronize(device)
+
+    page_table_1[0, replay_valid:] = -1
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert captured_out is not None
+
+    expected = dense_mla_reference(
+        q_all=q_all,
+        k_nope=k_nope,
+        k_rope=k_rope,
+        page_table_1=page_table_1,
+        sm_scale=cfg.sm_scale,
+        v_head_dim=cfg.kv_lora_rank,
+    )
+
+    max_abs, rmse, cos = _compare(captured_out, expected)
+    assert max_abs <= 0.10, f"max_abs={max_abs:.6f}"
+    assert rmse <= 0.005, f"rmse={rmse:.6f}"
+    assert cos >= 0.9995, f"cos={cos:.6f}"
+
+
+def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads() -> None:
+    device = require_sm120()
+    _require_glm_weights()
+
+    cache_len = 2050
+    local_heads = 8
+    cfg, q_all, k_nope, k_rope = _make_glm_case(
+        cache_len=cache_len,
+        q_len=1,
+        seed=49_901,
+        device=device,
+    )
+    packed = pack_mla_kv_cache_reference(k_nope, k_rope)
+    q_local = q_all[:, :local_heads, :].contiguous()
+    page_table_1 = torch.arange(2048, dtype=torch.int32, device=device).unsqueeze(0)
+    cache_seqlens = torch.tensor([cache_len], dtype=torch.int32, device=device)
+    metadata = MLASparseDecodeMetadata(
+        page_table_1=page_table_1,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=cache_seqlens,
+        max_seq_len_k=cache_len,
+    )
+    workspace = MLAWorkspace.for_fixed_capacity(
+        mode="decode",
+        device=device,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.uint8,
+        num_q_heads=local_heads,
+        head_dim=cfg.kv_lora_rank + cfg.qk_rope_head_dim,
+        v_head_dim=cfg.kv_lora_rank,
+        topk=2048,
+        max_total_q=1,
+        max_batch=1,
+    )
+
+    actual = sparse_mla_decode_forward(
+        q_all=q_local,
+        kv_cache=packed,
+        metadata=metadata,
+        workspace=workspace,
+        sm_scale=cfg.sm_scale,
+        v_head_dim=cfg.kv_lora_rank,
+    )
+    expected = dense_mla_reference(
+        q_all=q_local,
+        k_nope=k_nope,
+        k_rope=k_rope,
+        page_table_1=page_table_1,
+        sm_scale=cfg.sm_scale,
+        v_head_dim=cfg.kv_lora_rank,
+    )
+    torch.cuda.synchronize(device)
+
+    max_abs, rmse, cos = _compare(actual, expected)
+    assert max_abs <= 0.10, f"max_abs={max_abs:.6f}"
+    assert rmse <= 0.005, f"rmse={rmse:.6f}"
+    assert cos >= 0.9995, f"cos={cos:.6f}"
+
+
+def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads_fp8_view_cache() -> None:
+    device = require_sm120()
+    _require_glm_weights()
+
+    cache_len = 2050
+    local_heads = 8
+    cfg, q_all, k_nope, k_rope = _make_glm_case(
+        cache_len=cache_len,
+        q_len=1,
+        seed=49_902,
+        device=device,
+    )
+    packed = pack_mla_kv_cache_reference(k_nope, k_rope).view(torch.float8_e4m3fn)
+    q_local = q_all[:, :local_heads, :].contiguous()
+    page_table_1 = torch.arange(2048, dtype=torch.int32, device=device).unsqueeze(0)
+    cache_seqlens = torch.tensor([cache_len], dtype=torch.int32, device=device)
+    metadata = MLASparseDecodeMetadata(
+        page_table_1=page_table_1,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=cache_seqlens,
+        max_seq_len_k=cache_len,
+    )
+    workspace = MLAWorkspace.for_fixed_capacity(
+        mode="decode",
+        device=device,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        num_q_heads=local_heads,
+        head_dim=cfg.kv_lora_rank + cfg.qk_rope_head_dim,
+        v_head_dim=cfg.kv_lora_rank,
+        topk=2048,
+        max_total_q=1,
+        max_batch=1,
+    )
+
+    actual = sparse_mla_decode_forward(
+        q_all=q_local,
+        kv_cache=packed,
+        metadata=metadata,
+        workspace=workspace,
+        sm_scale=cfg.sm_scale,
+        v_head_dim=cfg.kv_lora_rank,
+    )
+    expected = dense_mla_reference(
+        q_all=q_local,
         k_nope=k_nope,
         k_rope=k_rope,
         page_table_1=page_table_1,

@@ -9,7 +9,6 @@ import torch
 
 _MLA_EXACT_HEAD_DIM = 576
 _MLA_EXACT_V_HEAD_DIM = 512
-_MLA_EXACT_NUM_Q_HEADS = 64
 _MLA_EXACT_PACKED_WIDTH = 656
 _MLA_EXACT_NOPE_GROUPS = _MLA_EXACT_V_HEAD_DIM // 128
 
@@ -56,11 +55,11 @@ def select_sparse_mla_traits(
         return None
     if q_all.dtype != torch.bfloat16 or output_dtype != torch.bfloat16:
         return None
-    if kv_cache.dtype != torch.uint8:
+    if kv_cache.dtype not in (torch.uint8, torch.float8_e4m3fn, torch.float8_e4m3fnuz):
         return None
     if q_all.shape[0] != page_table_1.shape[0]:
         return None
-    if q_all.shape[1] != _MLA_EXACT_NUM_Q_HEADS:
+    if q_all.shape[1] <= 0:
         return None
     if q_all.shape[2] != _MLA_EXACT_HEAD_DIM:
         return None
@@ -78,7 +77,7 @@ def select_sparse_mla_traits(
         num_threads=heads_per_cta * 32,
         head_dim=_MLA_EXACT_HEAD_DIM,
         v_head_dim=_MLA_EXACT_V_HEAD_DIM,
-        num_q_heads=_MLA_EXACT_NUM_Q_HEADS,
+        num_q_heads=int(q_all.shape[1]),
         q_dtype=q_all.dtype,
         kv_dtype=kv_cache.dtype,
         o_dtype=output_dtype,

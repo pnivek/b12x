@@ -31,15 +31,22 @@ class MLAWorkspace:
     padded_heads: int = 128
     use_cuda_graph: bool = False
     fixed_capacity: bool = False
+    max_chunks_per_row: int = 8
     page_table_1: torch.Tensor | None = None
     cache_seqlens_int32: torch.Tensor | None = None
     nsa_cache_seqlens_int32: torch.Tensor | None = None
     page_table_1_runtime: torch.Tensor | None = None
     cache_seqlens_int32_runtime: torch.Tensor | None = None
     nsa_cache_seqlens_int32_runtime: torch.Tensor | None = None
+    tmp_output: torch.Tensor | None = None
+    tmp_lse: torch.Tensor | None = None
+    kv_chunk_size_ptr: torch.Tensor | None = None
+    num_chunks_ptr: torch.Tensor | None = None
     q_pad: torch.Tensor | None = None
     sm_scale_tensor: torch.Tensor | None = None
     sm_scale_value: float | None = None
+    kv_chunk_size_value: int | None = None
+    num_chunks_value: int | None = None
 
     @classmethod
     def for_contract(
@@ -76,6 +83,7 @@ class MLAWorkspace:
             use_cuda_graph=use_cuda_graph,
         )
         workspace._allocate_padded_query()
+        workspace._allocate_decode_split_buffers()
         if use_cuda_graph:
             workspace._allocate_runtime_metadata()
         return workspace
@@ -145,6 +153,48 @@ class MLAWorkspace:
                 dtype=torch.int32,
                 device=self.device,
             )
+
+    def _allocate_decode_split_buffers(self) -> None:
+        if self.mode != "decode":
+            return
+        partial_rows = self.max_total_q * self.max_chunks_per_row
+        if self.tmp_output is None:
+            self.tmp_output = torch.empty(
+                (partial_rows, self.num_q_heads, self.v_head_dim),
+                dtype=self.dtype,
+                device=self.device,
+            )
+        if self.tmp_lse is None:
+            self.tmp_lse = torch.empty(
+                (partial_rows, self.num_q_heads),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        if self.kv_chunk_size_ptr is None:
+            self.kv_chunk_size_ptr = torch.empty((1,), dtype=torch.int32, device=self.device)
+            self.kv_chunk_size_value = None
+        if self.num_chunks_ptr is None:
+            self.num_chunks_ptr = torch.empty((1,), dtype=torch.int32, device=self.device)
+            self.num_chunks_value = None
+
+    def set_decode_chunk_config(self, *, kv_chunk_size: int, num_chunks: int) -> None:
+        if self.mode != "decode":
+            raise RuntimeError("decode chunk config is only valid for decode workspaces")
+        if num_chunks <= 0 or num_chunks > self.max_chunks_per_row:
+            raise ValueError(
+                f"num_chunks must be in [1, {self.max_chunks_per_row}], got {num_chunks}"
+            )
+        if kv_chunk_size <= 0:
+            raise ValueError(f"kv_chunk_size must be positive, got {kv_chunk_size}")
+        self._allocate_decode_split_buffers()
+        assert self.kv_chunk_size_ptr is not None
+        assert self.num_chunks_ptr is not None
+        if self.kv_chunk_size_value != int(kv_chunk_size):
+            self.kv_chunk_size_ptr[0] = int(kv_chunk_size)
+            self.kv_chunk_size_value = int(kv_chunk_size)
+        if self.num_chunks_value != int(num_chunks):
+            self.num_chunks_ptr[0] = int(num_chunks)
+            self.num_chunks_value = int(num_chunks)
 
     def prepare_decode(
         self,

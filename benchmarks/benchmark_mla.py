@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Benchmark graph-replayed sparse MLA through the public b12x API."""
+"""Benchmark graph-replayed GLM-5.1 TP8 decode public APIs: NSA indexer + sparse MLA."""
 
 from __future__ import annotations
 
 import argparse
-import functools
 import json
 import pathlib
 import statistics
@@ -14,37 +13,57 @@ from dataclasses import dataclass
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
-import torch.nn.functional as F
-from safetensors import safe_open
 
-from b12x.attention.mla.reference import dense_mla_reference, pack_mla_kv_cache_reference
+from b12x.attention.mla.split import select_sparse_mla_split_decode_config
+from b12x.attention.nsa_indexer.reference import sparse_nsa_index_reference
 from b12x.integration.mla import (
     MLASparseDecodeMetadata,
-    MLASparseExtendMetadata,
     MLAWorkspace,
     clear_mla_caches,
+    dense_mla_reference,
+    pack_mla_kv_cache_reference,
     sparse_mla_decode_forward,
-    sparse_mla_extend_forward,
+)
+from b12x.integration.nsa_indexer import (
+    NSAIndexerDecodeMetadata,
+    clear_nsa_indexer_caches,
+    pack_nsa_index_k_cache_reference,
+    sparse_nsa_index_decode_topk,
 )
 
 from benchmarks.common import require_sm120
 
 
 MODEL_PATH = pathlib.Path("/data/models/GLM-5.1-NVFP4")
-LAYER0_SHARD = MODEL_PATH / "model-00001-of-00084.safetensors"
+DEFAULT_BATCH_SIZES = (1, 2, 4, 8)
+DEFAULT_CACHE_LENS = (1024, 8192, 16384, 32768, 65536)
+DEFAULT_TP_SIZE = 8
+DEFAULT_TP_RANK = 0
+MLA_MAX_ABS_TOL = 0.10
+MLA_RMSE_TOL = 0.005
+MLA_COS_TOL = 0.9995
 
 
 @dataclass(frozen=True)
-class GLMMLAConfig:
-    hidden_size: int
-    num_heads: int
-    q_lora_rank: int
-    kv_lora_rank: int
+class GLMDecodeContractConfig:
+    num_attention_heads: int
+    index_n_heads: int
+    index_head_dim: int
+    index_topk: int
     qk_nope_head_dim: int
     qk_rope_head_dim: int
-    v_head_dim: int
-    rms_norm_eps: float
-    rope_theta: float
+    kv_lora_rank: int
+    tp_size: int
+    tp_rank: int
+    page_size: int = 64
+
+    @property
+    def num_local_heads(self) -> int:
+        return self.num_attention_heads // self.tp_size
+
+    @property
+    def q_head_dim(self) -> int:
+        return self.kv_lora_rank + self.qk_rope_head_dim
 
     @property
     def sm_scale(self) -> float:
@@ -52,218 +71,100 @@ class GLMMLAConfig:
 
 
 @dataclass(frozen=True)
-class GLMMLAWeights:
-    q_a_proj: torch.Tensor
-    kv_a_proj_with_mqa: torch.Tensor
-    q_b_proj: torch.Tensor
-    q_a_layernorm: torch.Tensor
-    kv_a_layernorm: torch.Tensor
-    w_kc: torch.Tensor
+class DecodeCase:
+    batch_size: int
+    cache_len: int
+    topk: int
 
 
-def _require_glm_weights() -> None:
-    if not MODEL_PATH.exists():
-        raise SystemExit(f"Model not found at {MODEL_PATH}")
-    if not LAYER0_SHARD.exists():
-        raise SystemExit(f"Layer-0 shard not found at {LAYER0_SHARD}")
+@dataclass(frozen=True)
+class SanityMetrics:
+    max_abs: float
+    rmse: float
+    cos: float
 
 
-@functools.lru_cache(maxsize=1)
-def _load_glm_config() -> GLMMLAConfig:
-    config = json.loads((MODEL_PATH / "config.json").read_text())
-    return GLMMLAConfig(
-        hidden_size=int(config["hidden_size"]),
-        num_heads=int(config["num_attention_heads"]),
-        q_lora_rank=int(config["q_lora_rank"]),
-        kv_lora_rank=int(config["kv_lora_rank"]),
+@dataclass(frozen=True)
+class CaseReport:
+    case: DecodeCase
+    indexer_us: float
+    mla_us: float
+    split_enabled: bool
+    chunk_size: int
+    num_chunks: int
+    mla_sanity: SanityMetrics
+
+    @property
+    def total_us(self) -> float:
+        return self.indexer_us + self.mla_us
+
+
+class BenchmarkFailure(RuntimeError):
+    def __init__(self, case: DecodeCase, message: str):
+        super().__init__(f"bs={case.batch_size} ctx={case.cache_len} topk={case.topk}: {message}")
+        self.case = case
+
+
+def _require_glm_config() -> pathlib.Path:
+    config_path = MODEL_PATH / "config.json"
+    if not config_path.exists():
+        raise SystemExit(f"GLM-5.1 config not found at {config_path}")
+    return config_path
+
+
+def _load_glm_contract_config(*, tp_size: int, tp_rank: int) -> GLMDecodeContractConfig:
+    config = json.loads(_require_glm_config().read_text())
+    num_attention_heads = int(config["num_attention_heads"])
+    if num_attention_heads % tp_size != 0:
+        raise SystemExit(
+            f"num_attention_heads={num_attention_heads} is not divisible by tp_size={tp_size}"
+        )
+    if tp_rank < 0 or tp_rank >= tp_size:
+        raise SystemExit(f"tp_rank must be in [0, {tp_size}), got {tp_rank}")
+    return GLMDecodeContractConfig(
+        num_attention_heads=num_attention_heads,
+        index_n_heads=int(config["index_n_heads"]),
+        index_head_dim=int(config["index_head_dim"]),
+        index_topk=int(config["index_topk"]),
         qk_nope_head_dim=int(config["qk_nope_head_dim"]),
         qk_rope_head_dim=int(config["qk_rope_head_dim"]),
-        v_head_dim=int(config["v_head_dim"]),
-        rms_norm_eps=float(config["rms_norm_eps"]),
-        rope_theta=float(config["rope_parameters"]["rope_theta"]),
+        kv_lora_rank=int(config["kv_lora_rank"]),
+        tp_size=tp_size,
+        tp_rank=tp_rank,
     )
-
-
-@functools.lru_cache(maxsize=1)
-def _load_glm_layer0_cpu() -> GLMMLAWeights:
-    cfg = _load_glm_config()
-    keys = [
-        "model.layers.0.self_attn.q_a_proj.weight",
-        "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
-        "model.layers.0.self_attn.q_b_proj.weight",
-        "model.layers.0.self_attn.kv_b_proj.weight",
-        "model.layers.0.self_attn.q_a_layernorm.weight",
-        "model.layers.0.self_attn.kv_a_layernorm.weight",
-    ]
-    with safe_open(str(LAYER0_SHARD), framework="pt", device="cpu") as handle:
-        tensors = {key: handle.get_tensor(key).contiguous() for key in keys}
-
-    kv_b_proj = tensors["model.layers.0.self_attn.kv_b_proj.weight"]
-    w_kc, _ = kv_b_proj.unflatten(
-        0,
-        (-1, cfg.qk_nope_head_dim + cfg.v_head_dim),
-    ).split([cfg.qk_nope_head_dim, cfg.v_head_dim], dim=1)
-    w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-
-    return GLMMLAWeights(
-        q_a_proj=tensors["model.layers.0.self_attn.q_a_proj.weight"],
-        kv_a_proj_with_mqa=tensors["model.layers.0.self_attn.kv_a_proj_with_mqa.weight"],
-        q_b_proj=tensors["model.layers.0.self_attn.q_b_proj.weight"],
-        q_a_layernorm=tensors["model.layers.0.self_attn.q_a_layernorm.weight"],
-        kv_a_layernorm=tensors["model.layers.0.self_attn.kv_a_layernorm.weight"],
-        w_kc=w_kc,
-    )
-
-
-@functools.lru_cache(maxsize=4)
-def _load_glm_layer0_cuda(device_index: int) -> tuple[GLMMLAConfig, GLMMLAWeights]:
-    cfg = _load_glm_config()
-    cpu = _load_glm_layer0_cpu()
-    device = torch.device("cuda", device_index)
-    return cfg, GLMMLAWeights(
-        q_a_proj=cpu.q_a_proj.to(device=device),
-        kv_a_proj_with_mqa=cpu.kv_a_proj_with_mqa.to(device=device),
-        q_b_proj=cpu.q_b_proj.to(device=device),
-        q_a_layernorm=cpu.q_a_layernorm.to(device=device),
-        kv_a_layernorm=cpu.kv_a_layernorm.to(device=device),
-        w_kc=cpu.w_kc.to(device=device),
-    )
-
-
-def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    x_f = x.to(torch.float32)
-    inv_rms = torch.rsqrt(x_f.square().mean(dim=-1, keepdim=True) + eps)
-    return (x_f * inv_rms).to(x.dtype) * weight
-
-
-def _rope_interleaved(x: torch.Tensor, positions: torch.Tensor, theta: float) -> torch.Tensor:
-    half = x.shape[-1] // 2
-    inv_freq = 1.0 / (
-        theta
-        ** (
-            torch.arange(half, device=x.device, dtype=torch.float32)
-            / half
-        )
-    )
-    freqs = positions.to(torch.float32).unsqueeze(-1) * inv_freq.unsqueeze(0)
-    cos = freqs.cos().view(x.shape[0], 1, half)
-    sin = freqs.sin().view(x.shape[0], 1, half)
-
-    x_pairs = x.to(torch.float32).reshape(x.shape[0], x.shape[1], half, 2)
-    even = x_pairs[..., 0]
-    odd = x_pairs[..., 1]
-    rotated = torch.empty_like(x_pairs)
-    rotated[..., 0] = even * cos - odd * sin
-    rotated[..., 1] = even * sin + odd * cos
-    return rotated.reshape_as(x).to(x.dtype)
-
-
-def _make_glm_case(
-    *,
-    cache_len: int,
-    q_len: int,
-    seed: int,
-    device: torch.device,
-) -> tuple[GLMMLAConfig, torch.Tensor, torch.Tensor, torch.Tensor]:
-    cfg, weights = _load_glm_layer0_cuda(device.index or 0)
-
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(seed)
-    hidden_states = torch.randn(
-        (cache_len, cfg.hidden_size),
-        generator=gen,
-        dtype=torch.float32,
-    ).to(device=device, dtype=torch.bfloat16)
-    hidden_states /= 4
-    positions = torch.arange(cache_len, device=device, dtype=torch.long)
-
-    q_lora = F.linear(hidden_states, weights.q_a_proj)
-    latent = F.linear(hidden_states, weights.kv_a_proj_with_mqa)
-    q_norm = _rms_norm(q_lora, weights.q_a_layernorm, cfg.rms_norm_eps)
-    k_nope = _rms_norm(
-        latent[:, : cfg.kv_lora_rank],
-        weights.kv_a_layernorm,
-        cfg.rms_norm_eps,
-    ).unsqueeze(1)
-    k_rope = _rope_interleaved(
-        latent[:, cfg.kv_lora_rank :].unsqueeze(1),
-        positions,
-        cfg.rope_theta,
-    )
-
-    q = F.linear(q_norm, weights.q_b_proj).view(
-        cache_len,
-        cfg.num_heads,
-        cfg.qk_nope_head_dim + cfg.qk_rope_head_dim,
-    )
-    q_nope, q_rope = q.split([cfg.qk_nope_head_dim, cfg.qk_rope_head_dim], dim=-1)
-    q_nope_out = torch.bmm(q_nope.transpose(0, 1), weights.w_kc).transpose(0, 1)
-    q_rope = _rope_interleaved(q_rope, positions, cfg.rope_theta)
-    q_all = torch.cat([q_nope_out[-q_len:], q_rope[-q_len:]], dim=-1).contiguous()
-    return cfg, q_all, k_nope, k_rope
-
-
-def _compare(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float, float]:
-    diff = (a - b).to(torch.float32)
-    a_f = a.to(torch.float32).reshape(-1)
-    b_f = b.to(torch.float32).reshape(-1)
-    cos = torch.nn.functional.cosine_similarity(a_f, b_f, dim=0).item()
-    return diff.abs().max().item(), torch.sqrt(diff.square().mean()).item(), cos
 
 
 def _parse_csv_ints(value: str) -> list[int]:
     return [int(part) for part in value.split(",") if part]
 
 
-def _make_page_table(
+def _resolve_topk(*, cache_len: int, topk_cap: int) -> int:
+    if cache_len <= 0:
+        raise ValueError(f"cache_len must be positive, got {cache_len}")
+    if topk_cap <= 0:
+        raise ValueError(f"topk_cap must be positive, got {topk_cap}")
+    return min(cache_len, topk_cap)
+
+
+def _build_decode_cases(
     *,
-    cache_len: int,
-    q_len: int,
-    width: int,
-    valid_per_row: int,
-    seed: int,
-    device: torch.device,
-) -> torch.Tensor:
-    if valid_per_row > width:
-        raise ValueError("valid_per_row cannot exceed width")
-    if width <= 0 or valid_per_row <= 0:
-        raise ValueError("width and valid_per_row must be positive")
-    if width == cache_len and valid_per_row == cache_len:
-        return torch.arange(cache_len, dtype=torch.int32, device=device).repeat(q_len, 1)
-
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(seed)
-    rows = []
-    for _ in range(q_len):
-        valid = torch.randperm(cache_len, generator=gen, dtype=torch.int64)[:valid_per_row]
-        valid = valid.to(torch.int32)
-        padded = torch.full((width,), -1, dtype=torch.int32)
-        padded[:valid_per_row] = valid
-        rows.append(padded)
-    return torch.stack(rows, dim=0).to(device=device)
-
-
-def _make_workspace(
-    *,
-    mode: str,
-    device: torch.device,
-    max_total_q: int,
-    max_batch: int,
-    topk: int,
-    cfg: GLMMLAConfig,
-) -> MLAWorkspace:
-    return MLAWorkspace.for_fixed_capacity(
-        mode=mode,
-        device=device,
-        dtype=torch.bfloat16,
-        kv_dtype=torch.uint8,
-        num_q_heads=cfg.num_heads,
-        head_dim=cfg.kv_lora_rank + cfg.qk_rope_head_dim,
-        v_head_dim=cfg.kv_lora_rank,
-        topk=topk,
-        max_total_q=max_total_q,
-        max_batch=max_batch,
-    )
+    batch_sizes: list[int],
+    cache_lens: list[int],
+    topk_cap: int,
+) -> list[DecodeCase]:
+    cases: list[DecodeCase] = []
+    for batch_size in batch_sizes:
+        if batch_size <= 0:
+            raise ValueError(f"batch sizes must be positive, got {batch_size}")
+        for cache_len in cache_lens:
+            cases.append(
+                DecodeCase(
+                    batch_size=batch_size,
+                    cache_len=cache_len,
+                    topk=_resolve_topk(cache_len=cache_len, topk_cap=topk_cap),
+                )
+            )
+    return cases
 
 
 def _capture_graph(fn, *, warmup: int) -> torch.cuda.CUDAGraph:
@@ -289,190 +190,370 @@ def _bench_graph(graph: torch.cuda.CUDAGraph, *, replays: int) -> list[float]:
     return [start.elapsed_time(end) * 1000.0 for start, end in zip(starts, ends)]
 
 
-def _run_case(
+def _geomean(values: list[float]) -> float:
+    if not values:
+        raise ValueError("geomean requires at least one value")
+    return statistics.geometric_mean(values)
+
+
+def _compare(a: torch.Tensor, b: torch.Tensor) -> SanityMetrics:
+    diff = (a - b).to(torch.float32)
+    a_f = a.to(torch.float32).reshape(-1)
+    b_f = b.to(torch.float32).reshape(-1)
+    cos = torch.nn.functional.cosine_similarity(a_f, b_f, dim=0).item()
+    return SanityMetrics(
+        max_abs=diff.abs().max().item(),
+        rmse=torch.sqrt(diff.square().mean()).item(),
+        cos=cos,
+    )
+
+
+def _make_dense_candidate_page_table(
     *,
-    mode: str,
+    batch_size: int,
     cache_len: int,
-    q_len: int,
-    width: int,
-    valid_per_row: int,
+    device: torch.device,
+) -> torch.Tensor:
+    row = torch.arange(cache_len, dtype=torch.int32, device=device)
+    return row.unsqueeze(0).repeat(batch_size, 1)
+
+
+def _make_indexer_inputs(
+    *,
+    case: DecodeCase,
+    cfg: GLMDecodeContractConfig,
+    seed: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    q_fp8 = (
+        torch.randn(
+            (case.batch_size, cfg.index_n_heads, cfg.index_head_dim),
+            generator=gen,
+            dtype=torch.float32,
+        )
+        .to(device=device)
+        .div_(2.0)
+    ).to(torch.float8_e4m3fn)
+    weights = (
+        torch.randn(
+            (case.batch_size, cfg.index_n_heads, 1),
+            generator=gen,
+            dtype=torch.float32,
+        )
+        .to(device=device)
+        .div_(cfg.index_n_heads**0.5)
+    )
+    k = (
+        torch.randn(
+            (case.cache_len, cfg.index_head_dim),
+            generator=gen,
+            dtype=torch.float32,
+        )
+        .to(device=device)
+        .div_(3.0)
+    )
+    return q_fp8, weights, pack_nsa_index_k_cache_reference(k, page_size=cfg.page_size)
+
+
+def _make_mla_inputs(
+    *,
+    case: DecodeCase,
+    cfg: GLMDecodeContractConfig,
+    seed: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    q_all = (
+        torch.randn(
+            (case.batch_size, cfg.num_local_heads, cfg.q_head_dim),
+            generator=gen,
+            dtype=torch.float32,
+        )
+        .to(device=device)
+        .div_(4.0)
+        .to(torch.bfloat16)
+    )
+    k_nope = (
+        torch.randn(
+            (case.cache_len, 1, cfg.kv_lora_rank),
+            generator=gen,
+            dtype=torch.float32,
+        )
+        .to(device=device)
+        .div_(4.0)
+        .to(torch.bfloat16)
+    )
+    k_rope = (
+        torch.randn(
+            (case.cache_len, 1, cfg.qk_rope_head_dim),
+            generator=gen,
+            dtype=torch.float32,
+        )
+        .to(device=device)
+        .div_(4.0)
+        .to(torch.bfloat16)
+    )
+    kv_cache = pack_mla_kv_cache_reference(k_nope, k_rope)
+    return q_all, k_nope, k_rope, kv_cache
+
+
+def _make_mla_workspace(
+    *,
+    cfg: GLMDecodeContractConfig,
+    case: DecodeCase,
+    device: torch.device,
+) -> MLAWorkspace:
+    return MLAWorkspace.for_fixed_capacity(
+        mode="decode",
+        device=device,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.uint8,
+        num_q_heads=cfg.num_local_heads,
+        head_dim=cfg.q_head_dim,
+        v_head_dim=cfg.kv_lora_rank,
+        topk=case.topk,
+        max_total_q=case.batch_size,
+        max_batch=case.batch_size,
+    )
+
+
+def _run_decode_case(
+    *,
+    case: DecodeCase,
+    cfg: GLMDecodeContractConfig,
     warmup: int,
     replays: int,
     seed: int,
     device: torch.device,
-) -> None:
-    cfg, q_all, k_nope, k_rope = _make_glm_case(
-        cache_len=cache_len,
-        q_len=q_len,
+) -> CaseReport:
+    q_fp8, weights, index_k_cache = _make_indexer_inputs(
+        case=case,
+        cfg=cfg,
         seed=seed,
         device=device,
     )
-    packed = pack_mla_kv_cache_reference(k_nope, k_rope)
-    page_table_1 = _make_page_table(
-        cache_len=cache_len,
-        q_len=q_len,
-        width=width,
-        valid_per_row=valid_per_row,
+    q_all, k_nope, k_rope, kv_cache = _make_mla_inputs(
+        case=case,
+        cfg=cfg,
         seed=seed + 1,
         device=device,
     )
+    candidate_page_table = _make_dense_candidate_page_table(
+        batch_size=case.batch_size,
+        cache_len=case.cache_len,
+        device=device,
+    )
+    full_cache_seqlens = torch.full(
+        (case.batch_size,),
+        case.cache_len,
+        dtype=torch.int32,
+        device=device,
+    )
+    indexer_metadata = NSAIndexerDecodeMetadata(
+        page_table_1=candidate_page_table,
+        cache_seqlens_int32=full_cache_seqlens,
+    )
 
-    if mode == "decode":
-        cache_seqlens = torch.tensor([cache_len], dtype=torch.int32, device=device)
-        metadata = MLASparseDecodeMetadata(
-            page_table_1=page_table_1[:1],
-            cache_seqlens_int32=cache_seqlens,
-            nsa_cache_seqlens_int32=cache_seqlens,
-            max_seq_len_k=cache_len,
-        )
-        workspace = _make_workspace(
-            mode="decode",
-            device=device,
-            max_total_q=1,
-            max_batch=1,
-            topk=width,
-            cfg=cfg,
-        )
-
-        def run():
-            return sparse_mla_decode_forward(
-                q_all=q_all[:1],
-                kv_cache=packed,
-                metadata=metadata,
-                workspace=workspace,
-                sm_scale=cfg.sm_scale,
-                v_head_dim=cfg.kv_lora_rank,
-            )
-
-        q_ref = q_all[:1]
-        page_table_ref = page_table_1[:1]
-    else:
-        cache_seqlens = torch.full((q_len,), cache_len, dtype=torch.int32, device=device)
-        cu_seqlens = torch.arange(0, q_len + 1, dtype=torch.int32, device=device)
-        metadata = MLASparseExtendMetadata(
-            page_table_1=page_table_1,
-            cache_seqlens_int32=cache_seqlens,
-            nsa_cache_seqlens_int32=cache_seqlens,
-            nsa_cu_seqlens_q=cu_seqlens,
-            nsa_cu_seqlens_k=cu_seqlens,
-            max_seq_len_q=1,
-            max_seq_len_k=cache_len,
-            mode="extend",
-        )
-        workspace = _make_workspace(
-            mode="extend",
-            device=device,
-            max_total_q=q_len,
-            max_batch=q_len,
-            topk=width,
-            cfg=cfg,
+    def run_indexer():
+        return sparse_nsa_index_decode_topk(
+            q_fp8=q_fp8,
+            weights=weights,
+            index_k_cache=index_k_cache,
+            metadata=indexer_metadata,
+            topk=case.topk,
+            page_size=cfg.page_size,
         )
 
-        def run():
-            return sparse_mla_extend_forward(
-                q_all=q_all,
-                kv_cache=packed,
-                metadata=metadata,
-                workspace=workspace,
-                sm_scale=cfg.sm_scale,
-                v_head_dim=cfg.kv_lora_rank,
-            )
+    clear_nsa_indexer_caches()
+    actual_topk = run_indexer()
+    expected_topk = sparse_nsa_index_reference(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        page_table_1=candidate_page_table,
+        query_row_to_batch=torch.arange(case.batch_size, dtype=torch.int32, device=device),
+        seqlens_per_query=full_cache_seqlens,
+        topk=case.topk,
+        page_size=cfg.page_size,
+    )
+    torch.cuda.synchronize()
+    if not torch.equal(actual_topk, expected_topk):
+        mismatch = int((actual_topk != expected_topk).sum().item())
+        raise BenchmarkFailure(
+            case,
+            f"indexer correctness mismatch: {mismatch} differing entries",
+        )
 
-        q_ref = q_all
-        page_table_ref = page_table_1
+    nsa_cache_seqlens = torch.full(
+        (case.batch_size,),
+        case.topk,
+        dtype=torch.int32,
+        device=device,
+    )
+    mla_metadata = MLASparseDecodeMetadata(
+        page_table_1=actual_topk,
+        cache_seqlens_int32=full_cache_seqlens,
+        nsa_cache_seqlens_int32=nsa_cache_seqlens,
+        max_seq_len_k=case.cache_len,
+    )
+    mla_workspace = _make_mla_workspace(cfg=cfg, case=case, device=device)
+    split_cfg = select_sparse_mla_split_decode_config(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        page_table_1=actual_topk,
+        output_dtype=q_all.dtype,
+        v_head_dim=cfg.kv_lora_rank,
+    )
+
+    def run_mla():
+        return sparse_mla_decode_forward(
+            q_all=q_all,
+            kv_cache=kv_cache,
+            metadata=mla_metadata,
+            workspace=mla_workspace,
+            sm_scale=cfg.sm_scale,
+            v_head_dim=cfg.kv_lora_rank,
+        )
 
     clear_mla_caches()
-    actual = run()
-    expected = dense_mla_reference(
-        q_all=q_ref,
+    actual_output = run_mla()
+    expected_output = dense_mla_reference(
+        q_all=q_all,
         k_nope=k_nope,
         k_rope=k_rope,
-        page_table_1=page_table_ref,
+        page_table_1=actual_topk,
         sm_scale=cfg.sm_scale,
         v_head_dim=cfg.kv_lora_rank,
     )
     torch.cuda.synchronize()
-
-    max_abs, rmse, cos = _compare(actual, expected)
-    graph = _capture_graph(run, warmup=warmup)
-    replay_us = _bench_graph(graph, replays=replays)
-
-    print(
-        json.dumps(
-            {
-                "mode": mode,
-                "cache_len": cache_len,
-                "q_len": q_len,
-                "width": width,
-                "valid_per_row": valid_per_row,
-                "median_us": statistics.median(replay_us),
-                "mean_us": statistics.fmean(replay_us),
-                "min_us": min(replay_us),
-                "max_us": max(replay_us),
-                "replays": replays,
-                "sanity": {
-                    "max_abs": max_abs,
-                    "rmse": rmse,
-                    "cos": cos,
-                },
-            }
+    mla_sanity = _compare(actual_output, expected_output)
+    if mla_sanity.max_abs > MLA_MAX_ABS_TOL:
+        raise BenchmarkFailure(
+            case,
+            f"MLA max_abs {mla_sanity.max_abs:.6f} exceeded {MLA_MAX_ABS_TOL:.6f}",
         )
+    if mla_sanity.rmse > MLA_RMSE_TOL:
+        raise BenchmarkFailure(
+            case,
+            f"MLA rmse {mla_sanity.rmse:.6f} exceeded {MLA_RMSE_TOL:.6f}",
+        )
+    if mla_sanity.cos < MLA_COS_TOL:
+        raise BenchmarkFailure(
+            case,
+            f"MLA cos {mla_sanity.cos:.6f} fell below {MLA_COS_TOL:.6f}",
+        )
+
+    clear_nsa_indexer_caches()
+    indexer_graph = _capture_graph(run_indexer, warmup=warmup)
+    indexer_us = statistics.median(_bench_graph(indexer_graph, replays=replays))
+
+    clear_mla_caches()
+    mla_graph = _capture_graph(run_mla, warmup=warmup)
+    mla_us = statistics.median(_bench_graph(mla_graph, replays=replays))
+
+    return CaseReport(
+        case=case,
+        indexer_us=indexer_us,
+        mla_us=mla_us,
+        split_enabled=split_cfg is not None,
+        chunk_size=0 if split_cfg is None else split_cfg.chunk_size,
+        num_chunks=0 if split_cfg is None else split_cfg.num_chunks,
+        mla_sanity=mla_sanity,
     )
 
 
-def main() -> None:
+def collect_case_reports(
+    args: argparse.Namespace,
+    *,
+    device: torch.device | None = None,
+) -> list[CaseReport]:
+    cfg = _load_glm_contract_config(tp_size=args.tp_size, tp_rank=args.tp_rank)
+    device = require_sm120() if device is None else device
+    cases = _build_decode_cases(
+        batch_sizes=_parse_csv_ints(args.batch_sizes),
+        cache_lens=_parse_csv_ints(args.cache_lens),
+        topk_cap=min(args.topk_cap, cfg.index_topk),
+    )
+    reports: list[CaseReport] = []
+    case_seed = args.seed
+    for case in cases:
+        reports.append(
+            _run_decode_case(
+                case=case,
+                cfg=cfg,
+                warmup=args.warmup,
+                replays=args.replays,
+                seed=case_seed,
+                device=device,
+            )
+        )
+        case_seed += 17
+    return reports
+
+
+def _render_case_line(report: CaseReport) -> str:
+    split_flag = "on" if report.split_enabled else "off"
+    return (
+        f"glm51-decode tp8 bs={report.case.batch_size:2d} ctx={report.case.cache_len:6d} "
+        f"topk={report.case.topk:4d} split={split_flag:>3s} "
+        f"chunk={report.chunk_size:3d} nchunks={report.num_chunks:d} | "
+        f"total={report.total_us:8.2f} us | "
+        f"indexer={report.indexer_us:8.2f} us | "
+        f"mla={report.mla_us:8.2f} us"
+    )
+
+
+def _render_summary_lines(reports: list[CaseReport]) -> list[str]:
+    total_geo = _geomean([report.total_us for report in reports])
+    indexer_geo = _geomean([report.indexer_us for report in reports])
+    mla_geo = _geomean([report.mla_us for report in reports])
+    return [
+        "Summary",
+        f"  cases: {len(reports)}",
+        f"  total geo:   {total_geo:.2f} us",
+        f"  indexer geo: {indexer_geo:.2f} us",
+        f"  mla geo:     {mla_geo:.2f} us",
+    ]
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("decode", "extend", "both"), default="both")
-    parser.add_argument("--decode-cache-lens", default="63,64,65,127,128,129")
-    parser.add_argument("--extend-cache-lens", default="63,64,65,127,128,129")
-    parser.add_argument("--extend-q-len", type=int, default=5)
-    parser.add_argument("--width", type=int, default=0, help="0 means dense width=cache_len")
     parser.add_argument(
-        "--valid-per-row",
-        type=int,
-        default=0,
-        help="0 means valid_per_row=width, otherwise generate sparse padded rows",
+        "--batch-sizes",
+        default="1,2,4,8",
+        help=f"decode batch sizes, default {','.join(str(v) for v in DEFAULT_BATCH_SIZES)}",
     )
+    parser.add_argument(
+        "--cache-lens",
+        default="1024,8192,16384,32768,65536",
+        help=f"decode cache lengths, default {','.join(str(v) for v in DEFAULT_CACHE_LENS)}",
+    )
+    parser.add_argument("--topk-cap", type=int, default=2048)
+    parser.add_argument("--tp-size", type=int, default=DEFAULT_TP_SIZE)
+    parser.add_argument("--tp-rank", type=int, default=DEFAULT_TP_RANK)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--replays", type=int, default=200)
     parser.add_argument("--seed", type=int, default=70_000)
-    args = parser.parse_args()
+    return parser.parse_args(argv)
 
-    device = require_sm120()
-    _require_glm_weights()
 
-    if args.mode in ("decode", "both"):
-        for case_idx, cache_len in enumerate(_parse_csv_ints(args.decode_cache_lens)):
-            width = cache_len if args.width == 0 else args.width
-            valid_per_row = width if args.valid_per_row == 0 else args.valid_per_row
-            _run_case(
-                mode="decode",
-                cache_len=cache_len,
-                q_len=1,
-                width=width,
-                valid_per_row=valid_per_row,
-                warmup=args.warmup,
-                replays=args.replays,
-                seed=args.seed + case_idx * 100,
-                device=device,
-            )
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    try:
+        reports = collect_case_reports(args)
+    except BenchmarkFailure as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
-    if args.mode in ("extend", "both"):
-        for case_idx, cache_len in enumerate(_parse_csv_ints(args.extend_cache_lens)):
-            width = cache_len if args.width == 0 else args.width
-            valid_per_row = width if args.valid_per_row == 0 else args.valid_per_row
-            _run_case(
-                mode="extend",
-                cache_len=cache_len,
-                q_len=args.extend_q_len,
-                width=width,
-                valid_per_row=valid_per_row,
-                warmup=args.warmup,
-                replays=args.replays,
-                seed=args.seed + 10_000 + case_idx * 100,
-                device=device,
-            )
+    for report in reports:
+        print(_render_case_line(report))
+    for line in _render_summary_lines(reports):
+        print(line)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

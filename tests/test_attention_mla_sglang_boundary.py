@@ -58,7 +58,14 @@ def _sample_sparse_page_table(
     return page_table_1
 
 
-def _make_fake_backend(cfg, *, device: torch.device, topk: int, nsa_backend_module):
+def _make_fake_backend(
+    cfg,
+    *,
+    device: torch.device,
+    topk: int,
+    nsa_backend_module,
+    num_q_heads: int | None = None,
+):
     class _FakeBackend:
         _get_b12x_mla_workspace = nsa_backend_module.NativeSparseAttnBackend._get_b12x_mla_workspace
 
@@ -66,7 +73,7 @@ def _make_fake_backend(cfg, *, device: torch.device, topk: int, nsa_backend_modu
             self.device = device
             self.q_dtype = torch.bfloat16
             self.kv_cache_dtype = torch.uint8
-            self.num_q_heads = cfg.num_heads
+            self.num_q_heads = cfg.num_heads if num_q_heads is None else int(num_q_heads)
             self.kv_lora_rank = cfg.kv_lora_rank
             self.qk_rope_head_dim = cfg.qk_rope_head_dim
             self.nsa_index_topk = topk
@@ -172,6 +179,119 @@ def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle() -> None:
     )
     expected = dense_mla_reference(
         q_all=q_all,
+        k_nope=k_nope,
+        k_rope=k_rope,
+        page_table_1=page_table_1,
+        sm_scale=cfg.sm_scale,
+        v_head_dim=cfg.kv_lora_rank,
+    )
+    torch.cuda.synchronize(device)
+
+    max_abs, rmse, cos = _compare(actual, expected)
+    assert max_abs <= 0.10, f"max_abs={max_abs:.6f}"
+    assert rmse <= 0.005, f"rmse={rmse:.6f}"
+    assert cos >= 0.9995, f"cos={cos:.6f}"
+
+
+def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle_for_local_tp_heads() -> None:
+    device = require_sm120()
+    _require_glm_weights()
+    nsa_backend_module = _import_sglang_nsa_backend()
+
+    cache_len = 2050
+    topk = 2048
+    local_heads = 8
+    cfg, q_all, k_nope, k_rope = _make_glm_case(
+        cache_len=cache_len,
+        q_len=1,
+        seed=71_205,
+        device=device,
+    )
+    q_local = q_all[:, :local_heads, :].contiguous()
+    packed = pack_mla_kv_cache_reference(k_nope, k_rope)
+    page_table_1 = _full_prefix_page_table(cache_len=cache_len, rows=1, width=topk, device=device)
+    metadata = _make_decode_metadata(
+        nsa_backend_module=nsa_backend_module,
+        cache_len=cache_len,
+        page_table_1=page_table_1,
+    )
+    backend = _make_fake_backend(
+        cfg,
+        device=device,
+        topk=topk,
+        nsa_backend_module=nsa_backend_module,
+        num_q_heads=local_heads,
+    )
+
+    actual = nsa_backend_module.NativeSparseAttnBackend._forward_b12x_mla(
+        backend,
+        q_all=q_local,
+        kv_cache=packed,
+        page_table_1=page_table_1,
+        metadata=metadata,
+        sm_scale=cfg.sm_scale,
+        v_head_dim=cfg.kv_lora_rank,
+        mode="decode",
+    )
+    expected = dense_mla_reference(
+        q_all=q_local,
+        k_nope=k_nope,
+        k_rope=k_rope,
+        page_table_1=page_table_1,
+        sm_scale=cfg.sm_scale,
+        v_head_dim=cfg.kv_lora_rank,
+    )
+    torch.cuda.synchronize(device)
+
+    max_abs, rmse, cos = _compare(actual, expected)
+    assert max_abs <= 0.10, f"max_abs={max_abs:.6f}"
+    assert rmse <= 0.005, f"rmse={rmse:.6f}"
+    assert cos >= 0.9995, f"cos={cos:.6f}"
+
+
+def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle_for_local_tp_heads_fp8_view_cache() -> None:
+    device = require_sm120()
+    _require_glm_weights()
+    nsa_backend_module = _import_sglang_nsa_backend()
+
+    cache_len = 2050
+    topk = 2048
+    local_heads = 8
+    cfg, q_all, k_nope, k_rope = _make_glm_case(
+        cache_len=cache_len,
+        q_len=1,
+        seed=71_206,
+        device=device,
+    )
+    q_local = q_all[:, :local_heads, :].contiguous()
+    packed = pack_mla_kv_cache_reference(k_nope, k_rope).view(torch.float8_e4m3fn)
+    page_table_1 = _full_prefix_page_table(cache_len=cache_len, rows=1, width=topk, device=device)
+    metadata = _make_decode_metadata(
+        nsa_backend_module=nsa_backend_module,
+        cache_len=cache_len,
+        page_table_1=page_table_1,
+    )
+    backend = _make_fake_backend(
+        cfg,
+        device=device,
+        topk=topk,
+        nsa_backend_module=nsa_backend_module,
+        num_q_heads=local_heads,
+    )
+    backend.kv_cache_dtype = torch.float8_e4m3fn
+
+    actual = nsa_backend_module.NativeSparseAttnBackend._forward_b12x_mla(
+        backend,
+        q_all=q_local,
+        kv_cache=packed,
+        page_table_1=page_table_1,
+        metadata=metadata,
+        sm_scale=cfg.sm_scale,
+        v_head_dim=cfg.kv_lora_rank,
+        mode="decode",
+    )
+    expected = dense_mla_reference(
+        q_all=q_local,
         k_nope=k_nope,
         k_rope=k_rope,
         page_table_1=page_table_1,

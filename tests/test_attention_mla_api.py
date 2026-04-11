@@ -151,6 +151,31 @@ def test_mla_workspace_graph_mode_copies_runtime_metadata() -> None:
     assert torch.equal(workspace.nsa_cache_seqlens_int32, nsa_cache_seqlens)
 
 
+def test_mla_decode_workspace_allocates_split_buffers_and_chunk_scalars() -> None:
+    workspace = MLAWorkspace.for_fixed_capacity(
+        mode="decode",
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_dtype=torch.uint8,
+        num_q_heads=8,
+        head_dim=256,
+        v_head_dim=256,
+        topk=2048,
+        max_total_q=8,
+        max_batch=4,
+    )
+
+    assert workspace.tmp_output is not None
+    assert workspace.tmp_output.shape == (8 * workspace.max_chunks_per_row, 8, 256)
+    assert workspace.tmp_lse is not None
+    assert workspace.tmp_lse.shape == (8 * workspace.max_chunks_per_row, 8)
+    workspace.set_decode_chunk_config(kv_chunk_size=256, num_chunks=8)
+    assert workspace.kv_chunk_size_ptr is not None
+    assert workspace.num_chunks_ptr is not None
+    assert int(workspace.kv_chunk_size_ptr[0].item()) == 256
+    assert int(workspace.num_chunks_ptr[0].item()) == 8
+
+
 def test_mla_workspace_enforces_capacity_limits() -> None:
     workspace = _make_workspace(mode="decode", topk=4)
     with torch.no_grad():
