@@ -16,9 +16,11 @@ from .fused_decode import (
 from .kernel import (
     clear_sparse_nsa_indexer_kernel_cache,
     run_sparse_nsa_index_logits_kernel,
+    run_sparse_nsa_paged_logits_kernel,
     supports_sparse_nsa_indexer_kernel,
+    supports_sparse_nsa_paged_logits_kernel,
 )
-from .reference import sparse_nsa_index_reference
+from .reference import sparse_nsa_index_reference, sparse_nsa_paged_logits_reference
 from .triton_topk import (
     clear_sparse_nsa_topk_kernel_cache,
     run_sparse_nsa_dynamic_topk_kernel,
@@ -39,6 +41,13 @@ def _is_cuda_graph_capture_active(device: torch.device) -> bool:
 class NSAIndexerDecodeMetadata:
     page_table_1: torch.Tensor
     cache_seqlens_int32: torch.Tensor
+
+
+@dataclass(frozen=True)
+class NSAIndexerPagedDecodeMetadata:
+    real_page_table: torch.Tensor
+    cache_seqlens_int32: torch.Tensor
+    paged_mqa_schedule_metadata: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -204,6 +213,90 @@ def _make_active_width_tensor(
         seqlens_per_query.device.index,
     )
     return torch.minimum(seqlens_per_query.amax().reshape(1), width_cap)
+
+
+def _sparse_nsa_paged_logits_impl(
+    *,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    real_page_table: torch.Tensor,
+    query_row_to_batch: torch.Tensor,
+    seqlens_per_query: torch.Tensor,
+    page_size: int,
+) -> torch.Tensor:
+    weights_f = _validate_sparse_index_inputs(
+        q_fp8=q_fp8,
+        weights=weights,
+        page_table_1=real_page_table,
+        query_row_to_batch=query_row_to_batch,
+        seqlens_per_query=seqlens_per_query,
+        topk=1,
+    )
+    valid_q_rows = int(query_row_to_batch.numel())
+    width_tokens = real_page_table.shape[1] * page_size
+    logits = torch.full(
+        (q_fp8.shape[0], width_tokens),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q_fp8.device,
+    )
+    if valid_q_rows == 0 or width_tokens == 0:
+        return logits
+
+    seqlens_valid = seqlens_per_query[:valid_q_rows].contiguous()
+    active_width = _make_active_width_tensor(seqlens_per_query=seqlens_valid, width=width_tokens)
+    max_page_capacity = index_k_cache.shape[0]
+    if not _is_cuda_graph_capture_active(q_fp8.device):
+        active_width_host = min(width_tokens, int(active_width.item()))
+        if active_width_host > 0:
+            positions = torch.arange(
+                active_width_host,
+                dtype=torch.int32,
+                device=q_fp8.device,
+            ).unsqueeze(0)
+            page_cols = torch.div(positions, page_size, rounding_mode="floor").to(torch.long)
+            block_rows = query_row_to_batch[:valid_q_rows].to(torch.long)
+            candidate_pages = real_page_table.index_select(0, block_rows).gather(1, page_cols)
+            candidate_valid_mask = (positions < seqlens_valid.unsqueeze(1)) & (candidate_pages >= 0)
+            overflow_mask = candidate_valid_mask & (candidate_pages >= max_page_capacity)
+            if torch.any(overflow_mask):
+                bad = int(candidate_pages[overflow_mask].max().item())
+                raise ValueError(
+                    f"real_page_table page id {bad} exceeds index_k_cache page capacity {max_page_capacity}"
+                )
+
+    if not supports_sparse_nsa_paged_logits_kernel(
+        q_fp8=q_fp8[:valid_q_rows],
+        weights=weights_f[:valid_q_rows],
+        index_k_cache=index_k_cache,
+        real_page_table=real_page_table,
+        query_row_to_batch=query_row_to_batch[:valid_q_rows],
+        seqlens_per_query=seqlens_valid,
+        page_size=page_size,
+    ):
+        return sparse_nsa_paged_logits_reference(
+            q_fp8=q_fp8,
+            weights=weights_f,
+            index_k_cache=index_k_cache,
+            real_page_table=real_page_table,
+            query_row_to_batch=query_row_to_batch,
+            seqlens_per_query=seqlens_per_query,
+            page_size=page_size,
+        )
+
+    logits_valid = run_sparse_nsa_paged_logits_kernel(
+        q_fp8=q_fp8[:valid_q_rows],
+        weights=weights_f[:valid_q_rows],
+        index_k_cache=index_k_cache,
+        real_page_table=real_page_table,
+        query_row_to_batch=query_row_to_batch[:valid_q_rows],
+        seqlens_per_query=seqlens_valid,
+        active_width=active_width,
+        page_size=page_size,
+    )
+    logits[:valid_q_rows].copy_(logits_valid)
+    return logits
 
 
 def _sparse_nsa_topk_impl(
@@ -395,6 +488,51 @@ def sparse_nsa_index_decode_topk(
         topk=topk,
         page_size=page_size,
         allow_fused_decode=True,
+    )
+
+
+def sparse_nsa_index_decode_logits_paged(
+    *,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    metadata: NSAIndexerPagedDecodeMetadata,
+    page_size: int = 64,
+) -> torch.Tensor:
+    if metadata.cache_seqlens_int32.ndim != 1:
+        raise ValueError(
+            "cache_seqlens_int32 must be rank-1, got "
+            f"{tuple(metadata.cache_seqlens_int32.shape)}"
+        )
+    if metadata.real_page_table.shape[0] != metadata.cache_seqlens_int32.shape[0]:
+        raise ValueError(
+            f"real_page_table rows {metadata.real_page_table.shape[0]} do not match "
+            f"cache_seqlens rows {metadata.cache_seqlens_int32.shape[0]}"
+        )
+    if metadata.cache_seqlens_int32.device != q_fp8.device:
+        raise ValueError(
+            f"cache_seqlens_int32 device {metadata.cache_seqlens_int32.device} does not match "
+            f"q_fp8 device {q_fp8.device}"
+        )
+    if metadata.real_page_table.device != q_fp8.device:
+        raise ValueError(
+            f"real_page_table device {metadata.real_page_table.device} does not match "
+            f"q_fp8 device {q_fp8.device}"
+        )
+
+    query_row_to_batch = torch.arange(
+        metadata.real_page_table.shape[0],
+        dtype=torch.int32,
+        device=q_fp8.device,
+    )
+    return _sparse_nsa_paged_logits_impl(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        real_page_table=metadata.real_page_table,
+        query_row_to_batch=query_row_to_batch,
+        seqlens_per_query=metadata.cache_seqlens_int32,
+        page_size=page_size,
     )
 
 

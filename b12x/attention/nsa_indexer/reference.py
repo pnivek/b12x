@@ -247,3 +247,109 @@ def sparse_nsa_index_reference(
         output[query_row, :topk_count] = token_ids[topk_pos].to(torch.int32)
 
     return output
+
+
+def sparse_nsa_paged_logits_reference(
+    *,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    real_page_table: torch.Tensor,
+    query_row_to_batch: torch.Tensor,
+    seqlens_per_query: torch.Tensor,
+    page_size: int = 64,
+) -> torch.Tensor:
+    """Return dense token-position logits from the paged/block-table contract."""
+
+    if q_fp8.ndim != 3:
+        raise ValueError(f"q_fp8 must be rank-3, got {tuple(q_fp8.shape)}")
+    if q_fp8.shape[2] != _INDEX_HEAD_DIM:
+        raise ValueError(f"q_fp8 head_dim must be {_INDEX_HEAD_DIM}, got {q_fp8.shape[2]}")
+    if real_page_table.ndim != 2:
+        raise ValueError(f"real_page_table must be rank-2, got {tuple(real_page_table.shape)}")
+    if real_page_table.dtype != torch.int32:
+        raise ValueError(
+            f"real_page_table must have dtype torch.int32, got {real_page_table.dtype}"
+        )
+    if real_page_table.device != q_fp8.device:
+        raise ValueError(
+            f"real_page_table device {real_page_table.device} does not match q_fp8 device {q_fp8.device}"
+        )
+    if query_row_to_batch.ndim != 1:
+        raise ValueError(
+            f"query_row_to_batch must be rank-1, got {tuple(query_row_to_batch.shape)}"
+        )
+    if seqlens_per_query.ndim != 1:
+        raise ValueError(
+            f"seqlens_per_query must be rank-1, got {tuple(seqlens_per_query.shape)}"
+        )
+    if query_row_to_batch.shape != seqlens_per_query.shape:
+        raise ValueError(
+            "query_row_to_batch and seqlens_per_query must have the same shape, got "
+            f"{tuple(query_row_to_batch.shape)} vs {tuple(seqlens_per_query.shape)}"
+        )
+    if query_row_to_batch.device != q_fp8.device:
+        raise ValueError(
+            f"query_row_to_batch device {query_row_to_batch.device} does not match "
+            f"q_fp8 device {q_fp8.device}"
+        )
+    if seqlens_per_query.device != q_fp8.device:
+        raise ValueError(
+            f"seqlens_per_query device {seqlens_per_query.device} does not match "
+            f"q_fp8 device {q_fp8.device}"
+        )
+
+    num_queries, num_heads, _ = q_fp8.shape
+    weights_f = _normalize_weights(weights, q_rows=num_queries, num_heads=num_heads)
+    k_quant, k_scale = _split_index_k_cache_reference(index_k_cache, page_size=page_size)
+
+    valid_q_rows = int(query_row_to_batch.numel())
+    if valid_q_rows > num_queries:
+        raise ValueError(f"metadata describes {valid_q_rows} query rows, but q_fp8 has {num_queries}")
+
+    width_tokens = real_page_table.shape[1] * page_size
+    logits_out = torch.full(
+        (num_queries, width_tokens),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q_fp8.device,
+    )
+    q_fp32 = q_fp8.to(torch.float32)
+    max_page_capacity = k_quant.shape[0]
+
+    for query_row in range(valid_q_rows):
+        batch_row = int(query_row_to_batch[query_row].item())
+        if batch_row < 0 or batch_row >= real_page_table.shape[0]:
+            raise ValueError(
+                f"query_row_to_batch[{query_row}]={batch_row} is out of bounds for "
+                f"{real_page_table.shape[0]} batch rows"
+            )
+        seq_len = int(seqlens_per_query[query_row].item())
+        if seq_len <= 0:
+            continue
+        seq_len = min(seq_len, width_tokens)
+        token_pos = torch.arange(seq_len, device=q_fp8.device, dtype=torch.long)
+        page_col = torch.div(token_pos, page_size, rounding_mode="floor")
+        slot_idx = token_pos % page_size
+        page_ids = real_page_table[batch_row, page_col].to(torch.long)
+        valid_mask = page_ids >= 0
+        if not torch.any(valid_mask):
+            continue
+        if torch.any(page_ids[valid_mask] >= max_page_capacity):
+            bad = int(page_ids[valid_mask].max().item())
+            raise ValueError(
+                f"real_page_table page id {bad} exceeds index_k_cache page capacity {max_page_capacity}"
+            )
+
+        valid_token_pos = token_pos[valid_mask]
+        valid_page_ids = page_ids[valid_mask]
+        valid_slot_idx = slot_idx[valid_mask]
+        k_selected = k_quant[valid_page_ids, valid_slot_idx]
+        scale_selected = k_scale[valid_page_ids, valid_slot_idx]
+
+        score = torch.matmul(q_fp32[query_row], k_selected.transpose(0, 1))
+        logits = (torch.relu(score) * weights_f[query_row].unsqueeze(1)).sum(dim=0)
+        logits = logits * scale_selected
+        logits_out[query_row, valid_token_pos] = logits
+
+    return logits_out

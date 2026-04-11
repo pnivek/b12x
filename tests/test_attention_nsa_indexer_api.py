@@ -6,9 +6,11 @@ import torch
 from b12x.attention.nsa_indexer.kernel import _split_index_k_cache_runtime_views
 from b12x.integration.nsa_indexer import (
     NSAIndexerDecodeMetadata,
+    NSAIndexerPagedDecodeMetadata,
     NSAIndexerExtendMetadata,
     clear_nsa_indexer_caches,
     pack_nsa_index_k_cache_reference,
+    sparse_nsa_index_decode_logits_paged,
     sparse_nsa_index_decode_topk,
     sparse_nsa_index_extend_topk,
 )
@@ -18,7 +20,10 @@ from b12x.attention.nsa_indexer.triton_topk import (
     supports_sparse_nsa_dynamic_topk_kernel,
     supports_sparse_nsa_topk_kernel,
 )
-from b12x.attention.nsa_indexer.reference import sparse_nsa_index_reference
+from b12x.attention.nsa_indexer.reference import (
+    sparse_nsa_index_reference,
+    sparse_nsa_paged_logits_reference,
+)
 
 
 def _row_token_set(row: torch.Tensor) -> set[int]:
@@ -49,6 +54,31 @@ def _assert_decode_matches_cuda_contract(
             assert _row_token_set(actual[row_idx]) == _row_token_set(expected[row_idx])
         else:
             assert torch.equal(actual[row_idx], expected[row_idx])
+
+
+def _make_real_page_table(
+    *,
+    page_starts: list[int],
+    seqlens: list[int],
+    width_blocks: int,
+    device: torch.device,
+) -> torch.Tensor:
+    real_page_table = torch.full(
+        (len(seqlens), width_blocks),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    for row_idx, (page_start, seq_len) in enumerate(zip(page_starts, seqlens, strict=True)):
+        block_count = (int(seq_len) + 63) // 64
+        if block_count:
+            real_page_table[row_idx, :block_count] = torch.arange(
+                page_start,
+                page_start + block_count,
+                dtype=torch.int32,
+                device=device,
+            )
+    return real_page_table
 
 
 def test_sparse_nsa_index_runtime_views_preserve_page_stride() -> None:
@@ -640,3 +670,103 @@ def test_sparse_nsa_dynamic_topk_kernel_uses_runtime_active_width() -> None:
         torch.arange(active_width, device=device, dtype=torch.long).unsqueeze(0).expand(rows, -1),
     ]
     assert torch.equal(output, expected)
+
+
+def test_sparse_nsa_index_decode_logits_paged_matches_reference() -> None:
+    device = torch.device("cpu")
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(72_120)
+
+    page_starts = [4, 12, 20]
+    seqlens = [96, 130, 71]
+    width_blocks = 3
+    q_rows = len(seqlens)
+    num_heads = 4
+    num_pages = max(page_starts) + width_blocks
+
+    index_k_cache = pack_nsa_index_k_cache_reference(
+        torch.randn((num_pages * 64, 128), generator=gen, dtype=torch.float32, device=device) / 3
+    )
+    q_fp8 = (
+        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32, device=device) / 2
+    ).to(torch.float8_e4m3fn)
+    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32, device=device)
+    real_page_table = _make_real_page_table(
+        page_starts=page_starts,
+        seqlens=seqlens,
+        width_blocks=width_blocks,
+        device=device,
+    )
+    seqlens_t = torch.tensor(seqlens, dtype=torch.int32, device=device)
+
+    actual = sparse_nsa_index_decode_logits_paged(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        metadata=NSAIndexerPagedDecodeMetadata(
+            real_page_table=real_page_table,
+            cache_seqlens_int32=seqlens_t,
+        ),
+    )
+    expected = sparse_nsa_paged_logits_reference(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        real_page_table=real_page_table,
+        query_row_to_batch=torch.arange(q_rows, dtype=torch.int32, device=device),
+        seqlens_per_query=seqlens_t,
+    )
+
+    assert actual.shape == (q_rows, width_blocks * 64)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for kernel coverage")
+def test_sparse_nsa_index_decode_logits_paged_matches_reference_cuda() -> None:
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(72_121)
+
+    page_starts = [3, 7]
+    seqlens = [80, 123]
+    width_blocks = 2
+    q_rows = len(seqlens)
+    num_heads = 3
+    num_pages = max(page_starts) + width_blocks
+
+    index_k_cache = pack_nsa_index_k_cache_reference(
+        torch.randn((num_pages * 64, 128), generator=gen, dtype=torch.float32).to(device=device) / 3
+    )
+    q_fp8 = (
+        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32).to(device=device) / 2
+    ).to(torch.float8_e4m3fn)
+    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32).to(device=device)
+    real_page_table = _make_real_page_table(
+        page_starts=page_starts,
+        seqlens=seqlens,
+        width_blocks=width_blocks,
+        device=device,
+    )
+    seqlens_t = torch.tensor(seqlens, dtype=torch.int32, device=device)
+
+    actual = sparse_nsa_index_decode_logits_paged(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        metadata=NSAIndexerPagedDecodeMetadata(
+            real_page_table=real_page_table,
+            cache_seqlens_int32=seqlens_t,
+        ),
+    )
+    expected = sparse_nsa_paged_logits_reference(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        real_page_table=real_page_table,
+        query_row_to_batch=torch.arange(q_rows, dtype=torch.int32, device=device),
+        seqlens_per_query=seqlens_t,
+    )
+
+    torch.cuda.synchronize(device)
+    assert torch.equal(torch.isfinite(actual), torch.isfinite(expected))
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6, equal_nan=True)

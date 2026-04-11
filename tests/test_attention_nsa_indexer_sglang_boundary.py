@@ -74,17 +74,23 @@ class _FakePagedMetadata:
         self,
         *,
         page_table_1: torch.Tensor,
+        real_page_table: torch.Tensor,
         seqlens_int32: torch.Tensor,
         seqlens_expanded: torch.Tensor,
         extend_lens: list[int],
     ) -> None:
         self._page_table_1 = page_table_1
+        self._real_page_table = real_page_table
         self._seqlens_int32 = seqlens_int32
         self._seqlens_expanded = seqlens_expanded
         self._extend_lens = extend_lens
+        self.paged_mqa_schedule_metadata = None
 
     def get_page_table_1(self) -> torch.Tensor:
         return self._page_table_1
+
+    def get_page_table_64(self) -> torch.Tensor:
+        return self._real_page_table
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self._seqlens_int32
@@ -94,6 +100,20 @@ class _FakePagedMetadata:
 
     def get_nsa_extend_len_cpu(self) -> list[int]:
         return self._extend_lens
+
+    def topk_transform(self, logits: torch.Tensor, topk: int) -> torch.Tensor:
+        rows = logits.shape[0]
+        output = torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
+        lengths = self._seqlens_expanded[:rows]
+        page_table_1 = self._page_table_1[:rows]
+        for row_idx in range(rows):
+            seq_len = min(int(lengths[row_idx].item()), page_table_1.shape[1])
+            if seq_len <= 0:
+                continue
+            row_logits = logits[row_idx, :seq_len]
+            topk_pos = torch.argsort(row_logits, descending=True, stable=True)[: min(topk, seq_len)]
+            output[row_idx, : topk_pos.numel()] = page_table_1[row_idx, topk_pos.to(torch.long)]
+        return output
 
 
 class _FakeRaggedMetadata:
@@ -128,15 +148,48 @@ def _make_fake_indexer(module, *, topk: int):
     return _FakeIndexer()
 
 
+def _make_paged_candidate_tables(
+    *,
+    page_starts: list[int],
+    seqlens: list[int],
+    width_blocks: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows = len(seqlens)
+    page_table_1 = torch.full((rows, width_blocks * 64), -1, dtype=torch.int32, device=device)
+    real_page_table = torch.full((rows, width_blocks), -1, dtype=torch.int32, device=device)
+    for row_idx, (page_start, seq_len) in enumerate(zip(page_starts, seqlens, strict=True)):
+        block_count = (int(seq_len) + 63) // 64
+        if block_count == 0:
+            continue
+        real_page_table[row_idx, :block_count] = torch.arange(
+            page_start,
+            page_start + block_count,
+            dtype=torch.int32,
+            device=device,
+        )
+        token_ids = torch.arange(
+            page_start * 64,
+            (page_start + block_count) * 64,
+            dtype=torch.int32,
+            device=device,
+        )
+        page_table_1[row_idx, :seq_len] = token_ids[:seq_len]
+    return page_table_1, real_page_table
+
+
 def test_sglang_b12x_nsa_indexer_paged_boundary_matches_b12x_reference() -> None:
     module = _import_sglang_nsa_indexer()
     gen = torch.Generator(device="cpu")
     gen.manual_seed(73_100)
 
-    num_tokens = 96
+    page_starts = [4, 8, 12]
+    seqlens = torch.tensor([65, 96, 127], dtype=torch.int32)
+    width_blocks = 2
+    num_tokens = (max(page_starts) + width_blocks) * 64
     num_heads = 3
     topk = 4
-    q_rows = 3
+    q_rows = len(page_starts)
 
     index_k_cache = pack_nsa_index_k_cache_reference(
         torch.randn((num_tokens, 128), generator=gen, dtype=torch.float32) / 3
@@ -145,11 +198,12 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_matches_b12x_reference() -> None
         torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32) / 2
     ).to(torch.float8_e4m3fn)
     weights = torch.randn((q_rows, num_heads, 1), generator=gen, dtype=torch.float32)
-    page_table_1 = torch.full((q_rows, 8), -1, dtype=torch.int32)
-    page_table_1[0, :5] = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32)
-    page_table_1[1, :6] = torch.tensor([10, 11, 12, 13, 14, 15], dtype=torch.int32)
-    page_table_1[2, :7] = torch.tensor([20, 21, 22, 23, 24, 25, 26], dtype=torch.int32)
-    seqlens = torch.tensor([5, 6, 7], dtype=torch.int32)
+    page_table_1, real_page_table = _make_paged_candidate_tables(
+        page_starts=page_starts,
+        seqlens=seqlens.tolist(),
+        width_blocks=width_blocks,
+        device=torch.device("cpu"),
+    )
 
     fake_indexer = _make_fake_indexer(module, topk=topk)
     fake_forward_batch = type(
@@ -163,6 +217,7 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_matches_b12x_reference() -> None
     )()
     metadata = _FakePagedMetadata(
         page_table_1=page_table_1,
+        real_page_table=real_page_table,
         seqlens_int32=seqlens,
         seqlens_expanded=seqlens,
         extend_lens=[1, 1, 1],
@@ -195,10 +250,13 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_respects_active_decode_rows() ->
     gen = torch.Generator(device="cpu")
     gen.manual_seed(73_102)
 
-    num_tokens = 112
+    page_starts = [2, 6, 10, 14]
+    seqlens = torch.tensor([70, 129, 66, 95], dtype=torch.int32)
+    width_blocks = 3
+    num_tokens = (max(page_starts) + width_blocks) * 64
     num_heads = 4
     topk = 5
-    q_rows = 4
+    q_rows = len(page_starts)
     active_rows = 3
 
     index_k_cache = pack_nsa_index_k_cache_reference(
@@ -208,12 +266,12 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_respects_active_decode_rows() ->
         torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32) / 2
     ).to(torch.float8_e4m3fn)
     weights = torch.randn((q_rows, num_heads, 1), generator=gen, dtype=torch.float32)
-    page_table_1 = torch.full((q_rows, 8), -1, dtype=torch.int32)
-    page_table_1[0, :5] = torch.tensor([2, 4, 6, 8, 10], dtype=torch.int32)
-    page_table_1[1, :6] = torch.tensor([21, 23, 25, 27, 29, 31], dtype=torch.int32)
-    page_table_1[2, :7] = torch.tensor([40, 42, 44, 46, 48, 50, 52], dtype=torch.int32)
-    page_table_1[3, :6] = torch.tensor([61, 63, 65, 67, 69, 71], dtype=torch.int32)
-    seqlens = torch.tensor([5, 6, 7, 6], dtype=torch.int32)
+    page_table_1, real_page_table = _make_paged_candidate_tables(
+        page_starts=page_starts,
+        seqlens=seqlens.tolist(),
+        width_blocks=width_blocks,
+        device=torch.device("cpu"),
+    )
 
     fake_indexer = _make_fake_indexer(module, topk=topk)
     fake_forward_batch = type(
@@ -227,6 +285,7 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_respects_active_decode_rows() ->
     )()
     metadata = _FakePagedMetadata(
         page_table_1=page_table_1,
+        real_page_table=real_page_table,
         seqlens_int32=seqlens,
         seqlens_expanded=seqlens,
         extend_lens=[1, 1, 1, 0],
@@ -324,10 +383,13 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_cuda_graph_capture() -> None:
     gen = torch.Generator(device="cpu")
     gen.manual_seed(73_103)
 
-    num_tokens = 160
+    page_starts = [4, 8, 12, 16]
+    seqlens = torch.tensor([96, 130, 71, 80], dtype=torch.int32, device=device)
+    width_blocks = 3
+    num_tokens = (max(page_starts) + width_blocks) * 64
     num_heads = 8
     topk = 6
-    q_rows = 4
+    q_rows = len(page_starts)
     active_rows = 3
 
     index_k_cache = pack_nsa_index_k_cache_reference(
@@ -340,14 +402,12 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_cuda_graph_capture() -> None:
     weights = torch.randn((q_rows, num_heads, 1), generator=gen, dtype=torch.float32).to(
         device=device
     )
-    page_table_1 = torch.full((q_rows, 10), -1, dtype=torch.int32, device=device)
-    page_table_1[0, :6] = torch.tensor([4, 9, 11, 18, 33, 40], dtype=torch.int32, device=device)
-    page_table_1[1, :7] = torch.tensor([2, 8, 15, 21, 45, 64, 65], dtype=torch.int32, device=device)
-    page_table_1[2, :8] = torch.tensor(
-        [79, 81, 96, 97, 111, 127, 128, 129], dtype=torch.int32, device=device
+    page_table_1, real_page_table = _make_paged_candidate_tables(
+        page_starts=page_starts,
+        seqlens=seqlens.tolist(),
+        width_blocks=width_blocks,
+        device=device,
     )
-    page_table_1[3, :5] = torch.tensor([140, 141, 143, 151, 159], dtype=torch.int32, device=device)
-    seqlens = torch.tensor([6, 7, 8, 5], dtype=torch.int32, device=device)
 
     fake_indexer = _make_fake_indexer(module, topk=topk)
     fake_forward_batch = type(
@@ -361,6 +421,7 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_cuda_graph_capture() -> None:
     )()
     metadata = _FakePagedMetadata(
         page_table_1=page_table_1,
+        real_page_table=real_page_table,
         seqlens_int32=seqlens,
         seqlens_expanded=seqlens,
         extend_lens=[1, 1, 1, 0],
