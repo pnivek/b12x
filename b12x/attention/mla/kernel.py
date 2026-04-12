@@ -2174,6 +2174,7 @@ def run_sparse_mla_kernel(
     page_table_1: torch.Tensor,
     sm_scale: float | torch.Tensor,
     output: torch.Tensor,
+    workspace: object | None = None,
 ) -> None:
     traits = select_sparse_mla_traits(
         q_all=q_all,
@@ -2207,12 +2208,16 @@ def run_sparse_mla_kernel(
         _to_kernel_tensor(output, _torch_to_cutlass_dtype(output.dtype)),
         current_cuda_stream(),
     )
+    # Use phantom tensors from workspace for stable cache keys when available.
+    _cq = getattr(workspace, "_contract_q", None)
+    _cpt = getattr(workspace, "_contract_page_table", None)
+    _co = getattr(workspace, "_contract_output", None)
     cache_key = (
-        _tensor_meta_key(q_u32),
+        _tensor_meta_key(_cq if _cq is not None else q_u32),
         _tensor_meta_key(kv_rows_u32),
         _tensor_meta_key(kv_scales),
-        _tensor_meta_key(page_table_1),
-        _tensor_meta_key(output),
+        _tensor_meta_key(_cpt if _cpt is not None else page_table_1),
+        _tensor_meta_key(_co if _co is not None else output),
         traits,
         head_tiles,
         str(output.dtype),

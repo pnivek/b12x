@@ -15,6 +15,21 @@ def _canonical_device(device: torch.device | str) -> torch.device:
     return device
 
 
+def _shape_only_cuda_tensor(
+    shape: tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return a tiny CUDA tensor whose shape/stride/dtype/device are stable.
+
+    Used as a phantom in host-launcher cache keys so that varying batch sizes
+    do not trigger CUTLASS recompilation.  The tensor is never read by kernels.
+    """
+    base = torch.empty(1, dtype=dtype, device=device)
+    return base.as_strided(shape, (0,) * len(shape))
+
+
 @dataclass(kw_only=True)
 class MLAWorkspace:
     mode: Literal["decode", "extend", "verify"]
@@ -47,6 +62,12 @@ class MLAWorkspace:
     sm_scale_value: float | None = None
     kv_chunk_size_value: int | None = None
     num_chunks_value: int | None = None
+    # Phantom tensors for stable host-launcher cache keys (fixed_capacity only).
+    _contract_q: torch.Tensor | None = None
+    _contract_page_table: torch.Tensor | None = None
+    _contract_output: torch.Tensor | None = None
+    _contract_tmp_output: torch.Tensor | None = None
+    _contract_tmp_lse: torch.Tensor | None = None
 
     @classmethod
     def for_contract(
@@ -122,6 +143,7 @@ class MLAWorkspace:
             padded_heads=padded_heads,
         )
         workspace.fixed_capacity = True
+        workspace._allocate_contract_phantoms()
         if use_cuda_graph:
             workspace._allocate_runtime_metadata()
         return workspace
@@ -322,6 +344,36 @@ class MLAWorkspace:
         self.page_table_1 = self.page_table_1_runtime[:rows, :width]
         self.cache_seqlens_int32 = self.cache_seqlens_int32_runtime[:batch]
         self.nsa_cache_seqlens_int32 = self.nsa_cache_seqlens_int32_runtime[:rows]
+
+    def _allocate_contract_phantoms(self) -> None:
+        """Create zero-stride phantom tensors at max capacity for stable cache keys."""
+        # q is viewed as uint32 in the kernel: (max_total_q, num_q_heads, head_dim // 4).
+        self._contract_q = _shape_only_cuda_tensor(
+            (self.max_total_q, self.num_q_heads, self.head_dim // 4),
+            dtype=torch.uint32,
+            device=self.device,
+        )
+        self._contract_page_table = _shape_only_cuda_tensor(
+            (self.max_total_q, self.topk),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._contract_output = _shape_only_cuda_tensor(
+            (self.max_total_q, self.num_q_heads, self.v_head_dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        if self.mode == "decode":
+            self._contract_tmp_output = _shape_only_cuda_tensor(
+                (self.max_total_q, self.num_q_heads, self.max_chunks_per_row, self.v_head_dim),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self._contract_tmp_lse = _shape_only_cuda_tensor(
+                (self.max_total_q, self.num_q_heads, self.max_chunks_per_row),
+                dtype=torch.float32,
+                device=self.device,
+            )
 
     def padded_query_view(self, total_q: int) -> torch.Tensor | None:
         if self.q_pad is None:

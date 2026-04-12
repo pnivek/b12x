@@ -525,7 +525,9 @@ def _refresh_dynamic_workspace_scales(
 
 def _finalize_workspace_views(workspace: TPMoEWorkspace) -> None:
     sf_dtype = cutlass.Float8E4M3FN
-    workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0).view(torch.float4_e2m1fn_x2)
+    # Keep as uint8 — the float4 element type is conveyed to CUTLASS via
+    # _gptr / compile-time dtype, and dlpack does not support float4.
+    workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0)
     workspace.packed_a_flat = workspace.packed_input.view(-1)
     workspace.scale_flat = workspace.packed_input_scale.view(-1)
     workspace.sfa_ptr = make_ptr(
@@ -685,8 +687,12 @@ def _get_weight_views(
         w1_alpha=_get_plain_cuda_tensor(w1_alphas),
         w2_alpha=_get_plain_cuda_tensor(w2_alphas),
     )
-    views.w13_fp4 = w13.view(torch.float4_e2m1fn_x2)
-    views.down_fp4 = down.view(torch.float4_e2m1fn_x2)
+    # Keep as uint8 for dlpack compatibility — torch float4 types are not
+    # supported by dlpack, and sglang may load weights as native float4.
+    # The CUTLASS kernel receives the element type via _gptr / compile-time
+    # dtype, not from the torch tensor dtype.
+    views.w13_fp4 = w13.view(torch.uint8)
+    views.down_fp4 = down.view(torch.uint8)
     views.sfb_w13_ptr = make_ptr(sf_dtype, w13_sf.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
     views.sfb_down_ptr = make_ptr(sf_dtype, down_sf.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
     _WEIGHT_CACHE[key] = views

@@ -197,6 +197,7 @@ def _run_sparse_mla(
             tmp_lse=workspace.tmp_lse,
             output=output,
             launch_num_chunks=launch_num_chunks,
+            workspace=workspace,
         )
     elif not use_reference and supports_sparse_mla_kernel(
         q_all=q_all,
@@ -215,6 +216,7 @@ def _run_sparse_mla(
             page_table_1=page_table_1,
             sm_scale=sm_scale_tensor,
             output=output,
+            workspace=workspace,
         )
     else:
         if _is_cuda_graph_capture_active(q_all.device):

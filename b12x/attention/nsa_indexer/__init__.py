@@ -3,6 +3,7 @@ from .api import (
     NSAIndexerPagedDecodeMetadata,
     clear_nsa_indexer_caches,
     get_paged_mqa_logits_metadata,
+    make_nsa_indexer_contract_phantoms,
     sparse_nsa_index_decode_logits_paged,
     sparse_nsa_index_extend_logits,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "NSAIndexerPagedDecodeMetadata",
     "clear_nsa_indexer_caches",
     "get_paged_mqa_logits_metadata",
+    "make_nsa_indexer_contract_phantoms",
     "pack_nsa_index_k_cache_reference",
     "sparse_nsa_extend_logits_reference",
     "sparse_nsa_index_decode_logits_paged",

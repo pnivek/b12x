@@ -676,6 +676,7 @@ def run_sparse_nsa_paged_logits_kernel(
     active_width: torch.Tensor | None = None,
     active_width_hint: int | None = None,
     page_size: int = _PAGE_SIZE,
+    contract_phantoms: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     if not supports_sparse_nsa_paged_logits_kernel(
         q_fp8=q_fp8,
@@ -732,17 +733,18 @@ def run_sparse_nsa_paged_logits_kernel(
         _to_kernel_tensor(logits, cutlass.Float32, assumed_align=4),
         current_cuda_stream(),
     )
+    _cp = contract_phantoms or {}
     cache_key = (
         persistent_ctas,
         q_fp8.shape[1],
-        _tensor_meta_key(q_bytes),
-        _tensor_meta_key(weights),
+        _tensor_meta_key(_cp.get("q_bytes", q_bytes)),
+        _tensor_meta_key(_cp.get("weights", weights)),
         _tensor_meta_key(k_quant_bytes),
         _tensor_meta_key(k_scales),
-        _tensor_meta_key(real_page_table),
-        _tensor_meta_key(seqlens_per_query),
+        _tensor_meta_key(_cp.get("real_page_table", real_page_table)),
+        _tensor_meta_key(_cp.get("seqlens_per_query", seqlens_per_query)),
         _tensor_meta_key(active_width),
-        _tensor_meta_key(logits),
+        _tensor_meta_key(_cp.get("logits", logits)),
     )
     _run_cached_host_launcher(kernel, cache_key, args)
     return logits

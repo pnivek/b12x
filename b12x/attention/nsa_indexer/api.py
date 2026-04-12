@@ -97,6 +97,35 @@ def clear_nsa_indexer_caches() -> None:
     _cached_width_cap_tensor.cache_clear()
 
 
+def make_nsa_indexer_contract_phantoms(
+    *,
+    max_q_rows: int,
+    num_heads: int,
+    max_pages: int,
+    page_size: int,
+    device: torch.device | str,
+) -> dict[str, torch.Tensor]:
+    """Create phantom tensors for stable NSA indexer host-launcher cache keys.
+
+    Pass the returned dict as ``contract_phantoms`` to
+    ``sparse_nsa_index_decode_logits_paged`` to avoid CUTLASS recompilation
+    when batch size varies in eager mode.
+    """
+    device = torch.device(device)
+    base_u8 = torch.empty(1, dtype=torch.uint8, device=device)
+    base_f32 = torch.empty(1, dtype=torch.float32, device=device)
+    base_i32 = torch.empty(1, dtype=torch.int32, device=device)
+    z = (0,)
+    width_tokens = max_pages * page_size
+    return {
+        "q_bytes": base_u8.as_strided((max_q_rows, num_heads, _INDEX_HEAD_DIM), z * 3),
+        "weights": base_f32.as_strided((max_q_rows, num_heads), z * 2),
+        "real_page_table": base_i32.as_strided((max_q_rows, max_pages), z * 2),
+        "seqlens_per_query": base_i32.as_strided((max_q_rows,), z),
+        "logits": base_f32.as_strided((max_q_rows, width_tokens), z * 2),
+    }
+
+
 def _normalize_weights(weights: torch.Tensor, *, q_rows: int, num_heads: int) -> torch.Tensor:
     if weights.ndim == 3:
         if weights.shape[2] != 1:
@@ -212,6 +241,7 @@ def sparse_nsa_index_decode_logits_paged(
     index_k_cache: torch.Tensor,
     metadata: NSAIndexerPagedDecodeMetadata,
     page_size: int = 64,
+    contract_phantoms: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     weights_f = _validate_paged_decode_inputs(
         q_fp8=q_fp8,
@@ -283,6 +313,7 @@ def sparse_nsa_index_decode_logits_paged(
         active_width=active_width,
         active_width_hint=metadata.active_width_hint,
         page_size=page_size,
+        contract_phantoms=contract_phantoms,
     )
     if valid_q_rows == full_q_rows:
         return logits_valid

@@ -379,6 +379,7 @@ def run_sparse_mla_split_decode_forward(
     tmp_output: torch.Tensor,
     tmp_lse: torch.Tensor,
     launch_num_chunks: int,
+    workspace: object | None = None,
 ) -> None:
     traits = select_sparse_mla_traits(
         q_all=q_all,
@@ -417,15 +418,19 @@ def run_sparse_mla_split_decode_forward(
         _to_kernel_tensor(tmp_lse, cutlass.Float32, assumed_align=4),
         current_cuda_stream(),
     )
+    _cq = getattr(workspace, "_contract_q", None)
+    _cpt = getattr(workspace, "_contract_page_table", None)
+    _cto = getattr(workspace, "_contract_tmp_output", None)
+    _ctl = getattr(workspace, "_contract_tmp_lse", None)
     forward_cache_key = (
-        _tensor_meta_key(q_u32),
+        _tensor_meta_key(_cq if _cq is not None else q_u32),
         _tensor_meta_key(kv_rows_u32),
         _tensor_meta_key(kv_scales),
-        _tensor_meta_key(page_table_1),
+        _tensor_meta_key(_cpt if _cpt is not None else page_table_1),
         _tensor_meta_key(kv_chunk_size_ptr),
         _tensor_meta_key(num_chunks_ptr),
-        _tensor_meta_key(tmp_output),
-        _tensor_meta_key(tmp_lse),
+        _tensor_meta_key(_cto if _cto is not None else tmp_output),
+        _tensor_meta_key(_ctl if _ctl is not None else tmp_lse),
         traits,
         int(launch_num_chunks),
         head_tiles,
@@ -440,6 +445,7 @@ def run_sparse_mla_split_decode_merge(
     tmp_lse: torch.Tensor,
     num_chunks_ptr: torch.Tensor,
     output: torch.Tensor,
+    workspace: object | None = None,
 ) -> None:
     merge_kernel = _build_sparse_mla_split_merge_kernel()
     merge_args = (
@@ -449,11 +455,14 @@ def run_sparse_mla_split_decode_merge(
         _to_kernel_tensor(output, _torch_to_cutlass_dtype(output.dtype)),
         current_cuda_stream(),
     )
+    _cto = getattr(workspace, "_contract_tmp_output", None)
+    _ctl = getattr(workspace, "_contract_tmp_lse", None)
+    _co = getattr(workspace, "_contract_output", None)
     merge_cache_key = (
-        _tensor_meta_key(tmp_output),
-        _tensor_meta_key(tmp_lse),
+        _tensor_meta_key(_cto if _cto is not None else tmp_output),
+        _tensor_meta_key(_ctl if _ctl is not None else tmp_lse),
         _tensor_meta_key(num_chunks_ptr),
-        _tensor_meta_key(output),
+        _tensor_meta_key(_co if _co is not None else output),
         str(tmp_output.dtype),
         str(output.dtype),
     )
@@ -472,6 +481,7 @@ def run_sparse_mla_split_decode(
     tmp_lse: torch.Tensor,
     output: torch.Tensor,
     launch_num_chunks: int,
+    workspace: object | None = None,
 ) -> None:
     run_sparse_mla_split_decode_forward(
         q_all=q_all,
@@ -483,10 +493,12 @@ def run_sparse_mla_split_decode(
         tmp_output=tmp_output,
         tmp_lse=tmp_lse,
         launch_num_chunks=launch_num_chunks,
+        workspace=workspace,
     )
     run_sparse_mla_split_decode_merge(
         tmp_output=tmp_output,
         tmp_lse=tmp_lse,
         num_chunks_ptr=num_chunks_ptr,
         output=output,
+        workspace=workspace,
     )
