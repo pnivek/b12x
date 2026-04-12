@@ -26,11 +26,28 @@ def _is_cuda_graph_capture_active(device: torch.device) -> bool:
     return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
 
 
+def _infer_active_width_hint(cache_seqlens_int32: torch.Tensor) -> int | None:
+    if cache_seqlens_int32.numel() == 0:
+        return 0
+    if _is_cuda_graph_capture_active(cache_seqlens_int32.device):
+        return None
+    return max(int(cache_seqlens_int32.amax().item()), 0)
+
+
 @dataclass(frozen=True)
 class NSAIndexerPagedDecodeMetadata:
     real_page_table: torch.Tensor
     cache_seqlens_int32: torch.Tensor
     paged_mqa_schedule_metadata: torch.Tensor | None = None
+    active_width_hint: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.active_width_hint is None:
+            object.__setattr__(
+                self,
+                "active_width_hint",
+                _infer_active_width_hint(self.cache_seqlens_int32),
+            )
 
 
 @dataclass(frozen=True)
@@ -42,7 +59,7 @@ class NSAIndexerExtendLogitsMetadata:
 def get_paged_mqa_logits_metadata(
     context_lens: torch.Tensor,
     block_kv: int,
-    num_sms: int,
+    num_sms: int | None = None,
 ) -> torch.Tensor:
     """Return a placeholder paged-MQA schedule tensor matching DeepGEMM's API.
 
@@ -63,6 +80,8 @@ def get_paged_mqa_logits_metadata(
         raise ValueError("context_lens must be contiguous")
     if block_kv <= 0:
         raise ValueError(f"block_kv must be positive, got {block_kv}")
+    if num_sms is None:
+        num_sms = torch.cuda.get_device_properties(context_lens.device).multi_processor_count
     if num_sms <= 0:
         raise ValueError(f"num_sms must be positive, got {num_sms}")
     return torch.zeros(
@@ -203,17 +222,16 @@ def sparse_nsa_index_decode_logits_paged(
     )
 
     valid_q_rows = metadata.real_page_table.shape[0]
+    full_q_rows = q_fp8.shape[0]
     width_tokens = metadata.real_page_table.shape[1] * page_size
-    logits = torch.full(
-        (q_fp8.shape[0], width_tokens),
-        float("-inf"),
-        dtype=torch.float32,
-        device=q_fp8.device,
-    )
     if valid_q_rows == 0 or width_tokens == 0:
-        return logits
+        return torch.full(
+            (full_q_rows, width_tokens),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q_fp8.device,
+        )
 
-    query_row_to_batch = torch.arange(valid_q_rows, dtype=torch.int32, device=q_fp8.device)
     seqlens_valid = metadata.cache_seqlens_int32.contiguous()
     active_width = _make_active_width_tensor(seqlens_per_query=seqlens_valid, width=width_tokens)
     max_page_capacity = index_k_cache.shape[0]
@@ -242,10 +260,10 @@ def sparse_nsa_index_decode_logits_paged(
         weights=weights_f[:valid_q_rows],
         index_k_cache=index_k_cache,
         real_page_table=metadata.real_page_table,
-        query_row_to_batch=query_row_to_batch,
         seqlens_per_query=seqlens_valid,
         page_size=page_size,
     ):
+        query_row_to_batch = torch.arange(valid_q_rows, dtype=torch.int32, device=q_fp8.device)
         return sparse_nsa_paged_logits_reference(
             q_fp8=q_fp8,
             weights=weights_f,
@@ -261,10 +279,19 @@ def sparse_nsa_index_decode_logits_paged(
         weights=weights_f[:valid_q_rows],
         index_k_cache=index_k_cache,
         real_page_table=metadata.real_page_table,
-        query_row_to_batch=query_row_to_batch,
         seqlens_per_query=seqlens_valid,
         active_width=active_width,
+        active_width_hint=metadata.active_width_hint,
         page_size=page_size,
+    )
+    if valid_q_rows == full_q_rows:
+        return logits_valid
+
+    logits = torch.full(
+        (full_q_rows, width_tokens),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q_fp8.device,
     )
     logits[:valid_q_rows].copy_(logits_valid)
     return logits

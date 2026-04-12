@@ -166,9 +166,9 @@ def test_mla_decode_workspace_allocates_split_buffers_and_chunk_scalars() -> Non
     )
 
     assert workspace.tmp_output is not None
-    assert workspace.tmp_output.shape == (8 * workspace.max_chunks_per_row, 8, 256)
+    assert workspace.tmp_output.shape == (8, 8, workspace.max_chunks_per_row, 256)
     assert workspace.tmp_lse is not None
-    assert workspace.tmp_lse.shape == (8 * workspace.max_chunks_per_row, 8)
+    assert workspace.tmp_lse.shape == (8, 8, workspace.max_chunks_per_row)
     workspace.set_decode_chunk_config(kv_chunk_size=256, num_chunks=8)
     assert workspace.kv_chunk_size_ptr is not None
     assert workspace.num_chunks_ptr is not None

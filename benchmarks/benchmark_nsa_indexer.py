@@ -500,7 +500,7 @@ def main() -> None:
     parser.add_argument("--decode-rows", default="1,16")
     parser.add_argument("--extend-batches", default="8")
     parser.add_argument("--extend-q-lens", default="4")
-    parser.add_argument("--cache-lens", default="2048,8192")
+    parser.add_argument("--cache-lens", default="1024,32768,131072")
     parser.add_argument(
         "--width",
         type=int,

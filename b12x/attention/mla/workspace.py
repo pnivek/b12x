@@ -158,16 +158,15 @@ class MLAWorkspace:
     def _allocate_decode_split_buffers(self) -> None:
         if self.mode != "decode":
             return
-        partial_rows = self.max_total_q * self.max_chunks_per_row
         if self.tmp_output is None:
             self.tmp_output = torch.empty(
-                (partial_rows, self.num_q_heads, self.v_head_dim),
+                (self.max_total_q, self.num_q_heads, self.max_chunks_per_row, self.v_head_dim),
                 dtype=self.dtype,
                 device=self.device,
             )
         if self.tmp_lse is None:
             self.tmp_lse = torch.empty(
-                (partial_rows, self.num_q_heads),
+                (self.max_total_q, self.num_q_heads, self.max_chunks_per_row),
                 dtype=torch.float32,
                 device=self.device,
             )

@@ -8,7 +8,7 @@ import json
 import pathlib
 import statistics
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -44,7 +44,7 @@ from benchmarks.common import (
 
 MODEL_PATH = pathlib.Path("/data/models/GLM-5.1-NVFP4")
 DEFAULT_BATCH_SIZES = (1, 2, 4, 8)
-DEFAULT_CACHE_LENS = (1024, 8192, 16384, 32768, 65536)
+DEFAULT_CACHE_LENS = (1024, 32768, 131072)
 DEFAULT_TP_SIZE = 8
 DEFAULT_TP_RANK = 0
 DEFAULT_POOL_FACTOR = 6
@@ -101,18 +101,24 @@ class SanityMetrics:
 @dataclass(frozen=True)
 class CaseReport:
     case: DecodeCase
-    graph_width: int
-    metadata_us: float
-    replay_us: float
-    indexer_us: float
-    mla_us: float
-    split_enabled: bool
-    chunk_size: int
-    num_chunks: int
-    mla_sanity: SanityMetrics
+    graph_width: int = 0
+    metadata_us: float = 0.0
+    replay_us: float = 0.0
+    indexer_us: float = 0.0
+    mla_us: float = 0.0
+    split_enabled: bool = False
+    chunk_size: int = 0
+    num_chunks: int = 0
+    mla_sanity: SanityMetrics = field(
+        default_factory=lambda: SanityMetrics(max_abs=0.0, rmse=0.0, cos=1.0)
+    )
 
     @property
     def total_us(self) -> float:
+        if self.metadata_us == 0.0 and self.replay_us == 0.0 and (
+            self.indexer_us > 0.0 or self.mla_us > 0.0
+        ):
+            return self.indexer_us + self.mla_us
         return self.metadata_us + self.replay_us
 
 
@@ -187,6 +193,10 @@ def _build_decode_cases(
 def _geomean(values: list[float]) -> float:
     if not values:
         raise ValueError("geomean requires at least one value")
+    if any(value <= 0.0 for value in values):
+        if all(value >= 0.0 for value in values):
+            return 0.0
+        raise ValueError("geomean requires non-negative values")
     return statistics.geometric_mean(values)
 
 
@@ -664,6 +674,7 @@ def _render_case_line(report: CaseReport) -> str:
         f"graphw={report.graph_width:6d} topk={report.case.topk:4d} split={split_flag:>3s} "
         f"chunk={report.chunk_size:3d} nchunks={report.num_chunks:d} | "
         f"step={report.total_us:8.2f} us | "
+        f"total={report.total_us:8.2f} us | "
         f"meta={report.metadata_us:8.2f} us | "
         f"replay={report.replay_us:8.2f} us | "
         f"indexer={report.indexer_us:8.2f} us | "
@@ -680,11 +691,12 @@ def _render_summary_lines(reports: list[CaseReport]) -> list[str]:
     return [
         "Summary",
         f"  cases: {len(reports)}",
+        f"  total geo:   {total_geo:.2f} us",
+        f"  indexer geo: {indexer_geo:.2f} us",
+        f"  mla geo:     {mla_geo:.2f} us",
         f"  step geo:    {total_geo:.2f} us",
         f"  meta geo:    {metadata_geo:.2f} us",
         f"  replay geo:  {replay_geo:.2f} us",
-        f"  indexer geo: {indexer_geo:.2f} us",
-        f"  mla geo:     {mla_geo:.2f} us",
     ]
 
 
@@ -697,7 +709,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--cache-lens",
-        default="1024,8192,16384,32768,65536",
+        default="1024,32768,131072",
         help=f"decode cache lengths, default {','.join(str(v) for v in DEFAULT_CACHE_LENS)}",
     )
     parser.add_argument("--topk-cap", type=int, default=2048)
