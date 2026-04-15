@@ -11,10 +11,10 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32, Uint32, const_expr
+from cutlass import Float32, Int32, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cutlass_dsl import Int64, T, dsl_user_op
+from cutlass.cutlass_dsl import Int64, dsl_user_op
 
 from b12x.attention import pipeline
 from b12x.attention import utils as attention_utils
@@ -547,15 +547,6 @@ class SparseNSAExtendLogitsKernel:
         s_q_bytes = storage.q_tile.get_tensor(
             cute.make_layout((_BLOCK_Q, _INDEX_HEAD_DIM), stride=(_INDEX_HEAD_DIM, 1))
         )
-        s_k_bytes = storage.k_linear.get_tensor(
-            cute.make_layout((_BLOCK_K, _INDEX_HEAD_DIM), stride=(_INDEX_HEAD_DIM, 1))
-        )
-        s_k_linear_stage = storage.k_linear.get_tensor(
-            cute.make_layout(
-                (_BLOCK_K, _INDEX_HEAD_DIM, 1),
-                stride=(_INDEX_HEAD_DIM, 1, _BLOCK_K * _INDEX_HEAD_DIM),
-            )
-        )
         s_k_linear_bytes = storage.k_linear.get_tensor(
             cute.make_layout((_BLOCK_K * _INDEX_HEAD_DIM,), stride=(1,))
         )
@@ -772,10 +763,10 @@ def run_sparse_nsa_extend_logits_kernel(
         return out
 
     q_bytes = q_fp8.contiguous().view(torch.uint8)
-    q_u32 = _view_last_dim_as_u32(q_bytes)
     k_quant_padded, k_scale_padded = _pad_kv_rows(k_quant=k_quant, k_scale=k_scale)
     k_quant_bytes = k_quant_padded.contiguous().view(torch.uint8)
-    k_tma_desc, k_tma_desc_ptrs = _get_cached_extend_k_tma_descriptor(k_quant_bytes)
+    _, k_tma_desc_ptrs = _get_cached_extend_k_tma_descriptor(k_quant_bytes)
+    q_u32 = _view_last_dim_as_u32(q_bytes)
     kernel = _build_sparse_nsa_extend_kernel()
     args = (
         _to_kernel_tensor(q_u32, cutlass.Uint32),

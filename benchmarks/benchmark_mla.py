@@ -15,7 +15,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from b12x.attention.mla.split import select_sparse_mla_split_decode_config
-from b12x.attention.nsa_indexer.reference import sparse_nsa_paged_logits_reference
+from b12x.attention.nsa_indexer.reference import (
+    sparse_nsa_extend_logits_reference,
+    sparse_nsa_paged_logits_reference,
+)
 from b12x.integration.mla import (
     MLASparseDecodeMetadata,
     MLASparseExtendMetadata,
@@ -27,10 +30,12 @@ from b12x.integration.mla import (
     sparse_mla_extend_forward,
 )
 from b12x.integration.nsa_indexer import (
+    NSAIndexerExtendLogitsMetadata,
     NSAIndexerPagedDecodeMetadata,
     clear_nsa_indexer_caches,
     pack_nsa_index_k_cache_reference,
     sparse_nsa_index_decode_logits_paged,
+    sparse_nsa_index_extend_logits,
 )
 
 from benchmarks.common import (
@@ -292,6 +297,33 @@ def _select_paged_topk_from_logits(
     return output
 
 
+def _select_ragged_topk_from_logits(
+    *,
+    logits: torch.Tensor,
+    k_start: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+) -> torch.Tensor:
+    rows = logits.shape[0]
+    output = torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
+    gather_k = min(topk, logits.shape[1])
+    if gather_k == 0:
+        return output
+    positions = torch.arange(logits.shape[1], device=logits.device, dtype=torch.int32).unsqueeze(0)
+    row_start = k_start.unsqueeze(1)
+    row_end = row_start + lengths.unsqueeze(1)
+    valid = (positions >= row_start) & (positions < row_end)
+    masked_logits = torch.where(valid, logits, torch.full_like(logits, float("-inf")))
+    topk_pos = torch.argsort(masked_logits, dim=1, descending=True, stable=True)[:, :gather_k]
+    topk_values = torch.gather(masked_logits, 1, topk_pos)
+    output[:, :gather_k] = torch.where(
+        torch.isfinite(topk_values),
+        topk_pos.to(torch.int32),
+        torch.full_like(topk_pos, -1, dtype=torch.int32),
+    )
+    return output
+
+
 def _make_decode_graph_prepare(
     *,
     live_page_table_1: torch.Tensor,
@@ -431,6 +463,33 @@ def _remap_selected_indices_to_local_offsets(
     ).view_as(selected_indices)
     local_offsets.masked_fill_(selected_indices < 0, -1)
     return local_offsets
+
+
+def _make_extend_kv_fp8(
+    *,
+    index_k_cache: torch.Tensor,
+    real_page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    data_bytes = page_size * 128
+    total_rows = int(seq_lens.sum().item())
+    k_bytes = torch.empty((total_rows, 128), dtype=torch.uint8, device=index_k_cache.device)
+    scale_bytes = torch.empty((total_rows, 4), dtype=torch.uint8, device=index_k_cache.device)
+    write_row = 0
+    for batch_row in range(real_page_table.shape[0]):
+        seq_len = int(seq_lens[batch_row].item())
+        for token_pos in range(seq_len):
+            page_col = token_pos // page_size
+            slot = token_pos % page_size
+            page_id = int(real_page_table[batch_row, page_col].item())
+            k_bytes[write_row] = index_k_cache[page_id, slot * 128 : (slot + 1) * 128]
+            scale_bytes[write_row] = index_k_cache[
+                page_id,
+                data_bytes + slot * 4 : data_bytes + (slot + 1) * 4,
+            ]
+            write_row += 1
+    return k_bytes.view(torch.float8_e4m3fn), scale_bytes.view(torch.float32).squeeze(-1)
 
 
 def _run_decode_case(
@@ -699,7 +758,7 @@ def _run_decode_case(
     )
 
 
-def _run_verify_case(
+def _run_prefill_or_verify_case(
     *,
     case: DecodeCase,
     cfg: GLMDecodeContractConfig,
@@ -806,6 +865,18 @@ def _run_verify_case(
     graph_batch_cache_seqlens = torch.empty_like(batch_cache_seqlens)
     graph_expanded_cache_seqlens = torch.empty_like(expanded_cache_seqlens)
     graph_nsa_cache_seqlens = torch.empty_like(nsa_cache_seqlens)
+    live_extend_lengths = torch.arange(
+        case.cache_len - case.q_len + 1,
+        case.cache_len + 1,
+        dtype=torch.int32,
+        device=device,
+    ).repeat(case.batch_size)
+    live_extend_k_start = torch.repeat_interleave(
+        torch.arange(case.batch_size, dtype=torch.int32, device=device) * case.cache_len,
+        case.q_len,
+    )
+    graph_extend_k_start = torch.empty_like(live_extend_k_start)
+    graph_extend_lengths = torch.empty_like(live_extend_lengths)
 
     def prepare_verify_graph() -> None:
         live_width = live_candidate_page_table.shape[1]
@@ -815,85 +886,128 @@ def _run_verify_case(
         graph_batch_cache_seqlens.copy_(batch_cache_seqlens)
         graph_expanded_cache_seqlens.copy_(expanded_cache_seqlens)
         graph_nsa_cache_seqlens.copy_(nsa_cache_seqlens)
+        graph_extend_k_start.copy_(live_extend_k_start)
+        graph_extend_lengths.copy_(live_extend_lengths)
 
     prepare_verify_graph()
-    indexer_metadata = NSAIndexerPagedDecodeMetadata(
-        real_page_table=graph_real_page_table,
-        cache_seqlens_int32=graph_expanded_cache_seqlens,
+    extend_k_nope = k_nope[pool_locs.to(torch.long)]
+    extend_k_rope = k_rope[pool_locs.to(torch.long)]
+    extend_kv_cache = pack_mla_kv_cache_reference(extend_k_nope, extend_k_rope)
+    extend_kv_fp8 = _make_extend_kv_fp8(
+        index_k_cache=index_k_cache,
+        real_page_table=base_real_page_table,
+        seq_lens=batch_cache_seqlens,
+        page_size=cfg.page_size,
     )
 
-    def run_indexer():
-        logits = sparse_nsa_index_decode_logits_paged(
+    if case.mode == "verify":
+        indexer_metadata = NSAIndexerPagedDecodeMetadata(
+            real_page_table=graph_real_page_table,
+            cache_seqlens_int32=graph_expanded_cache_seqlens,
+        )
+
+        def run_indexer():
+            logits = sparse_nsa_index_decode_logits_paged(
+                q_fp8=q_fp8,
+                weights=weights,
+                index_k_cache=index_k_cache,
+                metadata=indexer_metadata,
+                page_size=cfg.page_size,
+            )
+            return _select_paged_topk_from_logits(
+                logits=logits,
+                page_table_1=graph_candidate_page_table,
+                seqlens=graph_expanded_cache_seqlens,
+                topk=case.topk,
+            )
+
+        clear_nsa_indexer_caches()
+        actual_topk = run_indexer()
+        query_row_to_batch = torch.arange(
+            case.batch_size,
+            dtype=torch.int32,
+            device=device,
+        ).repeat_interleave(case.q_len)
+        expected_logits = sparse_nsa_paged_logits_reference(
             q_fp8=q_fp8,
             weights=weights,
             index_k_cache=index_k_cache,
-            metadata=indexer_metadata,
+            real_page_table=graph_real_page_table,
+            query_row_to_batch=query_row_to_batch,
+            seqlens_per_query=graph_expanded_cache_seqlens,
             page_size=cfg.page_size,
         )
-        return _select_paged_topk_from_logits(
-            logits=logits,
+        expected_topk = _select_paged_topk_from_logits(
+            logits=expected_logits,
             page_table_1=graph_candidate_page_table,
             seqlens=graph_expanded_cache_seqlens,
             topk=case.topk,
         )
+        torch.cuda.synchronize()
+        _assert_decode_contract_match(
+            case=case,
+            actual=actual_topk,
+            expected=expected_topk,
+            page_table_1=graph_candidate_page_table,
+            seqlens=graph_expanded_cache_seqlens,
+            topk=case.topk,
+        )
+        mla_selected_indices = actual_topk
+        mla_kv_cache = kv_cache
+        mla_k_nope = k_nope
+        mla_k_rope = k_rope
+        mla_metadata_mode = "target_verify"
+        mla_workspace_mode = "verify"
+    else:
+        extend_indexer_metadata = NSAIndexerExtendLogitsMetadata(
+            k_start=graph_extend_k_start,
+            k_end=graph_extend_k_start + graph_extend_lengths,
+        )
 
-    clear_nsa_indexer_caches()
-    actual_topk = run_indexer()
-    query_row_to_batch = torch.arange(
-        case.batch_size,
-        dtype=torch.int32,
-        device=device,
-    ).repeat_interleave(case.q_len)
-    expected_logits = sparse_nsa_paged_logits_reference(
-        q_fp8=q_fp8,
-        weights=weights,
-        index_k_cache=index_k_cache,
-        real_page_table=graph_real_page_table,
-        query_row_to_batch=query_row_to_batch,
-        seqlens_per_query=graph_expanded_cache_seqlens,
-        page_size=cfg.page_size,
-    )
-    expected_topk = _select_paged_topk_from_logits(
-        logits=expected_logits,
-        page_table_1=graph_candidate_page_table,
-        seqlens=graph_expanded_cache_seqlens,
-        topk=case.topk,
-    )
-    torch.cuda.synchronize()
-    _assert_decode_contract_match(
-        case=case,
-        actual=actual_topk,
-        expected=expected_topk,
-        page_table_1=graph_candidate_page_table,
-        seqlens=graph_expanded_cache_seqlens,
-        topk=case.topk,
-    )
+        def run_indexer():
+            logits = sparse_nsa_index_extend_logits(
+                q_fp8=q_fp8,
+                weights=weights,
+                kv_fp8=extend_kv_fp8,
+                metadata=extend_indexer_metadata,
+            )
+            return _select_ragged_topk_from_logits(
+                logits=logits,
+                k_start=graph_extend_k_start,
+                lengths=graph_extend_lengths,
+                topk=case.topk,
+            )
 
-    extend_k_nope = k_nope[pool_locs.to(torch.long)]
-    extend_k_rope = k_rope[pool_locs.to(torch.long)]
-    extend_kv_cache = pack_mla_kv_cache_reference(extend_k_nope, extend_k_rope)
-    physical_to_local = torch.full(
-        (pool_tokens,),
-        -1,
-        dtype=torch.int32,
-        device=device,
-    )
-    physical_to_local[pool_locs.to(torch.long)] = torch.arange(
-        pool_locs.shape[0],
-        dtype=torch.int32,
-        device=device,
-    )
-    extend_topk = _remap_selected_indices_to_local_offsets(
-        selected_indices=actual_topk,
-        physical_to_local=physical_to_local,
-    )
-
-    mla_selected_indices = actual_topk if case.mode == "verify" else extend_topk
-    mla_kv_cache = kv_cache if case.mode == "verify" else extend_kv_cache
-    mla_k_nope = k_nope if case.mode == "verify" else extend_k_nope
-    mla_k_rope = k_rope if case.mode == "verify" else extend_k_rope
-    mla_metadata_mode = "target_verify" if case.mode == "verify" else "extend"
-    mla_workspace_mode = "verify" if case.mode == "verify" else "extend"
+        clear_nsa_indexer_caches()
+        actual_topk = run_indexer()
+        expected_logits = sparse_nsa_extend_logits_reference(
+            q_fp8=q_fp8,
+            weights=weights,
+            kv_fp8=extend_kv_fp8,
+            k_start=graph_extend_k_start,
+            k_end=graph_extend_k_start + graph_extend_lengths,
+        )
+        expected_topk = _select_ragged_topk_from_logits(
+            logits=expected_logits,
+            k_start=graph_extend_k_start,
+            lengths=graph_extend_lengths,
+            topk=case.topk,
+        )
+        torch.cuda.synchronize()
+        _assert_decode_contract_match(
+            case=case,
+            actual=actual_topk,
+            expected=expected_topk,
+            page_table_1=graph_candidate_page_table,
+            seqlens=graph_expanded_cache_seqlens,
+            topk=case.topk,
+        )
+        mla_selected_indices = actual_topk
+        mla_kv_cache = extend_kv_cache
+        mla_k_nope = extend_k_nope
+        mla_k_rope = extend_k_rope
+        mla_metadata_mode = "extend"
+        mla_workspace_mode = "extend"
 
     mla_metadata = MLASparseExtendMetadata(
         selected_token_offsets=mla_selected_indices,
@@ -932,31 +1046,12 @@ def _run_verify_case(
         )
 
     def run_step():
-        topk_indices = _select_paged_topk_from_logits(
-            logits=sparse_nsa_index_decode_logits_paged(
-                q_fp8=q_fp8,
-                weights=weights,
-                index_k_cache=index_k_cache,
-                metadata=indexer_metadata,
-                page_size=cfg.page_size,
-            ),
-            page_table_1=graph_candidate_page_table,
-            seqlens=graph_expanded_cache_seqlens,
-            topk=case.topk,
-        )
-        mla_step_selected_indices = (
-            topk_indices
-            if case.mode == "verify"
-            else _remap_selected_indices_to_local_offsets(
-                selected_indices=topk_indices,
-                physical_to_local=physical_to_local,
-            )
-        )
+        topk_indices = run_indexer()
         return sparse_mla_extend_forward(
             q_all=q_all,
             kv_cache=mla_kv_cache,
             metadata=MLASparseExtendMetadata(
-                selected_token_offsets=mla_step_selected_indices,
+                selected_token_offsets=topk_indices,
                 cache_seqlens_int32=graph_batch_cache_seqlens,
                 nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
                 nsa_cu_seqlens_q=cu_seqlens_q,
@@ -1069,7 +1164,7 @@ def collect_case_reports(
                 graph_width=args.graph_width,
             )
             if case.mode == "decode"
-            else _run_verify_case(
+            else _run_prefill_or_verify_case(
                 case=case,
                 cfg=cfg,
                 warmup=args.warmup,

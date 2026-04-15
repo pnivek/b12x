@@ -373,3 +373,55 @@ def test_sparse_nsa_index_extend_logits_matches_reference_for_sparse_tile_ranges
     _assert_logits_close(actual, expected)
     assert torch.isneginf(actual[:32, 32:]).all()
     assert torch.isneginf(actual[32:, :128]).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for extend kernel coverage")
+@pytest.mark.parametrize("num_heads", [16, 32, 64])
+def test_sparse_nsa_index_extend_logits_cuda_matches_reference_for_large_head_counts(
+    num_heads: int,
+) -> None:
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(72_105 + num_heads)
+
+    q_rows = 8
+    k_rows = 257
+    q_fp8 = (
+        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32).to(device=device) / 2
+    ).to(torch.float8_e4m3fn)
+    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32).to(device=device)
+    k = torch.randn((k_rows, 128), generator=gen, dtype=torch.float32).to(device=device) / 3
+    kv_fp8 = _quantize_rows_to_kv_fp8(k)
+    k_start = torch.tensor(
+        [0, 192, 16, 128, 32, 224, 0, 64],
+        dtype=torch.int32,
+        device=device,
+    )
+    k_end = torch.tensor(
+        [33, 257, 80, 192, 96, 257, 1, 65],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    actual = sparse_nsa_index_extend_logits(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        metadata=NSAIndexerExtendLogitsMetadata(
+            k_start=k_start,
+            k_end=k_end,
+        ),
+    )
+    expected = sparse_nsa_extend_logits_reference(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        k_start=k_start,
+        k_end=k_end,
+    )
+
+    torch.cuda.synchronize(device)
+    _assert_logits_close(actual, expected)
+    assert torch.isneginf(actual[0, 33:192]).all()
+    assert torch.isneginf(actual[1, :192]).all()
+    assert torch.isneginf(actual[6, 1:]).all()
