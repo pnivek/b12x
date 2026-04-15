@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark realistic SGLang-like GLM-5.1 TP8 decode/verify replay: NSA indexer + sparse MLA."""
+"""Benchmark realistic SGLang-like GLM-5.1 TP8 decode plus eager-prefill chunks."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ from benchmarks.common import (
 MODEL_PATH = pathlib.Path("/data/models/GLM-5.1-NVFP4")
 DEFAULT_BATCH_SIZES = (1, 2, 4, 8)
 DEFAULT_CACHE_LENS = (1024, 32768, 131072)
-DEFAULT_VERIFY_Q_LENS = (4,)
+DEFAULT_PREFILL_Q_LENS = (16384,)
 DEFAULT_TP_SIZE = 8
 DEFAULT_TP_RANK = 0
 DEFAULT_POOL_FACTOR = 6
@@ -187,7 +187,7 @@ def _build_decode_cases(
     topk_cap: int,
 ) -> list[DecodeCase]:
     cases: list[DecodeCase] = []
-    allowed_modes = {"decode", "verify"}
+    allowed_modes = {"decode", "prefill", "verify"}
     for mode in modes:
         if mode not in allowed_modes:
             raise ValueError(f"unsupported mode {mode!r}, expected one of {sorted(allowed_modes)}")
@@ -206,13 +206,17 @@ def _build_decode_cases(
                         q_len=1,
                     )
                 )
-            if "verify" in modes:
+            for prefill_mode in ("prefill", "verify"):
+                if prefill_mode not in modes:
+                    continue
                 for q_len in verify_q_lens:
                     if q_len <= 0:
-                        raise ValueError(f"verify q_len must be positive, got {q_len}")
+                        raise ValueError(f"prefill q_len must be positive, got {q_len}")
+                    if q_len > cache_len:
+                        continue
                     cases.append(
                         DecodeCase(
-                            mode="verify",
+                            mode=prefill_mode,
                             batch_size=batch_size,
                             cache_len=cache_len,
                             topk=topk,
@@ -696,7 +700,7 @@ def _run_verify_case(
     if pool_factor <= 0:
         raise ValueError(f"pool_factor must be positive, got {pool_factor}")
     if case.q_len <= 1:
-        raise ValueError(f"verify q_len must be > 1, got {case.q_len}")
+        raise ValueError(f"prefill q_len must be > 1, got {case.q_len}")
     graph_width = _resolve_graph_width(cache_len=case.cache_len, graph_width=graph_width)
     aligned_graph_width = _align_up(graph_width, cfg.page_size)
     pool_tokens = _align_up(max(case.cache_len, case.cache_len * pool_factor), cfg.page_size)
@@ -1071,8 +1075,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--modes",
-        default="decode,verify",
-        help="benchmark modes to run: decode, verify, or both via csv (default: decode,verify)",
+        default="decode,prefill",
+        help="benchmark modes to run: decode, prefill, verify, or a csv mix (default: decode,prefill)",
     )
     parser.add_argument(
         "--batch-sizes",
@@ -1086,8 +1090,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--verify-q-lens",
-        default="4",
-        help=f"verify q lengths, default {','.join(str(v) for v in DEFAULT_VERIFY_Q_LENS)}",
+        "--prefill-q-lens",
+        dest="verify_q_lens",
+        default="16384",
+        help=f"prefill/verify chunk q lengths, default {','.join(str(v) for v in DEFAULT_PREFILL_Q_LENS)}",
     )
     parser.add_argument("--topk-cap", type=int, default=2048)
     parser.add_argument("--tp-size", type=int, default=DEFAULT_TP_SIZE)

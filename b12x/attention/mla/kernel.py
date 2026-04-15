@@ -316,6 +316,20 @@ def _stage_all_token_scales(
         linear += Int32(_MLA_WARP_THREADS)
 
 
+@cute.jit
+def _clamp_active_token_count(
+    active_token_counts: cute.Tensor,
+    q_idx: Int32,
+    max_width: Int32,
+) -> Int32:
+    token_end = Int32(active_token_counts[q_idx])
+    if token_end < Int32(0):
+        token_end = Int32(0)
+    if token_end > max_width:
+        token_end = max_width
+    return token_end
+
+
 def _extract_packed_kv_runtime_views(
     kv_cache: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2060,6 +2074,7 @@ class SparseMLAKernel:
         kv_rows_u32: cute.Tensor,
         kv_scales: cute.Tensor,
         page_table_1: cute.Tensor,
+        active_token_counts: cute.Tensor,
         sm_scale: cute.Tensor,
         output: cute.Tensor,
         stream: cuda.CUstream,
@@ -2069,6 +2084,7 @@ class SparseMLAKernel:
             kv_rows_u32,
             kv_scales,
             page_table_1,
+            active_token_counts,
             sm_scale,
             output,
         ).launch(
@@ -2084,6 +2100,7 @@ class SparseMLAKernel:
         kv_rows_u32: cute.Tensor,
         kv_scales: cute.Tensor,
         page_table_1: cute.Tensor,
+        active_token_counts: cute.Tensor,
         sm_scale: cute.Tensor,
         output: cute.Tensor,
     ):
@@ -2091,6 +2108,7 @@ class SparseMLAKernel:
         q_idx, head_tile_idx, _ = cute.arch.block_idx()
         q_idx = Int32(q_idx)
         head_tile_start = Int32(head_tile_idx * _MLA_HEADS_PER_TILE)
+        token_end = _clamp_active_token_count(active_token_counts, q_idx, Int32(page_table_1.shape[1]))
 
         smem = cutlass.utils.SmemAllocator()
         SharedStorage = get_sparse_mla_shared_storage_cls()
@@ -2114,7 +2132,7 @@ class SparseMLAKernel:
             q_idx,
             head_tile_start,
             Int32(0),
-            Int32(page_table_1.shape[1]),
+            token_end,
             Float32(sm_scale[Int32(0)] * attention_utils.LOG2_E),
             lane,
             output,
@@ -2172,6 +2190,7 @@ def run_sparse_mla_kernel(
     q_all: torch.Tensor,
     kv_cache: torch.Tensor,
     page_table_1: torch.Tensor,
+    active_token_counts: torch.Tensor,
     sm_scale: float | torch.Tensor,
     output: torch.Tensor,
     workspace: object | None = None,
@@ -2185,6 +2204,17 @@ def run_sparse_mla_kernel(
     )
     if traits is None:
         raise ValueError("sparse MLA kernel only supports the exact CUDA GLM-5.1 contract")
+    if active_token_counts.dtype != torch.int32:
+        raise ValueError(
+            f"active_token_counts must have dtype torch.int32, got {active_token_counts.dtype}"
+        )
+    if active_token_counts.device != q_all.device:
+        raise ValueError("active_token_counts must be on the same device as q_all")
+    if active_token_counts.ndim != 1 or active_token_counts.shape[0] != q_all.shape[0]:
+        raise ValueError(
+            "active_token_counts must be rank-1 with one entry per query row, "
+            f"got {tuple(active_token_counts.shape)} for q rows {q_all.shape[0]}"
+        )
 
     kv_rows_u32, kv_scales = _extract_packed_kv_runtime_views(kv_cache)
     q_u32 = _view_last_dim_as_u32(q_all)
@@ -2204,6 +2234,7 @@ def run_sparse_mla_kernel(
         _to_kernel_tensor(kv_rows_u32, cutlass.Uint32, assumed_align=16),
         _to_kernel_tensor(kv_scales, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(page_table_1, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(active_token_counts, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(sm_scale_tensor, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(output, _torch_to_cutlass_dtype(output.dtype)),
         current_cuda_stream(),
@@ -2211,12 +2242,14 @@ def run_sparse_mla_kernel(
     # Use phantom tensors from workspace for stable cache keys when available.
     _cq = getattr(workspace, "_contract_q", None)
     _cpt = getattr(workspace, "_contract_page_table", None)
+    _cnt = getattr(workspace, "_contract_nsa_cache_seqlens", None)
     _co = getattr(workspace, "_contract_output", None)
     cache_key = (
         _tensor_meta_key(_cq if _cq is not None else q_u32),
         _tensor_meta_key(kv_rows_u32),
         _tensor_meta_key(kv_scales),
         _tensor_meta_key(_cpt if _cpt is not None else page_table_1),
+        _tensor_meta_key(_cnt if _cnt is not None else active_token_counts),
         _tensor_meta_key(_co if _co is not None else output),
         traits,
         head_tiles,

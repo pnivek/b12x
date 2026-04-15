@@ -107,8 +107,11 @@ def _run_sparse_mla(
     v_head_dim: int,
 ) -> torch.Tensor:
     page_table_1 = workspace.page_table_1
+    active_token_counts = workspace.nsa_cache_seqlens_int32
     if page_table_1 is None:
         raise RuntimeError("workspace metadata is not prepared")
+    if active_token_counts is None:
+        raise RuntimeError("workspace active token counts are not prepared")
     if q_all.ndim != 3:
         raise ValueError(f"q_all must be rank-3, got {tuple(q_all.shape)}")
     if kv_cache.ndim != 3:
@@ -161,18 +164,19 @@ def _run_sparse_mla(
     use_reference = os.environ.get("B12X_MLA_FORCE_REFERENCE", "0") == "1"
     sm_scale_tensor = _get_sm_scale_tensor(workspace=workspace, device=q_all.device, sm_scale=sm_scale)
     split_cfg = None
-    if not use_reference and workspace.mode in ("decode", "verify"):
+    if not use_reference:
         split_cfg = select_sparse_mla_split_decode_config(
             q_all=q_all,
             kv_cache=kv_cache,
             page_table_1=page_table_1,
+            active_token_counts=active_token_counts,
             output_dtype=q_all.dtype,
             v_head_dim=v_head_dim,
         )
     if split_cfg is not None:
         if workspace.tmp_output is None or workspace.tmp_lse is None:
-            raise RuntimeError("decode workspace is missing split MLA buffers")
-        workspace.set_decode_chunk_config(
+            raise RuntimeError("workspace is missing split MLA buffers")
+        workspace.set_split_chunk_config(
             kv_chunk_size=split_cfg.chunk_size,
             num_chunks=split_cfg.num_chunks,
         )
@@ -190,6 +194,7 @@ def _run_sparse_mla(
             q_all=q_all,
             kv_cache=kv_cache,
             page_table_1=page_table_1,
+            active_token_counts=active_token_counts,
             sm_scale=sm_scale_tensor,
             kv_chunk_size_ptr=workspace.kv_chunk_size_ptr,
             num_chunks_ptr=workspace.num_chunks_ptr,
@@ -214,6 +219,7 @@ def _run_sparse_mla(
             q_all=q_all,
             kv_cache=kv_cache,
             page_table_1=page_table_1,
+            active_token_counts=active_token_counts,
             sm_scale=sm_scale_tensor,
             output=output,
             workspace=workspace,

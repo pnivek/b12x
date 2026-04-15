@@ -26,6 +26,7 @@ from .kernel import (
     _extract_packed_kv_runtime_views,
     _exp2_approx_ftz_f32,
     _log2_approx_ftz_f32,
+    _clamp_active_token_count,
     _run_cached_host_launcher,
     _run_two_pass_sparse_mla_tile,
     _tensor_meta_key,
@@ -88,6 +89,7 @@ def select_sparse_mla_split_decode_config(
     q_all: torch.Tensor,
     kv_cache: torch.Tensor,
     page_table_1: torch.Tensor,
+    active_token_counts: torch.Tensor | None = None,
     output_dtype: torch.dtype,
     v_head_dim: int,
 ) -> SparseMLASplitDecodeConfig | None:
@@ -102,6 +104,9 @@ def select_sparse_mla_split_decode_config(
         return None
 
     width = int(page_table_1.shape[1])
+    if active_token_counts is not None and active_token_counts.numel() > 0:
+        if active_token_counts.device.type != "cuda" or not torch.cuda.is_current_stream_capturing():
+            width = min(width, max(0, int(active_token_counts.max().item())))
     if width <= _SPLIT_CHUNK_LADDER[0] or width > _SPLIT_MAX_WIDTH:
         return None
 
@@ -161,6 +166,7 @@ class SparseMLASplitDecodeForwardKernel:
         kv_rows_u32: cute.Tensor,
         kv_scales: cute.Tensor,
         page_table_1: cute.Tensor,
+        active_token_counts: cute.Tensor,
         sm_scale: cute.Tensor,
         kv_chunk_size_ptr: cute.Tensor,
         num_chunks_ptr: cute.Tensor,
@@ -173,6 +179,7 @@ class SparseMLASplitDecodeForwardKernel:
             kv_rows_u32,
             kv_scales,
             page_table_1,
+            active_token_counts,
             sm_scale,
             kv_chunk_size_ptr,
             num_chunks_ptr,
@@ -195,6 +202,7 @@ class SparseMLASplitDecodeForwardKernel:
         kv_rows_u32: cute.Tensor,
         kv_scales: cute.Tensor,
         page_table_1: cute.Tensor,
+        active_token_counts: cute.Tensor,
         sm_scale: cute.Tensor,
         kv_chunk_size_ptr: cute.Tensor,
         num_chunks_ptr: cute.Tensor,
@@ -210,14 +218,17 @@ class SparseMLASplitDecodeForwardKernel:
         active_num_chunks = Int32(num_chunks_ptr[Int32(0)])
         if active_num_chunks > Int32(_SPLIT_MAX_CHUNKS):
             active_num_chunks = Int32(_SPLIT_MAX_CHUNKS)
-        if chunk_idx >= active_num_chunks:
+        row_token_end = _clamp_active_token_count(
+            active_token_counts, q_idx, Int32(page_table_1.shape[1])
+        )
+        chunk_size = Int32(kv_chunk_size_ptr[Int32(0)])
+        token_start = Int32(chunk_idx) * chunk_size
+        if chunk_idx >= active_num_chunks or token_start >= row_token_end:
             _zero_partial_head_tile(tmp_output, tmp_lse, q_idx, chunk_idx, head_tile_start, lane)
         else:
-            chunk_size = Int32(kv_chunk_size_ptr[Int32(0)])
-            token_start = Int32(chunk_idx) * chunk_size
             token_end = token_start + chunk_size
-            if token_end > Int32(page_table_1.shape[1]):
-                token_end = Int32(page_table_1.shape[1])
+            if token_end > row_token_end:
+                token_end = row_token_end
 
             smem = cutlass.utils.SmemAllocator()
             SharedStorage = get_sparse_mla_shared_storage_cls()
@@ -373,6 +384,7 @@ def run_sparse_mla_split_decode_forward(
     q_all: torch.Tensor,
     kv_cache: torch.Tensor,
     page_table_1: torch.Tensor,
+    active_token_counts: torch.Tensor,
     sm_scale: torch.Tensor,
     kv_chunk_size_ptr: torch.Tensor,
     num_chunks_ptr: torch.Tensor,
@@ -390,6 +402,17 @@ def run_sparse_mla_split_decode_forward(
     )
     if traits is None:
         raise ValueError("sparse MLA split decode only supports the exact CUDA GLM-5.1 contract")
+    if active_token_counts.dtype != torch.int32:
+        raise ValueError(
+            f"active_token_counts must have dtype torch.int32, got {active_token_counts.dtype}"
+        )
+    if active_token_counts.device != q_all.device:
+        raise ValueError("active_token_counts must be on the same device as q_all")
+    if active_token_counts.ndim != 1 or active_token_counts.shape[0] != q_all.shape[0]:
+        raise ValueError(
+            "active_token_counts must be rank-1 with one entry per query row, "
+            f"got {tuple(active_token_counts.shape)} for q rows {q_all.shape[0]}"
+        )
     if launch_num_chunks <= 0 or launch_num_chunks > _SPLIT_MAX_CHUNKS:
         raise ValueError(
             f"launch_num_chunks must be in [1, {_SPLIT_MAX_CHUNKS}], got {launch_num_chunks}"
@@ -411,6 +434,7 @@ def run_sparse_mla_split_decode_forward(
         _to_kernel_tensor(kv_rows_u32, cutlass.Uint32, assumed_align=16),
         _to_kernel_tensor(kv_scales, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(page_table_1, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(active_token_counts, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(sm_scale, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(kv_chunk_size_ptr, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(num_chunks_ptr, cutlass.Int32, assumed_align=4),
@@ -420,6 +444,7 @@ def run_sparse_mla_split_decode_forward(
     )
     _cq = getattr(workspace, "_contract_q", None)
     _cpt = getattr(workspace, "_contract_page_table", None)
+    _cnt = getattr(workspace, "_contract_nsa_cache_seqlens", None)
     _cto = getattr(workspace, "_contract_tmp_output", None)
     _ctl = getattr(workspace, "_contract_tmp_lse", None)
     forward_cache_key = (
@@ -427,6 +452,7 @@ def run_sparse_mla_split_decode_forward(
         _tensor_meta_key(kv_rows_u32),
         _tensor_meta_key(kv_scales),
         _tensor_meta_key(_cpt if _cpt is not None else page_table_1),
+        _tensor_meta_key(_cnt if _cnt is not None else active_token_counts),
         _tensor_meta_key(kv_chunk_size_ptr),
         _tensor_meta_key(num_chunks_ptr),
         _tensor_meta_key(_cto if _cto is not None else tmp_output),
@@ -474,6 +500,7 @@ def run_sparse_mla_split_decode(
     q_all: torch.Tensor,
     kv_cache: torch.Tensor,
     page_table_1: torch.Tensor,
+    active_token_counts: torch.Tensor,
     sm_scale: torch.Tensor,
     kv_chunk_size_ptr: torch.Tensor,
     num_chunks_ptr: torch.Tensor,
@@ -487,6 +514,7 @@ def run_sparse_mla_split_decode(
         q_all=q_all,
         kv_cache=kv_cache,
         page_table_1=page_table_1,
+        active_token_counts=active_token_counts,
         sm_scale=sm_scale,
         kv_chunk_size_ptr=kv_chunk_size_ptr,
         num_chunks_ptr=num_chunks_ptr,

@@ -712,6 +712,7 @@ def test_glm51_layer0_decode_split_api_matches_unsplit_kernel(width: int) -> Non
         q_all=q_all,
         kv_cache=packed,
         page_table_1=page_table_1,
+        active_token_counts=cache_seqlens,
         sm_scale=sm_scale_tensor,
         output=expected,
     )
@@ -1053,3 +1054,74 @@ def test_glm51_layer0_extend_api_matches_dense_oracle(cache_len: int) -> None:
     assert max_abs <= 0.10, f"cache_len={cache_len}: max_abs={max_abs:.6f}"
     assert rmse <= 0.005, f"cache_len={cache_len}: rmse={rmse:.6f}"
     assert cos >= 0.9995, f"cache_len={cache_len}: cos={cos:.6f}"
+
+
+def test_glm51_layer0_extend_api_respects_active_token_counts() -> None:
+    device = require_sm120()
+    _require_glm_weights()
+
+    cache_len = 2050
+    width = 257
+    q_len = 5
+    cfg, q_all, k_nope, k_rope = _make_glm_case(
+        cache_len=cache_len,
+        q_len=q_len,
+        seed=60_257,
+        device=device,
+    )
+    packed = pack_mla_kv_cache_reference(k_nope, k_rope)
+
+    active_counts = torch.tensor([257, 193, 129, 65, 0], dtype=torch.int32, device=device)
+    page_table_actual = torch.empty((q_len, width), dtype=torch.int32, device=device)
+    page_table_expected = torch.full((q_len, width), -1, dtype=torch.int32, device=device)
+    base = torch.arange(width, dtype=torch.int32, device=device)
+    for row in range(q_len):
+        row_tokens = (base + row * 37) % cache_len
+        page_table_actual[row] = row_tokens
+        valid = int(active_counts[row].item())
+        if valid > 0:
+            page_table_expected[row, :valid] = row_tokens[:valid]
+
+    cache_seqlens = torch.full((1,), cache_len, dtype=torch.int32, device=device)
+    cu_seqlens = torch.arange(0, q_len + 1, dtype=torch.int32, device=device)
+    metadata = MLASparseExtendMetadata(
+        page_table_1=page_table_actual,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=active_counts,
+        nsa_cu_seqlens_q=cu_seqlens,
+        nsa_cu_seqlens_k=cu_seqlens,
+        max_seq_len_q=q_len,
+        max_seq_len_k=cache_len,
+        mode="extend",
+    )
+    workspace = _make_workspace(
+        mode="extend",
+        device=device,
+        max_total_q=q_len,
+        max_batch=1,
+        topk=width,
+        cfg=cfg,
+    )
+
+    actual = sparse_mla_extend_forward(
+        q_all=q_all,
+        kv_cache=packed,
+        metadata=metadata,
+        workspace=workspace,
+        sm_scale=cfg.sm_scale,
+        v_head_dim=cfg.kv_lora_rank,
+    )
+    expected = dense_mla_reference(
+        q_all=q_all,
+        k_nope=k_nope,
+        k_rope=k_rope,
+        page_table_1=page_table_expected,
+        sm_scale=cfg.sm_scale,
+        v_head_dim=cfg.kv_lora_rank,
+    )
+    torch.cuda.synchronize(device)
+
+    max_abs, rmse, cos = _compare(actual, expected)
+    assert max_abs <= 0.10, f"max_abs={max_abs:.6f}"
+    assert rmse <= 0.005, f"rmse={rmse:.6f}"
+    assert cos >= 0.9995, f"cos={cos:.6f}"

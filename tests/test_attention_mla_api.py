@@ -192,6 +192,126 @@ def test_sparse_mla_verify_prefers_split_path(monkeypatch) -> None:
     assert captured["run_split"] is True
 
 
+def test_sparse_mla_extend_prefers_split_path(monkeypatch) -> None:
+    workspace = _make_workspace(mode="extend", topk=2048)
+    captured: dict[str, object] = {}
+
+    def fake_select_split(**kwargs):
+        del kwargs
+        from b12x.attention.mla.split import SparseMLASplitDecodeConfig
+
+        return SparseMLASplitDecodeConfig(chunk_size=64, num_chunks=32)
+
+    def fake_run_split_decode(**kwargs):
+        captured["active_token_counts"] = kwargs["active_token_counts"].clone()
+        output = kwargs["output"]
+        output.zero_()
+
+    def fail_run_sparse_mla_kernel(**kwargs):
+        raise AssertionError("extend split path should not use generic sparse MLA kernel")
+
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.select_sparse_mla_split_decode_config",
+        fake_select_split,
+    )
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.run_sparse_mla_split_decode",
+        fake_run_split_decode,
+    )
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.run_sparse_mla_kernel",
+        fail_run_sparse_mla_kernel,
+    )
+
+    q_all = torch.ones((5, 8, 256), dtype=torch.bfloat16)
+    kv_cache = torch.zeros((32, 1, 656), dtype=torch.uint8)
+    page_table_1 = torch.zeros((5, 2048), dtype=torch.int32)
+    cache_seqlens = torch.full((1,), 12, dtype=torch.int32)
+    nsa_cache_seqlens = torch.tensor([1537, 1024, 257, 64, 0], dtype=torch.int32)
+    nsa_cu = torch.tensor([0, 5], dtype=torch.int32)
+    metadata = MLASparseExtendMetadata(
+        page_table_1=page_table_1,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=nsa_cache_seqlens,
+        nsa_cu_seqlens_q=nsa_cu,
+        nsa_cu_seqlens_k=nsa_cu,
+        max_seq_len_q=5,
+        max_seq_len_k=12,
+        mode="extend",
+    )
+
+    output = sparse_mla_extend_forward(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        metadata=metadata,
+        workspace=workspace,
+        sm_scale=1.0,
+        v_head_dim=256,
+    )
+
+    assert output.shape == (5, 8, 256)
+    assert torch.equal(captured["active_token_counts"], nsa_cache_seqlens)
+
+
+def test_sparse_mla_extend_passes_active_token_counts_to_kernel(monkeypatch) -> None:
+    workspace = _make_workspace(mode="extend", topk=6)
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.select_sparse_mla_split_decode_config",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.supports_sparse_mla_kernel",
+        lambda **kwargs: True,
+    )
+
+    def fake_run_sparse_mla_kernel(**kwargs):
+        captured["active_token_counts"] = kwargs["active_token_counts"].clone()
+        kwargs["output"].zero_()
+
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.run_sparse_mla_kernel",
+        fake_run_sparse_mla_kernel,
+    )
+
+    q_all = torch.ones((3, 8, 256), dtype=torch.bfloat16)
+    kv_cache = torch.zeros((32, 1, 656), dtype=torch.uint8)
+    page_table_1 = torch.tensor(
+        [
+            [0, 1, 2, 3, 4, 5],
+            [6, 7, 8, 9, 10, 11],
+            [12, 13, 14, 15, 16, 17],
+        ],
+        dtype=torch.int32,
+    )
+    cache_seqlens = torch.tensor([12], dtype=torch.int32)
+    nsa_cache_seqlens = torch.tensor([6, 4, 2], dtype=torch.int32)
+    nsa_cu = torch.tensor([0, 3], dtype=torch.int32)
+    metadata = MLASparseExtendMetadata(
+        page_table_1=page_table_1,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=nsa_cache_seqlens,
+        nsa_cu_seqlens_q=nsa_cu,
+        nsa_cu_seqlens_k=nsa_cu,
+        max_seq_len_q=3,
+        max_seq_len_k=12,
+        mode="extend",
+    )
+
+    output = sparse_mla_extend_forward(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        metadata=metadata,
+        workspace=workspace,
+        sm_scale=1.0,
+        v_head_dim=256,
+    )
+
+    assert output.shape == (3, 8, 256)
+    assert torch.equal(captured["active_token_counts"], nsa_cache_seqlens)
+
+
 def test_mla_workspace_graph_mode_copies_runtime_metadata() -> None:
     workspace = MLAWorkspace.for_contract(
         mode="decode",

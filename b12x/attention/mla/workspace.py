@@ -65,6 +65,7 @@ class MLAWorkspace:
     # Phantom tensors for stable host-launcher cache keys (fixed_capacity only).
     _contract_q: torch.Tensor | None = None
     _contract_page_table: torch.Tensor | None = None
+    _contract_nsa_cache_seqlens: torch.Tensor | None = None
     _contract_output: torch.Tensor | None = None
     _contract_tmp_output: torch.Tensor | None = None
     _contract_tmp_lse: torch.Tensor | None = None
@@ -104,7 +105,7 @@ class MLAWorkspace:
             use_cuda_graph=use_cuda_graph,
         )
         workspace._allocate_padded_query()
-        workspace._allocate_decode_split_buffers()
+        workspace._allocate_split_buffers()
         if use_cuda_graph:
             workspace._allocate_runtime_metadata()
         return workspace
@@ -177,8 +178,8 @@ class MLAWorkspace:
                 device=self.device,
             )
 
-    def _allocate_decode_split_buffers(self) -> None:
-        if self.mode not in ("decode", "verify"):
+    def _allocate_split_buffers(self) -> None:
+        if self.mode not in ("decode", "extend", "verify"):
             return
         if self.tmp_output is None:
             self.tmp_output = torch.empty(
@@ -199,16 +200,14 @@ class MLAWorkspace:
             self.num_chunks_ptr = torch.empty((1,), dtype=torch.int32, device=self.device)
             self.num_chunks_value = None
 
-    def set_decode_chunk_config(self, *, kv_chunk_size: int, num_chunks: int) -> None:
-        if self.mode not in ("decode", "verify"):
-            raise RuntimeError("decode chunk config is only valid for decode/verify workspaces")
+    def set_split_chunk_config(self, *, kv_chunk_size: int, num_chunks: int) -> None:
         if num_chunks <= 0 or num_chunks > self.max_chunks_per_row:
             raise ValueError(
                 f"num_chunks must be in [1, {self.max_chunks_per_row}], got {num_chunks}"
             )
         if kv_chunk_size <= 0:
             raise ValueError(f"kv_chunk_size must be positive, got {kv_chunk_size}")
-        self._allocate_decode_split_buffers()
+        self._allocate_split_buffers()
         assert self.kv_chunk_size_ptr is not None
         assert self.num_chunks_ptr is not None
         if self.kv_chunk_size_value != int(kv_chunk_size):
@@ -217,6 +216,9 @@ class MLAWorkspace:
         if self.num_chunks_value != int(num_chunks):
             self.num_chunks_ptr[0] = int(num_chunks)
             self.num_chunks_value = int(num_chunks)
+
+    def set_decode_chunk_config(self, *, kv_chunk_size: int, num_chunks: int) -> None:
+        self.set_split_chunk_config(kv_chunk_size=kv_chunk_size, num_chunks=num_chunks)
 
     def prepare_decode(
         self,
@@ -358,12 +360,17 @@ class MLAWorkspace:
             dtype=torch.int32,
             device=self.device,
         )
+        self._contract_nsa_cache_seqlens = _shape_only_cuda_tensor(
+            (self.max_total_q,),
+            dtype=torch.int32,
+            device=self.device,
+        )
         self._contract_output = _shape_only_cuda_tensor(
             (self.max_total_q, self.num_q_heads, self.v_head_dim),
             dtype=self.dtype,
             device=self.device,
         )
-        if self.mode in ("decode", "verify"):
+        if self.tmp_output is not None and self.tmp_lse is not None:
             self._contract_tmp_output = _shape_only_cuda_tensor(
                 (self.max_total_q, self.num_q_heads, self.max_chunks_per_row, self.v_head_dim),
                 dtype=self.dtype,
