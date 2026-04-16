@@ -11,13 +11,16 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
+from cutlass._mlir.dialects import llvm
 from cutlass import Float32, Int32, Uint32
+from cutlass.cutlass_dsl import Int64, dsl_user_op
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 
 from b12x.attention import copy_utils
 from b12x.attention import pipeline
 from b12x.attention import utils as attention_utils
+from b12x.cute.fp4 import get_sm_version
 from b12x.cute.fp4 import (
     frag_layout_swizzle_16b_to_8b,
     ld_shared_v4_u32,
@@ -40,6 +43,11 @@ _PAGED_TOKENS_PER_GROUP = 8
 _MAX_SUPPORTED_Q_HEADS = 64
 _EAGER_HOST_LAUNCHER_CACHE_SIZE = 32
 _PAGED_Q_HEAD_TILE = 16
+_PAGED_K_TMA_DESC_CACHE_SIZE = 32
+_BLACKWELL_TMA_DESC_WORDS = 16
+_BLACKWELL_TMA_DESC_MIN_BACKING_BYTES = 128 * 1024
+_BLACKWELL_TMA_DESC_PATCH_WORD = 1
+_BLACKWELL_TMA_DESC_PATCH_CLEAR_MASK = 0xFFFFFFFFFFDFFFFF
 
 
 def _num_q_head_tiles(num_heads: int) -> int:
@@ -154,6 +162,151 @@ def _resolve_sparse_nsa_persistent_ctas(
     del num_heads
     max_work = max(live_pages, 1)
     return min(persistent_ctas, max_work)
+
+
+def _tensor_storage_nbytes(tensor: torch.Tensor) -> int:
+    storage = tensor.untyped_storage() if hasattr(tensor, "untyped_storage") else tensor.storage()
+    if hasattr(storage, "nbytes"):
+        return int(storage.nbytes())
+    return int(storage.size()) * tensor.element_size()
+
+
+def _is_dense_non_overlapping(tensor: torch.Tensor) -> bool:
+    expected_stride = 1
+    strides_and_sizes = []
+    for size, stride in zip(tensor.shape, tensor.stride(), strict=True):
+        if int(size) <= 1:
+            continue
+        strides_and_sizes.append((abs(int(stride)), int(size)))
+    for stride, size in sorted(strides_and_sizes):
+        if stride != expected_stride:
+            return False
+        expected_stride *= size
+    return True
+
+
+def _needs_paged_index_k_tma_descriptor_workaround(
+    index_k_cache: torch.Tensor,
+    k_quant_bytes: torch.Tensor,
+) -> bool:
+    if get_sm_version(index_k_cache.device) // 10 != 12:
+        return False
+    if _tensor_storage_nbytes(index_k_cache) >= _BLACKWELL_TMA_DESC_MIN_BACKING_BYTES:
+        return False
+    return not _is_dense_non_overlapping(k_quant_bytes)
+
+
+def _encode_paged_index_k_tma_descriptor(
+    k_quant_bytes: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if k_quant_bytes.ndim != 3 or k_quant_bytes.shape[1:] != (_PAGE_SIZE, _INDEX_HEAD_DIM):
+        raise ValueError(
+            "k_quant_bytes must have shape "
+            f"(num_pages, {_PAGE_SIZE}, {_INDEX_HEAD_DIM}), got {tuple(k_quant_bytes.shape)}"
+        )
+    if k_quant_bytes.dtype != torch.uint8:
+        raise TypeError(f"k_quant_bytes must have dtype torch.uint8, got {k_quant_bytes.dtype}")
+
+    num_pages = int(k_quant_bytes.shape[0])
+    row_stride_bytes = int(k_quant_bytes.stride(1)) * k_quant_bytes.element_size()
+    page_stride_bytes = int(k_quant_bytes.stride(0)) * k_quant_bytes.element_size()
+    base_ptr = int(k_quant_bytes.data_ptr())
+    U64 = cuda.cuuint64_t
+    U32 = cuda.cuuint32_t
+
+    result, tensor_map = cuda.cuTensorMapEncodeTiled(
+        cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        3,
+        base_ptr,
+        [U64(_INDEX_HEAD_DIM), U64(_PAGE_SIZE), U64(num_pages)],
+        [U64(row_stride_bytes), U64(page_stride_bytes)],
+        [U32(_INDEX_HEAD_DIM), U32(_PAGE_SIZE), U32(1)],
+        [U32(1), U32(1), U32(1)],
+        cuda.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
+        cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_NONE,
+        cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        cuda.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+    )
+    if result != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuTensorMapEncodeTiled failed: {result}")
+
+    host_desc_words = [int(word) for word in tensor_map.opaque]
+    if len(host_desc_words) != _BLACKWELL_TMA_DESC_WORDS:
+        raise RuntimeError(
+            f"unexpected TMA descriptor size: expected {_BLACKWELL_TMA_DESC_WORDS} words, "
+            f"got {len(host_desc_words)}"
+        )
+    host_desc = torch.tensor(host_desc_words, dtype=torch.uint64)
+    host_desc[_BLACKWELL_TMA_DESC_PATCH_WORD] &= _BLACKWELL_TMA_DESC_PATCH_CLEAR_MASK
+    desc = host_desc.to(device=k_quant_bytes.device, non_blocking=False)
+    desc_ptrs = torch.tensor([int(desc.data_ptr())], dtype=torch.int64, device=k_quant_bytes.device)
+    return desc, desc_ptrs
+
+
+def _get_cached_paged_index_k_tma_descriptor(
+    k_quant_bytes: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (
+        int(k_quant_bytes.data_ptr()),
+        tuple(k_quant_bytes.shape),
+        tuple(k_quant_bytes.stride()),
+        str(k_quant_bytes.dtype),
+        (k_quant_bytes.device.type, k_quant_bytes.device.index),
+    )
+    cache = getattr(_get_cached_paged_index_k_tma_descriptor, "_cache", None)
+    if cache is None:
+        cache = OrderedDict()
+        setattr(_get_cached_paged_index_k_tma_descriptor, "_cache", cache)
+    cached = cache.get(key)
+    if cached is not None:
+        cache.move_to_end(key)
+        return cached
+    desc = _encode_paged_index_k_tma_descriptor(k_quant_bytes)
+    cache[key] = desc
+    if len(cache) > _PAGED_K_TMA_DESC_CACHE_SIZE:
+        cache.popitem(last=False)
+    return desc
+
+
+@lru_cache(maxsize=16)
+def _dummy_paged_index_k_tma_desc_ptrs(device_index: int) -> torch.Tensor:
+    return torch.zeros((1,), dtype=torch.int64, device=torch.device("cuda", device_index))
+
+
+@lru_cache(maxsize=32)
+def _cached_int32_scalar(value: int, device_index: int) -> torch.Tensor:
+    return torch.tensor([value], dtype=torch.int32, device=torch.device("cuda", device_index))
+
+
+@dsl_user_op
+def _cp_async_bulk_tensor_3d(
+    dst_smem_addr: Int32,
+    tensor_map_ptr: Int64,
+    coord0: Int32,
+    coord1: Int32,
+    coord2: Int32,
+    mbar_smem_addr: Int32,
+    *,
+    loc=None,
+    ip=None,
+):
+    llvm.inline_asm(
+        None,
+        [
+            Int32(dst_smem_addr).ir_value(loc=loc, ip=ip),
+            Int64(tensor_map_ptr).ir_value(loc=loc, ip=ip),
+            Int32(coord0).ir_value(loc=loc, ip=ip),
+            Int32(coord1).ir_value(loc=loc, ip=ip),
+            Int32(coord2).ir_value(loc=loc, ip=ip),
+            Int32(mbar_smem_addr).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes "
+        "[$0], [$1, {$2, $3, $4}], [$5];",
+        "r,l,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
 
 
 @cute.jit
@@ -318,11 +471,24 @@ def _issue_index_k_tma_copy(
     mbar_ptr,
     expected_bytes,
     page_id,
+    dst_smem_addr,
+    tma_desc_ptr=None,
+    use_external_tma_desc=Int32(0),
 ):
     full_mbar_ptr = mbar_ptr + producer_state.index
     with cute.arch.elect_one():
         cute.arch.mbarrier_arrive_and_expect_tx(full_mbar_ptr, expected_bytes)
-    load_tma(src_idx=page_id, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
+    if use_external_tma_desc != Int32(0):
+        _cp_async_bulk_tensor_3d(
+            Int32(dst_smem_addr),
+            Int64(tma_desc_ptr),
+            Int32(0),
+            Int32(0),
+            page_id,
+            Int32(shared_ptr_to_u32(full_mbar_ptr)),
+        )
+    else:
+        load_tma(src_idx=page_id, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
 
 
 class SparseNSAPagedLogitsKernel:
@@ -347,6 +513,8 @@ class SparseNSAPagedLogitsKernel:
         q_bytes: cute.Tensor,
         weights: cute.Tensor,
         k_quant_bytes: cute.Tensor,
+        k_tma_desc_ptrs: cute.Tensor,
+        use_patched_k_tma_desc: cute.Tensor,
         k_scales: cute.Tensor,
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
@@ -366,6 +534,8 @@ class SparseNSAPagedLogitsKernel:
             q_bytes,
             weights,
             tma_tensor_k,
+            k_tma_desc_ptrs,
+            use_patched_k_tma_desc,
             k_scales,
             real_page_table,
             seqlens_per_query,
@@ -388,6 +558,8 @@ class SparseNSAPagedLogitsKernel:
         q_bytes: cute.Tensor,
         weights: cute.Tensor,
         k_tma_tensor: cute.Tensor,
+        k_tma_desc_ptrs: cute.Tensor,
+        use_patched_k_tma_desc: cute.Tensor,
         k_scales: cute.Tensor,
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
@@ -471,11 +643,14 @@ class SparseNSAPagedLogitsKernel:
             cute.local_tile(k_tma_tensor, (_PAGE_SIZE, _INDEX_HEAD_DIM), (0, 0, None)),
             s_k_page_stage,
         )
+        use_external_k_tma_desc = Int32(use_patched_k_tma_desc[Int32(0)])
+        k_tma_desc_ptr = Int64(k_tma_desc_ptrs[Int32(0)])
         if cta_idx < total_work:
             if tx == 0:
                 cute.arch.mbarrier_init(mbar_ptr_k, Int32(1))
             if warp_idx == Int32(0):
-                cpasync.prefetch_descriptor(tma_atom_k)
+                if use_external_k_tma_desc == Int32(0):
+                    cpasync.prefetch_descriptor(tma_atom_k)
 
             num_heads = Int32(self.num_heads_static)
             q_linear = tx
@@ -517,6 +692,9 @@ class SparseNSAPagedLogitsKernel:
                                 mbar_ptr_k,
                                 Int32(_PAGE_SIZE * _INDEX_HEAD_DIM),
                                 page_id,
+                                k_page_base_addr,
+                                tma_desc_ptr=k_tma_desc_ptr,
+                                use_external_tma_desc=use_external_k_tma_desc,
                             )
                         scale_idx = tx
                         while scale_idx < Int32(_PAGE_SIZE):
@@ -611,6 +789,9 @@ def _split_index_k_cache_runtime_views(index_k_cache: torch.Tensor) -> tuple[tor
 
 def clear_sparse_nsa_indexer_kernel_cache() -> None:
     _build_sparse_nsa_paged_kernel.cache_clear()
+    cache = getattr(_get_cached_paged_index_k_tma_descriptor, "_cache", None)
+    if cache is not None:
+        cache.clear()
 
 
 def supports_sparse_nsa_paged_logits_kernel(
@@ -706,6 +887,19 @@ def run_sparse_nsa_paged_logits_kernel(
         )
 
     k_quant_bytes, k_scales = _split_index_k_cache_runtime_views(index_k_cache)
+    use_patched_k_tma_desc = _needs_paged_index_k_tma_descriptor_workaround(
+        index_k_cache,
+        k_quant_bytes,
+    )
+    device_index = q_fp8.device.index or 0
+    if use_patched_k_tma_desc:
+        _, k_tma_desc_ptrs = _get_cached_paged_index_k_tma_descriptor(k_quant_bytes)
+    else:
+        k_tma_desc_ptrs = _dummy_paged_index_k_tma_desc_ptrs(device_index)
+    use_patched_k_tma_desc_tensor = _cached_int32_scalar(
+        int(use_patched_k_tma_desc),
+        device_index,
+    )
     q_bytes = q_fp8.contiguous().view(torch.uint8)
     logits = torch.full(
         (rows, width_tokens),
@@ -726,6 +920,8 @@ def run_sparse_nsa_paged_logits_kernel(
         _to_kernel_tensor(q_bytes, cutlass.Uint8),
         _to_kernel_tensor(weights.contiguous(), cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(k_quant_bytes, cutlass.Uint8),
+        _to_kernel_tensor(k_tma_desc_ptrs, cutlass.Int64, assumed_align=8),
+        _to_kernel_tensor(use_patched_k_tma_desc_tensor, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(k_scales, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(real_page_table.contiguous(), cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(seqlens_per_query.contiguous(), cutlass.Int32, assumed_align=4),
@@ -740,6 +936,8 @@ def run_sparse_nsa_paged_logits_kernel(
         _tensor_meta_key(_cp.get("q_bytes", q_bytes)),
         _tensor_meta_key(_cp.get("weights", weights)),
         _tensor_meta_key(k_quant_bytes),
+        _tensor_meta_key(k_tma_desc_ptrs),
+        _tensor_meta_key(use_patched_k_tma_desc_tensor),
         _tensor_meta_key(k_scales),
         _tensor_meta_key(_cp.get("real_page_table", real_page_table)),
         _tensor_meta_key(_cp.get("seqlens_per_query", seqlens_per_query)),

@@ -7,6 +7,8 @@ from typing import Literal
 
 import torch
 
+from .split import default_sparse_mla_split_decode_config_for_width
+
 
 def _canonical_device(device: torch.device | str) -> torch.device:
     device = torch.device(device)
@@ -32,7 +34,7 @@ def _shape_only_cuda_tensor(
 
 @dataclass(kw_only=True)
 class MLAWorkspace:
-    mode: Literal["decode", "extend", "verify"]
+    mode: Literal["decode", "extend", "verify", "draft_extend"]
     device: torch.device
     dtype: torch.dtype
     kv_dtype: torch.dtype
@@ -74,7 +76,7 @@ class MLAWorkspace:
     def for_contract(
         cls,
         *,
-        mode: Literal["decode", "extend", "verify"],
+        mode: Literal["decode", "extend", "verify", "draft_extend"],
         device: torch.device | str,
         dtype: torch.dtype,
         kv_dtype: torch.dtype,
@@ -114,7 +116,7 @@ class MLAWorkspace:
     def for_fixed_capacity(
         cls,
         *,
-        mode: Literal["decode", "extend", "verify"],
+        mode: Literal["decode", "extend", "verify", "draft_extend"],
         device: torch.device | str,
         dtype: torch.dtype,
         kv_dtype: torch.dtype,
@@ -144,6 +146,7 @@ class MLAWorkspace:
             padded_heads=padded_heads,
         )
         workspace.fixed_capacity = True
+        workspace._initialize_split_chunk_config_if_needed()
         workspace._allocate_contract_phantoms()
         if use_cuda_graph:
             workspace._allocate_runtime_metadata()
@@ -179,7 +182,7 @@ class MLAWorkspace:
             )
 
     def _allocate_split_buffers(self) -> None:
-        if self.mode not in ("decode", "extend", "verify"):
+        if self.mode not in ("decode", "extend", "verify", "draft_extend"):
             return
         if self.tmp_output is None:
             self.tmp_output = torch.empty(
@@ -199,6 +202,22 @@ class MLAWorkspace:
         if self.num_chunks_ptr is None:
             self.num_chunks_ptr = torch.empty((1,), dtype=torch.int32, device=self.device)
             self.num_chunks_value = None
+
+    def _initialize_split_chunk_config_if_needed(self) -> None:
+        self._allocate_split_buffers()
+        if not (self.fixed_capacity or self.use_cuda_graph):
+            return
+        if self.kv_chunk_size_value is not None and self.num_chunks_value is not None:
+            return
+        split_cfg = default_sparse_mla_split_decode_config_for_width(int(self.topk))
+        if split_cfg is None:
+            return
+        assert self.kv_chunk_size_ptr is not None
+        assert self.num_chunks_ptr is not None
+        self.kv_chunk_size_ptr[0] = int(split_cfg.chunk_size)
+        self.num_chunks_ptr[0] = int(split_cfg.num_chunks)
+        self.kv_chunk_size_value = int(split_cfg.chunk_size)
+        self.num_chunks_value = int(split_cfg.num_chunks)
 
     def set_split_chunk_config(self, *, kv_chunk_size: int, num_chunks: int) -> None:
         if num_chunks <= 0 or num_chunks > self.max_chunks_per_row:

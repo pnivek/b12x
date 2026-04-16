@@ -53,6 +53,19 @@ class SparseMLASplitDecodeConfig:
     num_chunks: int
 
 
+def default_sparse_mla_split_decode_config_for_width(
+    width: int,
+) -> SparseMLASplitDecodeConfig | None:
+    if width <= _SPLIT_CHUNK_LADDER[0] or width > _SPLIT_MAX_WIDTH:
+        return None
+
+    for chunk_size in _SPLIT_CHUNK_LADDER:
+        num_chunks = _ceil_div(width, chunk_size)
+        if num_chunks <= _SPLIT_MAX_CHUNKS:
+            return SparseMLASplitDecodeConfig(chunk_size=chunk_size, num_chunks=num_chunks)
+    return None
+
+
 @cute.jit
 def _split_output_lane_view(
     tmp_output: cute.Tensor,
@@ -107,14 +120,7 @@ def select_sparse_mla_split_decode_config(
     if active_token_counts is not None and active_token_counts.numel() > 0:
         if active_token_counts.device.type != "cuda" or not torch.cuda.is_current_stream_capturing():
             width = min(width, max(0, int(active_token_counts.max().item())))
-    if width <= _SPLIT_CHUNK_LADDER[0] or width > _SPLIT_MAX_WIDTH:
-        return None
-
-    for chunk_size in _SPLIT_CHUNK_LADDER:
-        num_chunks = _ceil_div(width, chunk_size)
-        if num_chunks <= _SPLIT_MAX_CHUNKS:
-            return SparseMLASplitDecodeConfig(chunk_size=chunk_size, num_chunks=num_chunks)
-    return None
+    return default_sparse_mla_split_decode_config_for_width(width)
 
 
 @cute.jit
