@@ -850,7 +850,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
         flat_stride = Int32(gdim_z) * Int32(self.threads_per_cta)
         num_k_tiles = (cols + Int32(63)) // Int32(64)
 
-        # Phase 0: cooperative init — zero row_counts and scatter_output
+        # Phase 0: cooperative init — zero row_counts and clear scatter_output.
         if all_rows_unique == Int32(0):
             i = flat_tid
             while i < num_experts:

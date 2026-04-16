@@ -157,6 +157,81 @@ def _run_activation_case(
     return output, reference
 
 
+def _run_single_token_multi_expert_micro_case(
+    *,
+    activation: str,
+    topk_ids_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device = require_sm120()
+    torch.manual_seed(7)
+
+    m, E, k, n, topk = 1, 4, 128, 128, 3
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16)
+    topk_ids = torch.tensor([[3, 1, 2]], device=device, dtype=topk_ids_dtype)
+    topk_logits = torch.tensor([[0.2, -0.1, 0.4]], device=device, dtype=torch.float32)
+    topk_weights = torch.softmax(topk_logits, dim=-1)
+
+    w1_rows = 2 * n if activation == "silu" else n
+    w1 = torch.randn(E, w1_rows, k, device=device, dtype=torch.bfloat16) * 0.5
+    w2 = torch.randn(E, k, n, device=device, dtype=torch.bfloat16) * 0.25
+    a1_gscale = torch.ones(E, device=device, dtype=torch.float32)
+    a2_gscale = torch.ones(E, device=device, dtype=torch.float32)
+    w1_fp4, w1_blockscale = _quantize_moe_weight_storage(w1, a1_gscale)
+    w2_fp4, w2_blockscale = _quantize_moe_weight_storage(w2, a2_gscale)
+    w1_alphas = torch.ones(E, device=device, dtype=torch.float32)
+    w2_alphas = torch.ones(E, device=device, dtype=torch.float32)
+
+    reference = moe_reference_nvfp4(
+        x,
+        w1_fp4,
+        w1_blockscale,
+        w1_alphas,
+        w2_fp4,
+        w2_blockscale,
+        w2_alphas,
+        a1_gscale,
+        a2_gscale,
+        topk_ids,
+        topk_weights,
+        E,
+        k,
+        n,
+        activation=activation,
+    )
+
+    prev_static_cutover = tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE
+    prev_micro_cutover = tp_moe._MICRO_COMPACT_CUTOVER_PAIRS_CACHE
+    try:
+        clear_tp_moe_caches()
+        tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE = 128
+        tp_moe._MICRO_COMPACT_CUTOVER_PAIRS_CACHE = 10_000
+
+        output = b12x_moe_fp4(
+            x,
+            a1_gscale,
+            w1_fp4,
+            w1_blockscale,
+            w1_alphas,
+            a2_gscale,
+            w2_fp4,
+            w2_blockscale,
+            w2_alphas,
+            topk_weights,
+            topk_ids,
+            workspace=allocate_tp_moe_workspace_pool(),
+            input_scales_static=True,
+            activation=activation,
+            fast_math=False,
+        )
+        torch.cuda.synchronize()
+    finally:
+        clear_tp_moe_caches()
+        tp_moe._STATIC_COMPACT_CUTOVER_PAIRS_CACHE = prev_static_cutover
+        tp_moe._MICRO_COMPACT_CUTOVER_PAIRS_CACHE = prev_micro_cutover
+
+    return output, reference
+
+
 @pytest.mark.parametrize(
     ("backend", "m", "static_cutover", "micro_cutover"),
     BACKEND_CASES,
@@ -201,3 +276,22 @@ def test_relu2_matches_reference_across_backends(
     metrics = compare_to_reference(output, reference)
     assert metrics.max_abs == 0.0, f"{backend}: {metrics}"
     assert metrics.rmse == 0.0, f"{backend}: {metrics}"
+
+
+@pytest.mark.parametrize("activation", ["silu", "relu2"])
+def test_single_token_multi_expert_micro_matches_int32_with_int64_topk_ids(
+    activation: str,
+) -> None:
+    output_i64, reference = _run_single_token_multi_expert_micro_case(
+        activation=activation,
+        topk_ids_dtype=torch.int64,
+    )
+    output_i32, _ = _run_single_token_multi_expert_micro_case(
+        activation=activation,
+        topk_ids_dtype=torch.int32,
+    )
+    pair_metrics = compare_to_reference(output_i64, output_i32)
+    assert pair_metrics.cos > 0.9999, f"{activation} int64 vs int32: {pair_metrics}"
+
+    metrics = compare_to_reference(output_i64, reference)
+    assert metrics.cos > 0.9999, f"{activation}: {metrics}"
