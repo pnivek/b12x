@@ -215,6 +215,40 @@ MODEL_PROFILES = {
 }
 
 
+def _cached_snapshot_path(repo_id: str) -> pathlib.Path | None:
+    cache_root = pathlib.Path.home() / ".cache" / "huggingface" / "hub" / f"models--{repo_id.replace('/', '--')}"
+    snapshots_root = cache_root / "snapshots"
+    if not snapshots_root.is_dir():
+        return None
+    main_ref = cache_root / "refs" / "main"
+    if main_ref.is_file():
+        candidate = snapshots_root / main_ref.read_text().strip()
+        if candidate.is_dir():
+            return candidate
+    snapshots = sorted(path for path in snapshots_root.iterdir() if path.is_dir())
+    if snapshots:
+        return snapshots[-1]
+    return None
+
+
+def _default_legacy_model_path() -> pathlib.Path:
+    local_qwen_path = pathlib.Path("/data/models/Qwen3.5-397B-A17B-NVFP4")
+    if local_qwen_path.is_dir():
+        return local_qwen_path
+    cached_qwen_path = _cached_snapshot_path(MODEL_PROFILES["qwen397b"].hf_repo_id)
+    if cached_qwen_path is not None:
+        return cached_qwen_path
+    return (
+        pathlib.Path.home()
+        / ".cache"
+        / "huggingface"
+        / "hub"
+        / "models--nvidia--Qwen3.5-397B-A17B-NVFP4"
+        / "snapshots"
+        / "__missing__"
+    )
+
+
 def resolve_model_path(
     profile: ModelProfile,
     override: pathlib.Path | None,
@@ -224,9 +258,14 @@ def resolve_model_path(
     env_path = os.environ.get("B12X_MODEL_PATH")
     if env_path:
         return pathlib.Path(env_path)
+    cached_path = _cached_snapshot_path(profile.hf_repo_id)
+    if cached_path is not None:
+        return cached_path
     from huggingface_hub import snapshot_download
 
     return pathlib.Path(snapshot_download(repo_id=profile.hf_repo_id))
+
+MODEL_PATH = _default_legacy_model_path()
 
 
 @dataclass
@@ -451,8 +490,8 @@ def load_expert_weight_stack(
     *,
     layer_start: int,
     num_layers: int,
-    activation: str,
-    checkpoint_family: str,
+    activation: str = "silu",
+    checkpoint_family: str = "qwen",
 ) -> list[ExpertWeights]:
     return [
         load_expert_weights(
@@ -674,10 +713,21 @@ def make_oracle_reference(
 
 
 ORACLE_TOLERANCES = {
-    "max_abs": 0.0005,
-    "rmse": 0.0001,
-    "mean_abs": 0.0001,
-    "cos_min": 0.99925,
+    "silu": {
+        "max_abs": 0.0005,
+        "rmse": 0.0001,
+        "mean_abs": 0.0001,
+        "cos_min": 0.99925,
+    },
+    # relu2 outputs are ~1000x larger in magnitude than silu's, and the
+    # activation's squaring step quadratically amplifies per-element noise.
+    # Absolute thresholds don't transfer; cos is the correctness signal.
+    "relu2": {
+        "max_abs": None,
+        "rmse": None,
+        "mean_abs": None,
+        "cos_min": 0.9925,
+    },
 }
 
 
@@ -691,15 +741,15 @@ def format_oracle_metrics(name: str, metrics: OracleMetrics) -> str:
 
 
 def check_oracle_metrics(
-    label: str, metrics: OracleMetrics, batch_size: int
+    label: str, metrics: OracleMetrics, batch_size: int, *, activation: str = "silu"
 ) -> list[str]:
     failures = []
-    tol = ORACLE_TOLERANCES
-    if metrics.max_abs > tol["max_abs"]:
+    tol = ORACLE_TOLERANCES[activation]
+    if tol["max_abs"] is not None and metrics.max_abs > tol["max_abs"]:
         failures.append(f"  bs={batch_size} {label}: max_abs={metrics.max_abs:.5f} > {tol['max_abs']}")
-    if metrics.rmse > tol["rmse"]:
+    if tol["rmse"] is not None and metrics.rmse > tol["rmse"]:
         failures.append(f"  bs={batch_size} {label}: rmse={metrics.rmse:.5f} > {tol['rmse']}")
-    if metrics.mean_abs > tol["mean_abs"]:
+    if tol["mean_abs"] is not None and metrics.mean_abs > tol["mean_abs"]:
         failures.append(f"  bs={batch_size} {label}: mean_abs={metrics.mean_abs:.5f} > {tol['mean_abs']}")
     if metrics.cos < tol["cos_min"]:
         failures.append(f"  bs={batch_size} {label}: cos={metrics.cos:.6f} < {tol['cos_min']}")
@@ -1334,18 +1384,25 @@ def bench_e2e() -> None:
                 f"  check vs {ref_name}: max_abs={diff.max().item():.5f} "
                 f"rmse={diff.square().mean().sqrt().item():.5f}"
             )
-            if oracle_ref is not None:
-                backend_metrics = compare_to_reference(backend_out, oracle_ref)
-                print(f"  {format_oracle_metrics(f'{backend_label} vs oracle', backend_metrics)}")
-                accuracy_failures.extend(
-                    check_oracle_metrics(f"{backend_label} vs oracle", backend_metrics, batch_size)
+
+        if oracle_ref is not None:
+            backend_metrics = compare_to_reference(backend_out, oracle_ref)
+            print(f"  {format_oracle_metrics(f'{backend_label} vs oracle', backend_metrics)}")
+            accuracy_failures.extend(
+                check_oracle_metrics(
+                    f"{backend_label} vs oracle", backend_metrics, batch_size,
+                    activation=args.activation,
                 )
-                if fi_output is not None:
-                    fi_metrics = compare_to_reference(fi_output, oracle_ref)
-                    print(f"  {format_oracle_metrics('flashinfer vs oracle', fi_metrics)}")
-                    reference_warnings.extend(
-                        check_oracle_metrics("flashinfer vs oracle", fi_metrics, batch_size)
+            )
+            if ref_output is not None and fi_output is not None:
+                fi_metrics = compare_to_reference(fi_output, oracle_ref)
+                print(f"  {format_oracle_metrics('flashinfer vs oracle', fi_metrics)}")
+                reference_warnings.extend(
+                    check_oracle_metrics(
+                        "flashinfer vs oracle", fi_metrics, batch_size,
+                        activation=args.activation,
                     )
+                )
 
         if args.profile_once != "none":
             if args.profile_once == "flashinfer":

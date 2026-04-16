@@ -60,6 +60,7 @@ class _MoEMicroKernelBase:
         input_scales_are_reciprocal: bool = False,
         fast_math: bool = False,
         activation: str = "silu",
+        share_input_across_experts: bool = False,
     ):
         if activation not in {"silu", "relu2"}:
             raise ValueError(f"unsupported activation {activation!r}")
@@ -70,6 +71,7 @@ class _MoEMicroKernelBase:
         self.fast_math = fast_math
         self.activation = activation
         self.is_gated = activation == "silu"
+        self.share_input_across_experts = share_input_across_experts
         tile_k = sf_vec_size * 8
         self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
         self.sa_tile_shape_mk = (max(128, mma_tiler_mn[0]), tile_k)
@@ -499,6 +501,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
         input_scales_are_reciprocal: bool = False,
         fast_math: bool = False,
         activation: str = "silu",
+        share_input_across_experts: bool = False,
     ):
         super().__init__(
             sf_vec_size,
@@ -507,6 +510,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             activation=activation,
+            share_input_across_experts=share_input_across_experts,
         )
 
     @cute.jit
@@ -845,6 +849,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
             # A single token's top-k routing is already a dense local expert set.
             all_rows_unique = Int32(1)
             num_active_experts = total_pairs
+        shared_single_input = Int32(1) if cutlass.const_expr(self.share_input_across_experts) else Int32(0)
         expert_scale_stride = Int32(scale_storage.shape[0]) // num_experts
         flat_tid = Int32(bidz) * Int32(self.threads_per_cta) + Int32(tidx)
         flat_stride = Int32(gdim_z) * Int32(self.threads_per_cta)
@@ -862,9 +867,10 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
             scatter_output[j // cols, j % cols] = cutlass.BFloat16(0.0)
             j += flat_stride
         cute.arch.sync_threads()
-        self._resident_grid_barrier(
-            barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
-        )
+        if shared_single_input == Int32(0):
+            self._resident_grid_barrier(
+                barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
+            )
 
         pair_idx = Int32(bidz)
         while pair_idx < total_pairs:
@@ -901,50 +907,58 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
 
             # Distribute quantization across ALL CTA threads, not just leader.
             # Each FP4 block (16 elements) is independent — perfect parallelism.
-            gs_value = input_global_scale[expert_id].to(cutlass.Float32)
-            if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(0.0):
-                if self.fast_math:
-                    gs_value = rcp_approx_ftz(gs_value)
-                else:
-                    gs_value = cutlass.Float32(1.0) / gs_value
-            sf_idx = Int32(tidx)
-            while sf_idx < sf_blocks_per_row:
-                block_start = sf_idx * Int32(16)
-                values = cute.make_rmem_tensor((16,), cutlass.Float32)
-                block_max = cutlass.Float32(0.0)
-                for elem_idx in cutlass.range_constexpr(16):
-                    value = cutlass.Float32(a_input[token_idx, block_start + Int32(elem_idx)])
-                    values[elem_idx] = value
-                    block_max = fmax_f32(block_max, fabs_f32(value))
-                packed64 = Uint64(0)
-                scale_byte = Uint8(0)
-                if self.fast_math:
-                    packed64, scale_byte = quantize_block_fp4_fast(values, block_max, gs_value)
-                else:
-                    packed64, scale_byte = quantize_block_fp4(values, block_max, gs_value)
+            should_quantize = Int32(1)
+            packed_local_expert_id = local_expert_id
+            packed_row = row
+            if shared_single_input > Int32(0):
+                should_quantize = Int32(1) if pair_idx == Int32(0) else Int32(0)
+                packed_local_expert_id = Int32(0)
+                packed_row = Int32(0)
+            if should_quantize > Int32(0):
+                gs_value = input_global_scale[expert_id].to(cutlass.Float32)
+                if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(0.0):
+                    if self.fast_math:
+                        gs_value = rcp_approx_ftz(gs_value)
+                    else:
+                        gs_value = cutlass.Float32(1.0) / gs_value
+                sf_idx = Int32(tidx)
+                while sf_idx < sf_blocks_per_row:
+                    block_start = sf_idx * Int32(16)
+                    values = cute.make_rmem_tensor((16,), cutlass.Float32)
+                    block_max = cutlass.Float32(0.0)
+                    for elem_idx in cutlass.range_constexpr(16):
+                        value = cutlass.Float32(a_input[token_idx, block_start + Int32(elem_idx)])
+                        values[elem_idx] = value
+                        block_max = fmax_f32(block_max, fabs_f32(value))
+                    packed64 = Uint64(0)
+                    scale_byte = Uint8(0)
+                    if self.fast_math:
+                        packed64, scale_byte = quantize_block_fp4_fast(values, block_max, gs_value)
+                    else:
+                        packed64, scale_byte = quantize_block_fp4(values, block_max, gs_value)
 
-                output_offset = (
-                    local_expert_id * max_rows * output_bytes_per_row
-                    + row * output_bytes_per_row
-                    + sf_idx * Int32(8)
-                )
-                st_global_u64(get_ptr_as_int64(packed_a_storage, output_offset), packed64)
+                    output_offset = (
+                        packed_local_expert_id * max_rows * output_bytes_per_row
+                        + packed_row * output_bytes_per_row
+                        + sf_idx * Int32(8)
+                    )
+                    st_global_u64(get_ptr_as_int64(packed_a_storage, output_offset), packed64)
 
-                m_tile_idx = row // Int32(32 * 4)
-                k_tile_idx = sf_idx // Int32(4)
-                outer_m_idx = row % Int32(32)
-                inner_m_idx = (row % Int32(32 * 4)) // Int32(32)
-                inner_k_idx = sf_idx % Int32(4)
-                scale_offset = (
-                    local_expert_id * expert_scale_stride
-                    + m_tile_idx * num_k_tiles * Int32(32 * 4 * 4)
-                    + k_tile_idx * Int32(32 * 4 * 4)
-                    + outer_m_idx * Int32(4 * 4)
-                    + inner_m_idx * Int32(4)
-                    + inner_k_idx
-                )
-                scale_storage[scale_offset] = scale_byte
-                sf_idx += Int32(self.threads_per_cta)
+                    m_tile_idx = packed_row // Int32(32 * 4)
+                    k_tile_idx = sf_idx // Int32(4)
+                    outer_m_idx = packed_row % Int32(32)
+                    inner_m_idx = (packed_row % Int32(32 * 4)) // Int32(32)
+                    inner_k_idx = sf_idx % Int32(4)
+                    scale_offset = (
+                        packed_local_expert_id * expert_scale_stride
+                        + m_tile_idx * num_k_tiles * Int32(32 * 4 * 4)
+                        + k_tile_idx * Int32(32 * 4 * 4)
+                        + outer_m_idx * Int32(4 * 4)
+                        + inner_m_idx * Int32(4)
+                        + inner_k_idx
+                    )
+                    scale_storage[scale_offset] = scale_byte
+                    sf_idx += Int32(self.threads_per_cta)
 
             if all_rows_unique == Int32(0):
                 cute.arch.sync_threads()
@@ -1118,6 +1132,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                 # tile_coord = (m_tile, intermediate_slice, local_expert_idx)
                 local_expert_idx = tile_coord[2]
                 weight_expert_idx = weight_expert_ids[local_expert_idx]
+                input_local_expert_idx = Int32(0) if shared_single_input > Int32(0) else local_expert_idx
                 valid_rows = row_counts[local_expert_idx]
                 if all_rows_unique > Int32(0):
                     valid_rows = Int32(1)
@@ -1147,15 +1162,15 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                         cute.slice_(self.tile_shape_mnk, (None, 0, None)),
                         (sfa_tile_offset, 0, None),
                     )
-                    csSFA_tile = thr_ld_SFA.partition_S(sSFA_tile)
+                    csSFA_tile_copy_view = thr_ld_SFA.partition_S(sSFA_tile)
                     tCrSFA_tile = self._dense_cls._partition_fragment_SFA(
                         self, sSFA_tile[None, None, 0], thr_mma, tidx,
                     )
-                    crSFA_tile = thr_ld_SFA.retile(tCrSFA_tile)
+                    crSFA_tile_copy_view = thr_ld_SFA.retile(tCrSFA_tile)
                 else:
-                    csSFA_tile = csSFA_full
+                    csSFA_tile_copy_view = csSFA_full
                     tCrSFA_tile = tCrSFA_full
-                    crSFA_tile = crSFA_full
+                    crSFA_tile_copy_view = crSFA_full
                 sfb_tile_offset = intermediate_slice % self.sfb_tiles_per_block
                 if cutlass.const_expr(self.sfb_tiles_per_block > 1):
                     sSFB_tile = cute.local_tile(
@@ -1163,7 +1178,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                         cute.slice_(self.tile_shape_mnk, (0, None, None)),
                         (sfb_tile_offset, 0, None),
                     )
-                    csSFB_tile = thr_ld_SFB.partition_S(sSFB_tile)
+                    csSFB_tile_copy_view = thr_ld_SFB.partition_S(sSFB_tile)
                     sSFB_up_tile = cute.local_tile(
                         sSFB_up,
                         cute.slice_(self.tile_shape_mnk, (0, None, None)),
@@ -1173,12 +1188,12 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                     tCrSFB_tile = self._dense_cls._partition_fragment_SFB(
                         self, sSFB_tile[None, None, 0], thr_mma, tidx,
                     )
-                    crSFB_tile = thr_ld_SFB.retile(tCrSFB_tile)
+                    crSFB_tile_copy_view = thr_ld_SFB.retile(tCrSFB_tile)
                 else:
-                    csSFB_tile = csSFB_full
+                    csSFB_tile_copy_view = csSFB_full
                     csSFB_up_tile = csSFB_up_full
                     tCrSFB_tile = tCrSFB_full
-                    crSFB_tile = crSFB_full
+                    crSFB_tile_copy_view = crSFB_full
                 valid_tile_rows = valid_rows - tile_m_base
                 if valid_tile_rows > Int32(self.tile_shape_mnk[0]):
                     valid_tile_rows = Int32(self.tile_shape_mnk[0])
@@ -1243,16 +1258,16 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                 # ============================================================
 
                 # Gate GEMM (inlined to avoid @cute.jit pass-by-value for acc)
-                fz_crSFA = cute.filter_zeros(crSFA_tile)
-                fz_crSFB = cute.filter_zeros(crSFB_tile)
+                fz_crSFA = cute.filter_zeros(crSFA_tile_copy_view)
+                fz_crSFB = cute.filter_zeros(crSFB_tile_copy_view)
                 gate_acc.fill(0.0)
                 cons_state.reset_count()
                 peek = ml_pipeline.consumer_try_wait(cons_state)
                 ml_pipeline.consumer_wait(cons_state, peek)
                 csA_p = csA_tile[None, None, None, cons_state.index]
                 csB_p = csB[None, None, None, cons_state.index]
-                csSFA_p = csSFA_tile[None, None, None, cons_state.index]
-                csSFB_p = csSFB_tile[None, None, None, cons_state.index]
+                csSFA_p = csSFA_tile_copy_view[None, None, None, cons_state.index]
+                csSFB_p = csSFB_tile_copy_view[None, None, None, cons_state.index]
                 cute.copy(smem_copy_A, csA_p[None, None, 0], crA_tile[None, None, 0])
                 cute.copy(smem_copy_B, csB_p[None, None, 0], crB[None, None, 0])
                 fz_csSFA_p = cute.filter_zeros(csSFA_p)
@@ -1268,8 +1283,8 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                             peek = ml_pipeline.consumer_try_wait(cons_state)
                             csA_p = csA_tile[None, None, None, cons_state.index]
                             csB_p = csB[None, None, None, cons_state.index]
-                            csSFA_p = csSFA_tile[None, None, None, cons_state.index]
-                            csSFB_p = csSFB_tile[None, None, None, cons_state.index]
+                            csSFA_p = csSFA_tile_copy_view[None, None, None, cons_state.index]
+                            csSFB_p = csSFB_tile_copy_view[None, None, None, cons_state.index]
                             fz_csSFA_p = cute.filter_zeros(csSFA_p)
                             fz_csSFB_p = cute.filter_zeros(csSFB_p)
                             ml_pipeline.consumer_wait(cons_state, peek)
@@ -1299,8 +1314,8 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                                     )
                         cute.copy(smem_copy_A, csA_p[None, None, k_next], crA_tile[None, None, k_next])
                         cute.copy(smem_copy_B, csB_p[None, None, k_next], crB[None, None, k_next])
-                        fz_csSFA_cur = cute.filter_zeros(csSFA_tile[None, None, None, cons_state.index])
-                        fz_csSFB_cur = cute.filter_zeros(csSFB_tile[None, None, None, cons_state.index])
+                        fz_csSFA_cur = cute.filter_zeros(csSFA_tile_copy_view[None, None, None, cons_state.index])
+                        fz_csSFB_cur = cute.filter_zeros(csSFB_tile_copy_view[None, None, None, cons_state.index])
                         cute.copy(smem_copy_SFA, fz_csSFA_cur[None, None, k_next], fz_crSFA[None, None, k_next])
                         cute.copy(smem_copy_SFB, fz_csSFB_cur[None, None, k_next], fz_crSFB[None, None, k_next])
                 for k_block_idx in cutlass.range_constexpr(num_k_blocks):
@@ -1348,7 +1363,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                     up_pipeline.consumer_wait(up_cons_state, peek)
                     csA_p = csA_tile[None, None, None, up_cons_state.index]
                     csB_p = csB_up[None, None, None, up_cons_state.index]
-                    csSFA_p = csSFA_tile[None, None, None, up_cons_state.index]
+                    csSFA_p = csSFA_tile_copy_view[None, None, None, up_cons_state.index]
                     csSFB_p = csSFB_up_tile[None, None, None, up_cons_state.index]
                     cute.copy(smem_copy_A, csA_p[None, None, 0], crA_tile[None, None, 0])
                     cute.copy(smem_copy_B, csB_p[None, None, 0], crB[None, None, 0])
@@ -1365,7 +1380,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                                 peek = up_pipeline.consumer_try_wait(up_cons_state)
                                 csA_p = csA_tile[None, None, None, up_cons_state.index]
                                 csB_p = csB_up[None, None, None, up_cons_state.index]
-                                csSFA_p = csSFA_tile[None, None, None, up_cons_state.index]
+                                csSFA_p = csSFA_tile_copy_view[None, None, None, up_cons_state.index]
                                 csSFB_p = csSFB_up_tile[None, None, None, up_cons_state.index]
                                 fz_csSFA_p = cute.filter_zeros(csSFA_p)
                                 fz_csSFB_p = cute.filter_zeros(csSFB_p)
@@ -1525,14 +1540,14 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                 scatter_N = Int32(scatter_output.shape[1])
 
                 csA_phase2 = csA_tile[None, None, None, 0]
-                csSFA_phase2 = csSFA_tile[None, None, None, 0]
+                csSFA_phase2 = csSFA_tile_copy_view[None, None, None, 0]
 
                 # Consume all output tiles continuously from phase2_pipeline.
 
                 # Hoist A-side register loads: sA is constant across all
                 # FC2 output tiles (quantized intermediate). Load crA and
                 # crSFA for all k-blocks once, reuse for all 32 tiles.
-                fz_crSFA_p2 = cute.filter_zeros(crSFA_tile)
+                fz_crSFA_p2 = cute.filter_zeros(crSFA_tile_copy_view)
                 cute.copy(smem_copy_A, csA_phase2[None, None, 0], crA_tile[None, None, 0])
                 fz_csSFA_p2 = cute.filter_zeros(csSFA_phase2)
                 cute.copy(smem_copy_SFA, fz_csSFA_p2[None, None, 0], fz_crSFA_p2[None, None, 0])
@@ -1732,11 +1747,12 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                 intermediate_slice = tc[1]
                 local_expert_idx = tc[2]
                 weight_expert_idx = weight_expert_ids[local_expert_idx]
+                input_local_expert_idx = Int32(0) if shared_single_input > Int32(0) else local_expert_idx
 
                 sa_tile_coord_m = tc[0] // self.sa_tiles_per_block
-                tAgA_mk = tAgA[(None, sa_tile_coord_m, None, local_expert_idx)]
+                tAgA_mk = tAgA[(None, sa_tile_coord_m, None, input_local_expert_idx)]
                 sfa_tile_coord_m = tc[0] // self.sfa_tiles_per_block
-                tAgSFA_mk = tAgSFA[(None, sfa_tile_coord_m, None, local_expert_idx)]
+                tAgSFA_mk = tAgSFA[(None, sfa_tile_coord_m, None, input_local_expert_idx)]
 
                 # FC1 producer slice. Gated activation packs [up, gate] along N;
                 # relu2 uses a single FC1 pass over intermediate_slice.

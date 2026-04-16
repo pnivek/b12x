@@ -1175,7 +1175,9 @@ def _select_micro_mma_tiler_mn(max_rows: int, n: int) -> tuple[int, int]:
     coarse_tiles = ((max_rows + coarse_tile[0] - 1) // coarse_tile[0]) * (
         (n + coarse_tile[1] - 1) // coarse_tile[1]
     )
-    if max_rows <= 128 and coarse_tiles < max(1, sm_count // 2):
+    # Single-token decode often lands exactly on the "half the machine" boundary.
+    # Keeping the coarse 128x128 tile there leaves the M dimension badly underfilled.
+    if max_rows <= 128 and coarse_tiles <= max(1, sm_count // 2):
         return (64, 128)
     return (128, 128)
 
@@ -1341,6 +1343,7 @@ def _get_micro_kernel(
     topk_ids_dtype: torch.dtype,
     input_scales_are_reciprocal: bool,
     fast_math: bool,
+    share_input_across_experts: bool = False,
     mac_override: int | None = None,
     activation: str = "silu",
 ):
@@ -1353,7 +1356,7 @@ def _get_micro_kernel(
     global _LAST_KERNEL
     cache_key = (
         "micro", state_E, weight_E, m, k, n, num_topk, max_rows, mac, mma_tiler_mn, topk_ids_dtype,
-        input_scales_are_reciprocal, fast_math, activation,
+        input_scales_are_reciprocal, fast_math, share_input_across_experts, activation,
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -1376,6 +1379,7 @@ def _get_micro_kernel(
         output_tile_count_n=max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1]),
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
+        share_input_across_experts=share_input_across_experts,
     )
     kernel = activation_spec.make_micro_kernel(**kernel_kwargs)
 
@@ -1819,12 +1823,14 @@ def _launch_compact_static(
     input_scales_are_reciprocal: bool,
     fast_math: bool,
     stream,
+    share_input_across_experts: bool = False,
     activation: str = "silu",
 ) -> None:
     micro_cutover_pairs = _get_micro_compact_cutover_pairs()
     if (
         micro_cutover_pairs == _MICRO_COMPACT_CUTOVER_PAIRS_DEFAULT
         and num_topk > 1
+        and not (activation == "relu2" and m == 1)
     ):
         micro_cutover_pairs = _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK_DEFAULT
     use_micro = routed_rows <= micro_cutover_pairs
@@ -1863,6 +1869,7 @@ def _launch_compact_static(
             topk_ids_dtype=torch.int32,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
+            share_input_across_experts=share_input_across_experts,
             mac_override=micro_mac,
             activation=activation,
         )
@@ -2095,6 +2102,11 @@ def b12x_moe_fp4(
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             stream=stream,
+            share_input_across_experts=(
+                activation == "relu2"
+                and m == 1
+                and a1_gscale.numel() == 1
+            ),
             activation=activation,
         )
     return scatter_output

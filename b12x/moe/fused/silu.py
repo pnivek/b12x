@@ -18,6 +18,7 @@ class MoEMicroKernelSilu(MoEMicroKernelBackend):
         *,
         input_scales_are_reciprocal: bool = False,
         fast_math: bool = False,
+        share_input_across_experts: bool = False,
     ):
         super().__init__(
             sf_vec_size,
@@ -26,6 +27,7 @@ class MoEMicroKernelSilu(MoEMicroKernelBackend):
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             activation="silu",
+            share_input_across_experts=share_input_across_experts,
         )
 
 
