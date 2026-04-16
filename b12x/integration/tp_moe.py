@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Dict, Tuple
 
@@ -250,6 +251,18 @@ _DYNAMIC_MULTICTA_CACHE: bool | None = None
 _DYNAMIC_CHUNK_MULTIPLIER_CACHE: int | None = None
 _LAST_WEIGHTS: Tuple = (None, None)  # (cache_key, views)
 _LAST_KERNEL: Tuple = (None, None)  # (cache_key, (compiled, mac))
+_CURRENT_DISPATCH_STAGE: str | None = None
+
+
+@contextmanager
+def b12x_moe_dispatch_context(stage: str | None):
+    global _CURRENT_DISPATCH_STAGE
+    previous_stage = _CURRENT_DISPATCH_STAGE
+    _CURRENT_DISPATCH_STAGE = stage
+    try:
+        yield
+    finally:
+        _CURRENT_DISPATCH_STAGE = previous_stage
 
 
 def clear_tp_moe_caches() -> None:
