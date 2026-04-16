@@ -1840,21 +1840,14 @@ def _launch_compact_static(
         # barriers without owning useful work.
         micro_work_tiles = max(1, routed_rows * max(1, (n + 128 - 1) // 128))
         micro_mac = min(_get_impl_mac("micro", routed_rows=routed_rows), micro_work_tiles)
-        # m==1 with an ungated activation lets us skip the Triton compaction
-        # prepass: the kernel's all_rows_unique path reads topk_ids directly
-        # as global expert ids. Gated (silu) activations still need the
-        # prepass because their kernel path reads weight_expert_ids.
-        skip_prepass = m == 1 and activation != "silu"
-        launch_ids = flat_ids
-        if not skip_prepass:
-            compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
-            triton_compact_topk_ids(
-                flat_ids,
-                compact_ids,
-                workspace.weight_expert_ids,
-                workspace.active_expert_count,
-            )
-            launch_ids = compact_ids
+        compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
+        triton_compact_topk_ids(
+            flat_ids,
+            compact_ids,
+            workspace.weight_expert_ids,
+            workspace.active_expert_count,
+        )
+        launch_ids = compact_ids
         compiled, mac = _get_micro_kernel(
             workspace.state_E, weight_E, m, k, n, num_topk, workspace.max_rows,
             topk_ids_dtype=torch.int32,
