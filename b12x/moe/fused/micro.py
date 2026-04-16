@@ -841,24 +841,21 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
         num_topk = total_pairs // num_tokens
         num_active_experts = active_expert_count[Int32(0)]
         all_rows_unique = Int32(0)
-        if num_tokens == Int32(1) and num_active_experts == total_pairs:
+        if num_tokens == Int32(1):
+            # A single token's top-k routing is already a dense local expert set.
             all_rows_unique = Int32(1)
+            num_active_experts = total_pairs
         expert_scale_stride = Int32(scale_storage.shape[0]) // num_experts
         flat_tid = Int32(bidz) * Int32(self.threads_per_cta) + Int32(tidx)
         flat_stride = Int32(gdim_z) * Int32(self.threads_per_cta)
         num_k_tiles = (cols + Int32(63)) // Int32(64)
 
         # Phase 0: cooperative init — zero row_counts and scatter_output
-        i = flat_tid
-        while i < num_experts:
-            row_count = Int32(0)
-            if all_rows_unique > Int32(0) and i < num_active_experts:
-                row_count = Int32(1)
-            row_counts[i] = row_count
-            i += flat_stride
-        if flat_tid == Int32(0):
-            # Triton prepass has already populated the compact expert set.
-            pass
+        if all_rows_unique == Int32(0):
+            i = flat_tid
+            while i < num_experts:
+                row_counts[i] = Int32(0)
+                i += flat_stride
         scatter_total = num_tokens * cols
         j = flat_tid
         while j < scatter_total:
@@ -882,7 +879,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
             row = Int32(0)
             if all_rows_unique > Int32(0):
                 local_expert_id = pair_idx
-                expert_id = weight_expert_ids[local_expert_id].to(Int32)
+                expert_id = topk_ids[local_expert_id].to(Int32)
             else:
                 if is_cta_leader > Int32(0):
                     local_expert_id = topk_ids[pair_idx].to(Int32)
@@ -921,11 +918,8 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                     block_max = fmax_f32(block_max, fabs_f32(value))
                 packed64 = Uint64(0)
                 scale_byte = Uint8(0)
-                if cutlass.const_expr(self.is_gated):
-                    if self.fast_math:
-                        packed64, scale_byte = quantize_block_fp4_fast(values, block_max, gs_value)
-                    else:
-                        packed64, scale_byte = quantize_block_fp4(values, block_max, gs_value)
+                if self.fast_math:
+                    packed64, scale_byte = quantize_block_fp4_fast(values, block_max, gs_value)
                 else:
                     packed64, scale_byte = quantize_block_fp4(values, block_max, gs_value)
 
@@ -1124,10 +1118,11 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                 # tile_coord = (m_tile, intermediate_slice, local_expert_idx)
                 local_expert_idx = tile_coord[2]
                 weight_expert_idx = weight_expert_ids[local_expert_idx]
-                alpha_value = alpha[weight_expert_idx].to(cutlass.Float32)
                 valid_rows = row_counts[local_expert_idx]
                 if all_rows_unique > Int32(0):
+                    weight_expert_idx = topk_ids[local_expert_idx].to(Int32)
                     valid_rows = Int32(1)
+                alpha_value = alpha[weight_expert_idx].to(cutlass.Float32)
                 tile_m_base = tile_coord[0] * Int32(self.tile_shape_mnk[0])
                 intermediate_slice = tile_coord[1]
                 sa_tile_offset = tile_coord[0] % self.sa_tiles_per_block
@@ -1484,11 +1479,8 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
 
                         packed64 = Uint64(0)
                         scale_byte = Uint8(0)
-                        if cutlass.const_expr(self.is_gated):
-                            if self.fast_math:
-                                packed64, scale_byte = quantize_block_fp4_fast(values, block_max, gs_value)
-                            else:
-                                packed64, scale_byte = quantize_block_fp4(values, block_max, gs_value)
+                        if self.fast_math:
+                            packed64, scale_byte = quantize_block_fp4_fast(values, block_max, gs_value)
                         else:
                             packed64, scale_byte = quantize_block_fp4(values, block_max, gs_value)
                         packed_base = sf_block << Int32(3)
@@ -1741,6 +1733,8 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                 intermediate_slice = tc[1]
                 local_expert_idx = tc[2]
                 weight_expert_idx = weight_expert_ids[local_expert_idx]
+                if all_rows_unique > Int32(0):
+                    weight_expert_idx = topk_ids[local_expert_idx].to(Int32)
 
                 sa_tile_coord_m = tc[0] // self.sa_tiles_per_block
                 tAgA_mk = tAgA[(None, sa_tile_coord_m, None, local_expert_idx)]

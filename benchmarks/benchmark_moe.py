@@ -62,8 +62,8 @@ EP_RANK = 0
 
 def require_sm120() -> None:
     major, minor = torch.cuda.get_device_capability()
-    if (major, minor) != (12, 0):
-        raise RuntimeError(f"Requires sm_120, got sm_{major}{minor}")
+    if major != 12 or minor not in (0, 1):
+        raise RuntimeError(f"Requires sm_120 or sm_121, got sm_{major}{minor}")
 
 
 def bench_events(fn: Callable[[], None], *, warmup: int, iters: int) -> list[float]:
