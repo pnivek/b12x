@@ -61,6 +61,8 @@ class _MoEMicroKernelBase:
         fast_math: bool = False,
         activation: str = "silu",
         share_input_across_experts: bool = False,
+        share_expert_scales: bool = False,
+        single_token: bool = False,
     ):
         if activation not in {"silu", "relu2"}:
             raise ValueError(f"unsupported activation {activation!r}")
@@ -72,6 +74,8 @@ class _MoEMicroKernelBase:
         self.activation = activation
         self.is_gated = activation == "silu"
         self.share_input_across_experts = share_input_across_experts
+        self.share_expert_scales = share_expert_scales
+        self.single_token = single_token
         tile_k = sf_vec_size * 8
         self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
         self.sa_tile_shape_mk = (max(128, mma_tiler_mn[0]), tile_k)
@@ -502,6 +506,8 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
         fast_math: bool = False,
         activation: str = "silu",
         share_input_across_experts: bool = False,
+        share_expert_scales: bool = False,
+        single_token: bool = False,
     ):
         super().__init__(
             sf_vec_size,
@@ -511,6 +517,8 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
             fast_math=fast_math,
             activation=activation,
             share_input_across_experts=share_input_across_experts,
+            share_expert_scales=share_expert_scales,
+            single_token=single_token,
         )
 
     @cute.jit
@@ -843,20 +851,18 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
         max_rows = Int32(token_map.shape[1])
         total_pairs = Int32(topk_ids.shape[0])
         num_topk = total_pairs // num_tokens
-        num_active_experts = active_expert_count[Int32(0)]
-        all_rows_unique = Int32(0)
-        if num_tokens == Int32(1):
+        if cutlass.const_expr(self.single_token):
             # A single token's top-k routing is already a dense local expert set.
-            all_rows_unique = Int32(1)
             num_active_experts = total_pairs
-        shared_single_input = Int32(1) if cutlass.const_expr(self.share_input_across_experts) else Int32(0)
+        else:
+            num_active_experts = active_expert_count[Int32(0)]
         expert_scale_stride = Int32(scale_storage.shape[0]) // num_experts
         flat_tid = Int32(bidz) * Int32(self.threads_per_cta) + Int32(tidx)
         flat_stride = Int32(gdim_z) * Int32(self.threads_per_cta)
         num_k_tiles = (cols + Int32(63)) // Int32(64)
 
         # Phase 0: cooperative init — zero row_counts and clear scatter_output.
-        if all_rows_unique == Int32(0):
+        if cutlass.const_expr(not self.single_token):
             i = flat_tid
             while i < num_experts:
                 row_counts[i] = Int32(0)
@@ -867,7 +873,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
             scatter_output[j // cols, j % cols] = cutlass.BFloat16(0.0)
             j += flat_stride
         cute.arch.sync_threads()
-        if shared_single_input == Int32(0):
+        if cutlass.const_expr(not self.share_input_across_experts):
             self._resident_grid_barrier(
                 barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
             )
@@ -876,16 +882,19 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
         while pair_idx < total_pairs:
             token_idx = Int32(0)
             weight = cutlass.Float32(0.0)
-            if all_rows_unique == Int32(0):
+            if cutlass.const_expr(not self.single_token):
                 token_idx = pair_idx // num_topk
                 weight = topk_weights[pair_idx].to(cutlass.Float32)
 
             expert_id = Int32(0)
             local_expert_id = Int32(0)
             row = Int32(0)
-            if all_rows_unique > Int32(0):
+            if cutlass.const_expr(self.single_token):
                 local_expert_id = pair_idx
-                expert_id = weight_expert_ids[local_expert_id].to(Int32)
+                if cutlass.const_expr(self.is_gated):
+                    expert_id = weight_expert_ids[local_expert_id].to(Int32)
+                else:
+                    expert_id = topk_ids[local_expert_id].to(Int32)
             else:
                 if is_cta_leader > Int32(0):
                     local_expert_id = topk_ids[pair_idx].to(Int32)
@@ -910,12 +919,13 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
             should_quantize = Int32(1)
             packed_local_expert_id = local_expert_id
             packed_row = row
-            if shared_single_input > Int32(0):
+            if cutlass.const_expr(self.share_input_across_experts):
                 should_quantize = Int32(1) if pair_idx == Int32(0) else Int32(0)
                 packed_local_expert_id = Int32(0)
                 packed_row = Int32(0)
             if should_quantize > Int32(0):
-                gs_value = input_global_scale[expert_id].to(cutlass.Float32)
+                scale_idx = Int32(0) if cutlass.const_expr(self.share_expert_scales) else expert_id
+                gs_value = input_global_scale[scale_idx].to(cutlass.Float32)
                 if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(0.0):
                     if self.fast_math:
                         gs_value = rcp_approx_ftz(gs_value)
@@ -960,7 +970,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                     scale_storage[scale_offset] = scale_byte
                     sf_idx += Int32(self.threads_per_cta)
 
-            if all_rows_unique == Int32(0):
+            if cutlass.const_expr(not self.single_token):
                 cute.arch.sync_threads()
             pair_idx += Int32(gdim_z)
 
@@ -1108,7 +1118,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
             accum_tile_m = Int32(0)
             tile_coord = (Int32(0), Int32(0), Int32(0))
             is_valid_tile = Int32(0) < Int32(0)
-            if all_rows_unique > Int32(0):
+            if cutlass.const_expr(self.single_token):
                 tile_coord, is_valid_tile = _compact_unique_get_work_tile(
                     num_active_experts=num_active_experts,
                     num_tiles_n=Int32(self.output_tile_count_n),
@@ -1131,11 +1141,18 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
             while is_valid_tile:
                 # tile_coord = (m_tile, intermediate_slice, local_expert_idx)
                 local_expert_idx = tile_coord[2]
-                weight_expert_idx = weight_expert_ids[local_expert_idx]
-                input_local_expert_idx = Int32(0) if shared_single_input > Int32(0) else local_expert_idx
-                valid_rows = row_counts[local_expert_idx]
-                if all_rows_unique > Int32(0):
+                if cutlass.const_expr(self.single_token):
+                    if cutlass.const_expr(not self.is_gated):
+                        weight_expert_idx = topk_ids[local_expert_idx].to(Int32)
+                    else:
+                        weight_expert_idx = weight_expert_ids[local_expert_idx]
                     valid_rows = Int32(1)
+                else:
+                    weight_expert_idx = weight_expert_ids[local_expert_idx]
+                    valid_rows = row_counts[local_expert_idx]
+                input_local_expert_idx = (
+                    Int32(0) if cutlass.const_expr(self.share_input_across_experts) else local_expert_idx
+                )
                 alpha_value = alpha[weight_expert_idx].to(cutlass.Float32)
                 tile_m_base = tile_coord[0] * Int32(self.tile_shape_mnk[0])
                 intermediate_slice = tile_coord[1]
@@ -1201,7 +1218,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                     valid_tile_rows = Int32(0)
 
                 cache_row = Int32(tidx)
-                if all_rows_unique == Int32(0):
+                if cutlass.const_expr(not self.single_token):
                     if cache_row < Int32(_COMPACT_STATIC_TILE_M):
                         tok = Int32(0)
                         wv = cutlass.Float32(0.0)
@@ -1240,7 +1257,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                 down_acc = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
                 unique_tok = Int32(0)
                 unique_wv = cutlass.Float32(0.0)
-                if all_rows_unique > Int32(0):
+                if cutlass.const_expr(self.single_token):
                     unique_tok = local_expert_idx // num_topk
                     unique_wv = topk_weights[local_expert_idx].to(cutlass.Float32)
 
@@ -1426,7 +1443,8 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                 sA_u8 = cute.recast_tensor(sA[None, None, 0], cutlass.Uint8)
                 packed_cols = Int32(self.tile_shape_mnk[2] // 2)
                 sf_blocks_per_row = Int32(self.tile_shape_mnk[2] // 16)
-                gs_value = global_scale[weight_expert_idx].to(cutlass.Float32)
+                scale_idx = Int32(0) if cutlass.const_expr(self.share_expert_scales) else weight_expert_idx
+                gs_value = global_scale[scale_idx].to(cutlass.Float32)
                 if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(0.0):
                     if self.fast_math:
                         gs_value = rcp_approx_ftz(gs_value)
@@ -1652,7 +1670,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                             cached_row = rows_offset + local_row
                             tok = Int32(0)
                             wv = cutlass.Float32(0.0)
-                            if all_rows_unique > Int32(0):
+                            if cutlass.const_expr(self.single_token):
                                 tok = unique_tok
                                 wv = unique_wv
                             else:
@@ -1681,7 +1699,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                 self.pass_sync_barrier.arrive_and_wait()
 
                 current_work_linear_idx += num_persistent_clusters
-                if all_rows_unique > Int32(0):
+                if cutlass.const_expr(self.single_token):
                     tile_coord, is_valid_tile = _compact_unique_get_work_tile(
                         num_active_experts=num_active_experts,
                         num_tiles_n=Int32(self.output_tile_count_n),
@@ -1722,7 +1740,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
             accum_tile_m = Int32(0)
             tile_coord = (Int32(0), Int32(0), Int32(0))
             is_valid_tile = Int32(0) < Int32(0)
-            if all_rows_unique > Int32(0):
+            if cutlass.const_expr(self.single_token):
                 tile_coord, is_valid_tile = _compact_unique_get_work_tile(
                     num_active_experts=num_active_experts,
                     num_tiles_n=Int32(self.output_tile_count_n),
@@ -1746,8 +1764,16 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                 tc = tile_coord
                 intermediate_slice = tc[1]
                 local_expert_idx = tc[2]
-                weight_expert_idx = weight_expert_ids[local_expert_idx]
-                input_local_expert_idx = Int32(0) if shared_single_input > Int32(0) else local_expert_idx
+                if cutlass.const_expr(self.single_token):
+                    if cutlass.const_expr(not self.is_gated):
+                        weight_expert_idx = topk_ids[local_expert_idx].to(Int32)
+                    else:
+                        weight_expert_idx = weight_expert_ids[local_expert_idx]
+                else:
+                    weight_expert_idx = weight_expert_ids[local_expert_idx]
+                input_local_expert_idx = (
+                    Int32(0) if cutlass.const_expr(self.share_input_across_experts) else local_expert_idx
+                )
 
                 sa_tile_coord_m = tc[0] // self.sa_tiles_per_block
                 tAgA_mk = tAgA[(None, sa_tile_coord_m, None, input_local_expert_idx)]
@@ -1811,7 +1837,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                 self.pass_sync_barrier.arrive_and_wait()
 
                 current_work_linear_idx += num_persistent_clusters
-                if all_rows_unique > Int32(0):
+                if cutlass.const_expr(self.single_token):
                     tile_coord, is_valid_tile = _compact_unique_get_work_tile(
                         num_active_experts=num_active_experts,
                         num_tiles_n=Int32(self.output_tile_count_n),
