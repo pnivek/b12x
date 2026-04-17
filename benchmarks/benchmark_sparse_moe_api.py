@@ -17,6 +17,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 import torch.nn.functional as F
 
+from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 from benchmarks.benchmark_moe import (
     BATCH_SIZE_PROFILES,
     MODEL_PATH,
@@ -108,6 +109,14 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip output equality checks between manual routing and the sparse wrapper.",
     )
+    parser.add_argument("--flush-l2", action="store_true", default=True)
+    parser.add_argument("--no-flush-l2", action="store_false", dest="flush_l2")
+    parser.add_argument(
+        "--l2-flush-bytes",
+        type=int,
+        default=0,
+        help="L2 eviction size in bytes; default is 2x detected L2 capacity.",
+    )
     return parser.parse_args()
 
 
@@ -124,12 +133,16 @@ def main() -> None:
     clear_tp_moe_caches()
 
     device = torch.device("cuda")
+    l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)
+    l2_flush = make_l2_flush_fn(args.flush_l2, args.l2_flush_bytes)
     spec = _make_spec()
     print(
         "Sparse API benchmark (graph replay) | "
         f"Qwen3.5 TP={spec.tp_size} K={spec.hidden_size} I_tp={spec.I_tp} "
         f"E={spec.num_experts} top_k={spec.top_k}"
     )
+    flush_desc = f"on ({l2_flush_bytes / (1 << 20):.1f} MiB per launch)" if l2_flush else "off"
+    print(f"L2 flush: {flush_desc}")
 
     with torch.no_grad():
         weights = load_expert_weights(MODEL_PATH, spec, layer_idx=args.layer_idx)
@@ -274,11 +287,36 @@ def main() -> None:
             manual_e2e_graph = _capture_graph(manual_e2e)
             sparse_graph = _capture_graph(sparse_api)
 
-            routing_times = bench_events(manual_route_graph.replay, warmup=args.warmup, iters=args.iters)
-            route_api_times = bench_events(route_api_graph.replay, warmup=args.warmup, iters=args.iters)
-            tp_times = bench_events(tp_graph.replay, warmup=args.warmup, iters=args.iters)
-            manual_times = bench_events(manual_e2e_graph.replay, warmup=args.warmup, iters=args.iters)
-            sparse_times = bench_events(sparse_graph.replay, warmup=args.warmup, iters=args.iters)
+            routing_times = bench_events(
+                manual_route_graph.replay,
+                warmup=args.warmup,
+                iters=args.iters,
+                l2_flush=l2_flush,
+            )
+            route_api_times = bench_events(
+                route_api_graph.replay,
+                warmup=args.warmup,
+                iters=args.iters,
+                l2_flush=l2_flush,
+            )
+            tp_times = bench_events(
+                tp_graph.replay,
+                warmup=args.warmup,
+                iters=args.iters,
+                l2_flush=l2_flush,
+            )
+            manual_times = bench_events(
+                manual_e2e_graph.replay,
+                warmup=args.warmup,
+                iters=args.iters,
+                l2_flush=l2_flush,
+            )
+            sparse_times = bench_events(
+                sparse_graph.replay,
+                warmup=args.warmup,
+                iters=args.iters,
+                l2_flush=l2_flush,
+            )
 
             route_manual_us = statistics.median(routing_times) * 1000.0
             route_api_us = statistics.median(route_api_times) * 1000.0

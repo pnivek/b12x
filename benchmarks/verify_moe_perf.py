@@ -18,7 +18,9 @@ from benchmarks.benchmark_moe import (
     bench_repeated,
     get_scale_contract_params,
     load_expert_weights,
+    make_l2_flush_fn,
     require_sm120,
+    resolve_l2_flush_bytes,
 )
 from b12x.integration.tp_moe import allocate_tp_moe_workspace_pool, b12x_moe_fp4, clear_tp_moe_caches
 
@@ -40,6 +42,18 @@ def _build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--flush-l2",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Evict GPU L2 before each warmup and timed launch (default: enabled).",
+    )
+    parser.add_argument(
+        "--l2-flush-bytes",
+        type=int,
+        default=0,
+        help="Bytes to touch when evicting L2; 0 uses 2x the reported L2 size.",
+    )
     return parser
 
 
@@ -55,6 +69,7 @@ def _measure_batch(
     repeats: int,
     fast_math: bool,
     device: torch.device,
+    l2_flush,
 ) -> dict[str, float]:
     torch.manual_seed(42 + batch_size)
     x = torch.randn(batch_size, spec.hidden_size, dtype=torch.bfloat16, device=device)
@@ -88,6 +103,7 @@ def _measure_batch(
         warmup=warmup,
         iters=iters,
         repeats=repeats,
+        l2_flush=l2_flush,
     )
 
     for _ in range(3):
@@ -105,6 +121,7 @@ def _measure_batch(
         warmup=warmup,
         iters=iters,
         repeats=repeats,
+        l2_flush=l2_flush,
     )
 
     return {
@@ -120,6 +137,8 @@ def main() -> None:
     require_sm120()
     torch.empty(1, device="cuda")
     device = torch.device("cuda")
+    l2_flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
+    l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes) if args.flush_l2 else 0
 
     spec = ModelSpec(
         hidden_size=4096,
@@ -139,6 +158,8 @@ def main() -> None:
         "fast_math": args.fast_math,
         "iters": args.iters,
         "layer_idx": args.layer_idx,
+        "l2_flush_bytes": l2_flush_bytes,
+        "l2_flush_enabled": args.flush_l2,
         "model_path": str(MODEL_PATH),
         "repeats": args.repeats,
         "scale_contract": args.scale_contract,
@@ -156,6 +177,7 @@ def main() -> None:
             repeats=args.repeats,
             fast_math=args.fast_math,
             device=device,
+            l2_flush=l2_flush,
         )
 
     print(json.dumps(results, indent=2, sort_keys=True))

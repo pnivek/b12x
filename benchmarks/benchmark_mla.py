@@ -43,8 +43,10 @@ from benchmarks.common import (
     capture_cuda_graph,
     make_dense_candidate_page_table,
     make_dense_real_page_table,
+    make_l2_flush_fn,
     make_sparse_pool_locs,
     require_sm120,
+    resolve_l2_flush_bytes,
     scatter_rows_into_pool,
 )
 
@@ -502,6 +504,7 @@ def _run_decode_case(
     device: torch.device,
     pool_factor: int,
     graph_width: int,
+    l2_flush,
 ) -> CaseReport:
     if pool_factor <= 0:
         raise ValueError(f"pool_factor must be positive, got {pool_factor}")
@@ -722,13 +725,13 @@ def _run_decode_case(
         warmup=warmup,
         prepare=prepare_decode_graph,
     )
-    indexer_stats = bench_cuda_graph(indexer_graph, replays=replays)
+    indexer_stats = bench_cuda_graph(indexer_graph, replays=replays, l2_flush=l2_flush)
     indexer_us = statistics.median(indexer_stats["replay_us"])
 
     clear_mla_caches()
     prepare_decode_graph()
     mla_graph = capture_cuda_graph(run_mla, warmup=warmup)
-    mla_stats = bench_cuda_graph(mla_graph, replays=replays)
+    mla_stats = bench_cuda_graph(mla_graph, replays=replays, l2_flush=l2_flush)
     mla_us = statistics.median(mla_stats["replay_us"])
 
     clear_nsa_indexer_caches()
@@ -742,6 +745,7 @@ def _run_decode_case(
         step_graph,
         replays=replays,
         prepare=prepare_decode_graph,
+        l2_flush=l2_flush,
     )
 
     return CaseReport(
@@ -768,6 +772,7 @@ def _run_prefill_or_verify_case(
     device: torch.device,
     pool_factor: int,
     graph_width: int,
+    l2_flush,
 ) -> CaseReport:
     if pool_factor <= 0:
         raise ValueError(f"pool_factor must be positive, got {pool_factor}")
@@ -1099,13 +1104,18 @@ def _run_prefill_or_verify_case(
         warmup=warmup,
         prepare=prepare_verify_graph,
     )
-    indexer_stats = bench_cuda_graph(indexer_graph, replays=replays, prepare=prepare_verify_graph)
+    indexer_stats = bench_cuda_graph(
+        indexer_graph,
+        replays=replays,
+        prepare=prepare_verify_graph,
+        l2_flush=l2_flush,
+    )
     indexer_us = statistics.median(indexer_stats["replay_us"])
 
     clear_mla_caches()
     prepare_verify_graph()
     mla_graph = capture_cuda_graph(run_mla, warmup=warmup)
-    mla_stats = bench_cuda_graph(mla_graph, replays=replays)
+    mla_stats = bench_cuda_graph(mla_graph, replays=replays, l2_flush=l2_flush)
     mla_us = statistics.median(mla_stats["replay_us"])
 
     clear_nsa_indexer_caches()
@@ -1119,6 +1129,7 @@ def _run_prefill_or_verify_case(
         step_graph,
         replays=replays,
         prepare=prepare_verify_graph,
+        l2_flush=l2_flush,
     )
 
     return CaseReport(
@@ -1142,6 +1153,7 @@ def collect_case_reports(
 ) -> list[CaseReport]:
     cfg = _load_glm_contract_config(tp_size=args.tp_size, tp_rank=args.tp_rank)
     device = require_sm120() if device is None else device
+    l2_flush = make_l2_flush_fn(args.flush_l2, args.l2_flush_bytes)
     cases = _build_decode_cases(
         modes=[mode for mode in args.modes.split(",") if mode],
         batch_sizes=_parse_csv_ints(args.batch_sizes),
@@ -1162,6 +1174,7 @@ def collect_case_reports(
                 device=device,
                 pool_factor=args.pool_factor,
                 graph_width=args.graph_width,
+                l2_flush=l2_flush,
             )
             if case.mode == "decode"
             else _run_prefill_or_verify_case(
@@ -1173,6 +1186,7 @@ def collect_case_reports(
                 device=device,
                 pool_factor=args.pool_factor,
                 graph_width=args.graph_width,
+                l2_flush=l2_flush,
             )
         )
         case_seed += 17
@@ -1250,13 +1264,29 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_GRAPH_WIDTH,
         help="decode graph candidate-table width; actual width is max(cache_len, graph_width)",
     )
+    parser.add_argument("--flush-l2", action="store_true", default=True)
+    parser.add_argument("--no-flush-l2", action="store_false", dest="flush_l2")
+    parser.add_argument(
+        "--l2-flush-bytes",
+        type=int,
+        default=0,
+        help="L2 eviction size in bytes; default is 2x detected L2 capacity.",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    device = require_sm120()
+    l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)
+    flush_desc = (
+        f"on ({l2_flush_bytes / (1 << 20):.1f} MiB per launch)"
+        if args.flush_l2
+        else "off"
+    )
+    print(f"L2 flush: {flush_desc}")
     try:
-        reports = collect_case_reports(args)
+        reports = collect_case_reports(args, device=device)
     except BenchmarkFailure as exc:
         print(str(exc), file=sys.stderr)
         return 1

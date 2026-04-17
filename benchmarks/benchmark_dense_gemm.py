@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from b12x.cute.fp4 import quantize_grouped_nvfp4_torch
-from b12x.cute.utils import convert_sf_from_mma_layout
+from b12x.cute.utils import convert_sf_from_mma_layout, get_hardware_info
 from b12x.gemm.dense import dense_gemm
 
 from flashinfer.gemm import mm_fp4
@@ -47,6 +47,9 @@ BATCH_SIZES = [2, 4, 8]
 REFERENCE_BACKEND = "cutlass"
 REFERENCE_LABEL = "FlashInfer CUTLASS"
 COSINE_THRESHOLD = 0.999999
+_L2_FLUSH_BUFFER_CACHE: dict[tuple[int, int], torch.Tensor] = {}
+_AUTO_L2_FLUSH_MULTIPLIER = 2
+_FALLBACK_L2_FLUSH_BYTES = 32 << 20
 
 
 class BenchmarkAbort(RuntimeError):
@@ -57,13 +60,58 @@ class CorrectnessError(BenchmarkAbort):
     """Raised when replay outputs fail the correctness gate."""
 
 
-def bench_events(fn: Callable[[], None], *, warmup: int, iters: int) -> List[float]:
+def resolve_l2_flush_bytes(bytes_hint: int) -> int:
+    if bytes_hint < 0:
+        raise ValueError(f"l2 flush bytes must be non-negative, got {bytes_hint}")
+    if bytes_hint > 0:
+        return int(bytes_hint)
+    try:
+        l2_bytes = int(get_hardware_info().get_l2_cache_size_in_bytes())
+    except Exception:
+        l2_bytes = 0
+    if l2_bytes > 0:
+        return l2_bytes * _AUTO_L2_FLUSH_MULTIPLIER
+    return _FALLBACK_L2_FLUSH_BYTES
+
+
+def make_l2_flush_fn(
+    *,
+    enabled: bool,
+    bytes_hint: int = 0,
+) -> Callable[[], None] | None:
+    if not enabled:
+        return None
+    flush_bytes = resolve_l2_flush_bytes(bytes_hint)
+    device_idx = torch.cuda.current_device()
+    key = (device_idx, flush_bytes)
+    buffer = _L2_FLUSH_BUFFER_CACHE.get(key)
+    if buffer is None:
+        buffer = torch.empty(flush_bytes, dtype=torch.uint8, device=f"cuda:{device_idx}")
+        _L2_FLUSH_BUFFER_CACHE[key] = buffer
+
+    def flush(cache_buffer: torch.Tensor = buffer) -> None:
+        cache_buffer.bitwise_not_()
+
+    return flush
+
+
+def bench_events(
+    fn: Callable[[], None],
+    *,
+    warmup: int,
+    iters: int,
+    l2_flush: Callable[[], None] | None = None,
+) -> List[float]:
     for _ in range(warmup):
+        if l2_flush is not None:
+            l2_flush()
         fn()
     torch.cuda.synchronize()
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     for i in range(iters):
+        if l2_flush is not None:
+            l2_flush()
         starts[i].record()
         fn()
         ends[i].record()
@@ -153,6 +201,7 @@ def bench_one(
     warmup: int,
     iters: int,
     check: bool,
+    l2_flush: Callable[[], None] | None,
 ):
     """Benchmark one (M,N,K) problem with CUDA graph replay timing."""
     torch.manual_seed(42)
@@ -180,7 +229,12 @@ def bench_one(
         b12x_replay = capture_graph_replay(b12x_launch)
         results["b12x_replay"] = b12x_replay
         results["b12x_out"] = b12x_out
-        results["b12x"] = bench_events(b12x_replay, warmup=warmup, iters=iters)
+        results["b12x"] = bench_events(
+            b12x_replay,
+            warmup=warmup,
+            iters=iters,
+            l2_flush=l2_flush,
+        )
     except Exception as exc:
         results["b12x"] = None
         print(f"      b12x FAILED: {exc}")
@@ -198,7 +252,12 @@ def bench_one(
         ref_replay = capture_graph_replay(cutlass_launch)
         results["ref_replay"] = ref_replay
         results["ref_out"] = ref_out
-        results[REFERENCE_LABEL] = bench_events(ref_replay, warmup=warmup, iters=iters)
+        results[REFERENCE_LABEL] = bench_events(
+            ref_replay,
+            warmup=warmup,
+            iters=iters,
+            l2_flush=l2_flush,
+        )
     except Exception as exc:
         results[REFERENCE_LABEL] = None
         print(f"      {REFERENCE_LABEL} FAILED: {exc}")
@@ -226,6 +285,18 @@ def main():
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=BATCH_SIZES)
+    parser.add_argument(
+        "--flush-l2",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Evict GPU L2 before each warmup and timed launch (default: enabled).",
+    )
+    parser.add_argument(
+        "--l2-flush-bytes",
+        type=int,
+        default=0,
+        help="Bytes to touch when evicting L2; 0 uses 2x the reported L2 size.",
+    )
     parser.set_defaults(check=True)
     parser.add_argument(
         "--check",
@@ -245,10 +316,16 @@ def main():
     if major != 12 or minor not in (0, 1):
         raise RuntimeError(f"Requires sm_120 or sm_121, got sm_{major}{minor}")
     torch.empty(1, device="cuda")
+    l2_flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
+    l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes) if args.flush_l2 else 0
 
     print(f"Dense FP4 GEMM: b12x vs {REFERENCE_LABEL}")
     print("NVIDIA Nemotron 3 Super shared-expert down-proj")
     print("Timing mode: CUDA graph replay")
+    if args.flush_l2:
+        print(f"L2 flush: on ({l2_flush_bytes / (1 << 20):.1f} MiB per launch)")
+    else:
+        print("L2 flush: off")
     if args.check:
         print(f"Correctness check: on (cos >= {COSINE_THRESHOLD:.6f})")
     else:
@@ -274,6 +351,7 @@ def main():
                     warmup=args.warmup,
                     iters=args.iters,
                     check=args.check,
+                    l2_flush=l2_flush,
                 )
             except BenchmarkAbort as exc:
                 print(

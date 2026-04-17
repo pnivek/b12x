@@ -25,7 +25,6 @@ import argparse
 import math
 import pathlib
 import sys
-import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -37,6 +36,7 @@ import torch.nn.functional as F
 from cutlass import Float32, Int32, Uint32
 from cutlass.cute.runtime import from_dlpack
 
+from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 from b12x.cute.fp4 import (
     bf16_mma_m16n8k16_f32,
     cvt_bf16x2_to_e4m3x2,
@@ -176,16 +176,36 @@ def bench_mxfp8_pv_with_cvt_kernel(m_out: cute.Tensor, iters: Int32):
         m_out[0] = d0
 
 
-def _bench(compiled, args, out_tensor, stream, warmup: int, repeats: int) -> float:
+def _bench(
+    compiled,
+    args,
+    out_tensor,
+    stream,
+    warmup: int,
+    repeats: int,
+    *,
+    l2_flush=None,
+) -> float:
     cute_out = _to_cute_tensor(out_tensor, cutlass.Float32)
+
+    def launch() -> None:
+        compiled(cute_out, stream, args)
+
     for _ in range(warmup):
-        compiled(cute_out, stream, args)
+        if l2_flush is not None:
+            l2_flush()
+        launch()
     torch.cuda.synchronize()
-    start = time.perf_counter()
-    for _ in range(repeats):
-        compiled(cute_out, stream, args)
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(repeats)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(repeats)]
+    for idx in range(repeats):
+        if l2_flush is not None:
+            l2_flush()
+        starts[idx].record()
+        launch()
+        ends[idx].record()
     torch.cuda.synchronize()
-    return (time.perf_counter() - start) * 1000.0 / repeats
+    return sum(start.elapsed_time(end) for start, end in zip(starts, ends)) / repeats
 
 
 def quantize_to_mxfp8(x: torch.Tensor, block_size: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
@@ -303,13 +323,25 @@ def main() -> None:
     parser.add_argument("--block-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cos-threshold", type=float, default=0.9995)
+    parser.add_argument("--flush-l2", action="store_true", default=True)
+    parser.add_argument("--no-flush-l2", action="store_false", dest="flush_l2")
+    parser.add_argument(
+        "--l2-flush-bytes",
+        type=int,
+        default=0,
+        help="L2 eviction size in bytes; default is 2x detected L2 capacity.",
+    )
     args = parser.parse_args()
 
     torch.cuda.init()
+    l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)
+    l2_flush = make_l2_flush_fn(args.flush_l2, args.l2_flush_bytes)
     device = torch.device("cuda")
     out = torch.zeros(1, device=device, dtype=torch.float32)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     cute_out = _to_cute_tensor(out, cutlass.Float32)
+    flush_desc = f"on ({l2_flush_bytes / (1 << 20):.1f} MiB per launch)" if l2_flush else "off"
+    print(f"L2 flush: {flush_desc}")
 
     if args.mode in {"all", "cvt"}:
         print("Compiling BF16->E4M3 conversion smoke kernel...")
@@ -324,10 +356,32 @@ def main() -> None:
         compiled_bf16 = cute.compile(bench_bf16_pv, cute_out, stream, iter_arg)
         compiled_mxfp8 = cute.compile(bench_mxfp8_pv, cute_out, stream, iter_arg)
         compiled_mxfp8_cvt = cute.compile(bench_mxfp8_pv_with_cvt, cute_out, stream, iter_arg)
-        bf16_ms = _bench(compiled_bf16, iter_arg, out, stream, args.warmup, args.repeats)
-        mxfp8_ms = _bench(compiled_mxfp8, iter_arg, out, stream, args.warmup, args.repeats)
+        bf16_ms = _bench(
+            compiled_bf16,
+            iter_arg,
+            out,
+            stream,
+            args.warmup,
+            args.repeats,
+            l2_flush=l2_flush,
+        )
+        mxfp8_ms = _bench(
+            compiled_mxfp8,
+            iter_arg,
+            out,
+            stream,
+            args.warmup,
+            args.repeats,
+            l2_flush=l2_flush,
+        )
         mxfp8_cvt_ms = _bench(
-            compiled_mxfp8_cvt, iter_arg, out, stream, args.warmup, args.repeats
+            compiled_mxfp8_cvt,
+            iter_arg,
+            out,
+            stream,
+            args.warmup,
+            args.repeats,
+            l2_flush=l2_flush,
         )
         bf16_k = 16 * args.iters / bf16_ms
         mxfp8_k = 32 * args.iters / mxfp8_ms

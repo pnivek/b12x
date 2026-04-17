@@ -14,6 +14,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
+from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 from b12x.attention.reference import paged_attention_reference
 from b12x.attention.paged.tuning import get_decode_graph_policy
 from b12x.integration.attention import (
@@ -41,10 +42,17 @@ def _capture_graph(fn: Callable[[], None], *, warmup: int) -> torch.cuda.CUDAGra
     return graph
 
 
-def _bench_graph(graph: torch.cuda.CUDAGraph, *, replays: int) -> list[float]:
+def _bench_graph(
+    graph: torch.cuda.CUDAGraph,
+    *,
+    replays: int,
+    l2_flush=None,
+) -> list[float]:
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(replays)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(replays)]
     for idx in range(replays):
+        if l2_flush is not None:
+            l2_flush()
         starts[idx].record()
         graph.replay()
         ends[idx].record()
@@ -1121,6 +1129,7 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
     dtype = _dtype_from_name(args.dtype)
     kv_dtype = _resolve_kv_dtype(args.kv_dtype, dtype)
     flashinfer_workspace_bytes = args.flashinfer_workspace_mb * 1024 * 1024
+    l2_flush = make_l2_flush_fn(args.flush_l2, args.l2_flush_bytes)
     q_seqlens = _parse_csv_ints(args.q_seqlens)
     cache_seqlens = _parse_csv_ints(args.cache_seqlens)
     cases = _build_shape_cases(
@@ -1148,6 +1157,7 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
             "b12x_attn_mode": args.b12x_attn_mode,
             "replays": args.replays,
             "flashinfer_fa2": args.compare_fa2,
+            "l2_flush": args.flush_l2,
         },
     )
 
@@ -1201,7 +1211,11 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
             b12x_attn_mode=args.b12x_attn_mode,
             graph_ctas_per_sm=args.graph_ctas_per_sm if args.graph_ctas_per_sm > 0 else None,
         )
-        backend_times_ms = _bench_graph(backend_capture.graph, replays=args.replays)
+        backend_times_ms = _bench_graph(
+            backend_capture.graph,
+            replays=args.replays,
+            l2_flush=l2_flush,
+        )
         backend_ci_low_ms, backend_ci_high_ms, backend_sem_ms = _mean_ci(
             backend_times_ms,
             ci_level=args.ci_level,
@@ -1238,7 +1252,11 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
                 workspace_bytes=flashinfer_workspace_bytes,
                 warmup=args.warmup,
             )
-            flashinfer_times_ms = _bench_graph(flashinfer_graph, replays=args.replays)
+            flashinfer_times_ms = _bench_graph(
+                flashinfer_graph,
+                replays=args.replays,
+                l2_flush=l2_flush,
+            )
             flashinfer_ci_low_ms, flashinfer_ci_high_ms, flashinfer_sem_ms = _mean_ci(
                 flashinfer_times_ms,
                 ci_level=args.ci_level,
@@ -1298,6 +1316,7 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
     dtype = _dtype_from_name(args.dtype)
     kv_dtype = _resolve_kv_dtype(args.kv_dtype, dtype)
     flashinfer_workspace_bytes = args.flashinfer_workspace_mb * 1024 * 1024
+    l2_flush = make_l2_flush_fn(args.flush_l2, args.l2_flush_bytes)
     batch_buckets = _parse_csv_ints(args.batch_buckets)
     decode_contexts = _parse_csv_ints(args.decode_contexts)
     cases = _build_decode_replay_cases(
@@ -1323,6 +1342,7 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
             "b12x_attn_mode": args.b12x_attn_mode,
             "replays": args.replays,
             "flashinfer_fa2": args.compare_fa2,
+            "l2_flush": args.flush_l2,
         },
     )
 
@@ -1423,7 +1443,11 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                     f"blocked={type(exc).__name__}:{exc}"
                 )
                 continue
-            backend_times_ms = _bench_graph(b12x_bucket.graph, replays=args.replays)
+            backend_times_ms = _bench_graph(
+                b12x_bucket.graph,
+                replays=args.replays,
+                l2_flush=l2_flush,
+            )
             backend_ci_low_ms, backend_ci_high_ms, backend_sem_ms = _mean_ci(
                 backend_times_ms,
                 ci_level=args.ci_level,
@@ -1441,7 +1465,11 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
             flashinfer_output: torch.Tensor | None = None
             if fa2_bucket is not None:
                 fa2_bucket.prepare_replay(context_tokens=case.context_tokens)
-                flashinfer_times_ms = _bench_graph(fa2_bucket.graph, replays=args.replays)
+                flashinfer_times_ms = _bench_graph(
+                    fa2_bucket.graph,
+                    replays=args.replays,
+                    l2_flush=l2_flush,
+                )
                 flashinfer_ci_low_ms, flashinfer_ci_high_ms, flashinfer_sem_ms = _mean_ci(
                     flashinfer_times_ms,
                     ci_level=args.ci_level,
@@ -1547,6 +1575,14 @@ def main() -> None:
     parser.add_argument("--compare-fa2", action="store_true", default=True)
     parser.add_argument("--no-compare-fa2", action="store_false", dest="compare_fa2")
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--flush-l2", action="store_true", default=True)
+    parser.add_argument("--no-flush-l2", action="store_false", dest="flush_l2")
+    parser.add_argument(
+        "--l2-flush-bytes",
+        type=int,
+        default=0,
+        help="L2 eviction size in bytes; default is 2x detected L2 capacity.",
+    )
     args = parser.parse_args()
 
     require_sm120()
@@ -1554,6 +1590,13 @@ def main() -> None:
         raise ValueError("--replays must be at least 100 for graph-replay benchmarking")
     if not 0.0 < args.ci_level < 1.0:
         raise ValueError("--ci-level must be between 0 and 1")
+    l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)
+    flush_desc = (
+        f"on ({l2_flush_bytes / (1 << 20):.1f} MiB per launch)"
+        if args.flush_l2
+        else "off"
+    )
+    print(f"L2 flush: {flush_desc}")
     clear_attention_caches()
     if args.mode == "legacy-matrix":
         _run_legacy_matrix(args)

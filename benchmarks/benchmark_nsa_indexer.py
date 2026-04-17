@@ -33,8 +33,10 @@ from benchmarks.common import (
     capture_cuda_graph,
     make_dense_candidate_page_table,
     make_dense_real_page_table,
+    make_l2_flush_fn,
     make_sparse_pool_locs,
     require_sm120,
+    resolve_l2_flush_bytes,
     scatter_rows_into_pool,
 )
 
@@ -239,6 +241,7 @@ def _run_decode_case(
     seed: int,
     device: torch.device,
     pool_factor: int,
+    l2_flush,
 ) -> None:
     graph_width = _resolve_graph_width(cache_len=cache_len, graph_width=width)
     pool_tokens = _align_up(max(cache_len, cache_len * pool_factor), cfg.page_size)
@@ -339,6 +342,7 @@ def _run_decode_case(
         graph,
         replays=replays,
         prepare=prepare_decode_graph,
+        l2_flush=l2_flush,
     )
     print(
         json.dumps(
@@ -358,6 +362,7 @@ def _run_decode_case(
                 "replay_min_us": min(stats["replay_us"]),
                 "replay_max_us": max(stats["replay_us"]),
                 "replays": replays,
+                "l2_flush_enabled": l2_flush is not None,
             }
         )
     )
@@ -376,6 +381,7 @@ def _run_extend_case(
     seed: int,
     device: torch.device,
     pool_factor: int,
+    l2_flush,
 ) -> None:
     total_q = batch * q_len
     if q_len > cache_len:
@@ -464,11 +470,15 @@ def _run_extend_case(
     _assert_exact_match(actual[: expected.shape[0]], expected)
 
     for _ in range(warmup):
+        if l2_flush is not None:
+            l2_flush()
         run()
     torch.cuda.synchronize()
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(replays)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(replays)]
     for idx in range(replays):
+        if l2_flush is not None:
+            l2_flush()
         starts[idx].record()
         run()
         ends[idx].record()
@@ -491,6 +501,7 @@ def _run_extend_case(
                 "min_us": min(replay_us),
                 "max_us": max(replay_us),
                 "replays": replays,
+                "l2_flush_enabled": l2_flush is not None,
             }
         )
     )
@@ -518,9 +529,21 @@ def main() -> None:
     parser.add_argument("--replays", type=int, default=50)
     parser.add_argument("--seed", type=int, default=88_000)
     parser.add_argument("--pool-factor", type=int, default=DEFAULT_POOL_FACTOR)
+    parser.add_argument("--flush-l2", action="store_true", default=True)
+    parser.add_argument("--no-flush-l2", action="store_false", dest="flush_l2")
+    parser.add_argument(
+        "--l2-flush-bytes",
+        type=int,
+        default=0,
+        help="L2 eviction size in bytes; default is 2x detected L2 capacity.",
+    )
     args = parser.parse_args()
 
     device = require_sm120()
+    l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)
+    l2_flush = make_l2_flush_fn(args.flush_l2, args.l2_flush_bytes)
+    flush_desc = f"on ({l2_flush_bytes / (1 << 20):.1f} MiB per launch)" if l2_flush else "off"
+    print(f"L2 flush: {flush_desc}", file=sys.stderr)
     cfg = _load_glm_config()
     cache_lens = _parse_csv_ints(args.cache_lens)
     decode_rows = _parse_csv_ints(args.decode_rows)
@@ -542,6 +565,7 @@ def main() -> None:
                     seed=case_seed,
                     device=device,
                     pool_factor=args.pool_factor,
+                    l2_flush=l2_flush,
                 )
                 case_seed += 17
     if args.mode in ("extend", "both"):
@@ -567,6 +591,7 @@ def main() -> None:
                         seed=case_seed,
                         device=device,
                         pool_factor=args.pool_factor,
+                        l2_flush=l2_flush,
                     )
                     case_seed += 17
 

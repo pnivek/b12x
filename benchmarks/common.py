@@ -6,10 +6,14 @@ import statistics
 import torch
 
 from b12x.cute.fp4 import quantize_grouped_nvfp4_torch
+from b12x.cute.utils import get_hardware_info
 
 
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
+_AUTO_L2_FLUSH_MULTIPLIER = 2
+_FALLBACK_L2_FLUSH_BYTES = 32 << 20
+_L2_FLUSH_BUFFER_CACHE: dict[tuple[int, int], torch.Tensor] = {}
 
 
 def require_sm120() -> torch.device:
@@ -19,6 +23,38 @@ def require_sm120() -> torch.device:
     if major != 12 or minor not in (0, 1):
         raise SystemExit(f"SM120 or SM121 is required to run b12x benchmarks, got sm_{major}{minor}")
     return torch.device("cuda")
+
+
+def resolve_l2_flush_bytes(bytes_hint: int) -> int:
+    if bytes_hint > 0:
+        return int(bytes_hint)
+    try:
+        l2_bytes = int(get_hardware_info().get_l2_cache_size_in_bytes())
+    except Exception:
+        l2_bytes = 0
+    if l2_bytes > 0:
+        return _AUTO_L2_FLUSH_MULTIPLIER * l2_bytes
+    return _FALLBACK_L2_FLUSH_BYTES
+
+
+def make_l2_flush_fn(
+    enabled: bool,
+    bytes_hint: int = 0,
+) -> Callable[[], None] | None:
+    if not enabled:
+        return None
+    flush_bytes = resolve_l2_flush_bytes(bytes_hint)
+    device_idx = torch.cuda.current_device()
+    cache_key = (device_idx, flush_bytes)
+    buffer = _L2_FLUSH_BUFFER_CACHE.get(cache_key)
+    if buffer is None or buffer.numel() != flush_bytes:
+        buffer = torch.empty(flush_bytes, dtype=torch.uint8, device=f"cuda:{device_idx}")
+        _L2_FLUSH_BUFFER_CACHE[cache_key] = buffer
+
+    def flush(buf: torch.Tensor = buffer) -> None:
+        buf.bitwise_not_()
+
+    return flush
 
 
 def make_sparse_pool_locs(
@@ -154,11 +190,14 @@ def bench_cuda_graph(
     *,
     replays: int,
     prepare: Callable[[], None] | None = None,
+    l2_flush: Callable[[], None] | None = None,
 ) -> dict[str, list[float]]:
     if prepare is None:
         starts = [torch.cuda.Event(enable_timing=True) for _ in range(replays)]
         ends = [torch.cuda.Event(enable_timing=True) for _ in range(replays)]
         for idx in range(replays):
+            if l2_flush is not None:
+                l2_flush()
             starts[idx].record()
             graph.replay()
             ends[idx].record()
@@ -174,6 +213,8 @@ def bench_cuda_graph(
     mids = [torch.cuda.Event(enable_timing=True) for _ in range(replays)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(replays)]
     for idx in range(replays):
+        if l2_flush is not None:
+            l2_flush()
         starts[idx].record()
         prepare()
         mids[idx].record()
@@ -190,8 +231,16 @@ def bench_cuda_graph(
     }
 
 
-def bench_gpu_ms(fn, *, warmup: int, iters: int) -> float:
+def bench_gpu_ms(
+    fn,
+    *,
+    warmup: int,
+    iters: int,
+    l2_flush: Callable[[], None] | None = None,
+) -> float:
     for _ in range(warmup):
+        if l2_flush is not None:
+            l2_flush()
         fn()
     torch.cuda.synchronize()
 
@@ -199,6 +248,8 @@ def bench_gpu_ms(fn, *, warmup: int, iters: int) -> float:
     end = torch.cuda.Event(enable_timing=True)
     times_ms: list[float] = []
     for _ in range(iters):
+        if l2_flush is not None:
+            l2_flush()
         start.record()
         fn()
         end.record()

@@ -41,6 +41,7 @@ except Exception as exc:  # pragma: no cover - env-time dependency
 import torch
 
 import benchmarks.benchmark_paged_attention as bench
+from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 from b12x.attention.paged import api as paged_api
 from b12x.attention.paged import merge as paged_merge
 from b12x.attention.paged import planner as paged_planner
@@ -360,8 +361,13 @@ def _capture_reference_output(
     return fa_output
 
 
-def _bench_backend_mean_us(graph: torch.cuda.CUDAGraph, *, replays: int) -> tuple[float, float, float, float]:
-    times_ms = bench._bench_graph(graph, replays=replays)
+def _bench_backend_mean_us(
+    graph: torch.cuda.CUDAGraph,
+    *,
+    replays: int,
+    l2_flush=None,
+) -> tuple[float, float, float, float]:
+    times_ms = bench._bench_graph(graph, replays=replays, l2_flush=l2_flush)
     ci_low_ms, ci_high_ms, sem_ms = bench._mean_ci(times_ms, ci_level=0.95)
     return (
         statistics.fmean(times_ms) * 1000.0,
@@ -387,6 +393,7 @@ def _run_trial(
     warmup: int,
     replays: int,
     cos_threshold: float,
+    l2_flush,
 ) -> TrialResult:
     with _scheduler_overrides(spec, config):
         clear_attention_caches()
@@ -405,6 +412,7 @@ def _run_trial(
         b12x_mean_us, b12x_ci_low_us, b12x_ci_high_us, b12x_sem_us = _bench_backend_mean_us(
             b12x_graph,
             replays=replays,
+            l2_flush=l2_flush,
         )
         max_abs = float((b12x_output - fa_output).abs().max().item())
         cos = float(bench._cosine_similarity(b12x_output, fa_output))
@@ -446,6 +454,7 @@ def _make_objective(
     warmup: int,
     replays: int,
     cos_threshold: float,
+    l2_flush,
 ):
     def objective(trial: optuna.Trial) -> float:
         config = _sample_config(trial, spec)
@@ -465,6 +474,7 @@ def _make_objective(
                 warmup=warmup,
                 replays=replays,
                 cos_threshold=cos_threshold,
+                l2_flush=l2_flush,
             )
         except Exception as exc:
             trial.set_user_attr("status", "crash")
@@ -550,11 +560,21 @@ def main() -> None:
     parser.add_argument("--no-enqueue-baseline", action="store_false", dest="enqueue_baseline")
     parser.add_argument("--topk", type=int, default=10)
     parser.add_argument("--timeout", type=int, default=0)
+    parser.add_argument("--flush-l2", action="store_true", default=True)
+    parser.add_argument("--no-flush-l2", action="store_false", dest="flush_l2")
+    parser.add_argument(
+        "--l2-flush-bytes",
+        type=int,
+        default=0,
+        help="L2 eviction size in bytes; default is 2x detected L2 capacity.",
+    )
     args = parser.parse_args()
 
     bench.require_sm120()
     if args.replays < 100:
         raise ValueError("--replays must be at least 100")
+    l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)
+    l2_flush = make_l2_flush_fn(args.flush_l2, args.l2_flush_bytes)
 
     spec = _build_target_from_args(args)
     if spec.mode == "decode" and spec.q_seqlen != 1:
@@ -575,6 +595,8 @@ def main() -> None:
             "replays": args.replays,
             "trials": args.trials,
             "search_mode": "direct_plan_only",
+            "l2_flush": args.flush_l2,
+            "l2_flush_bytes": l2_flush_bytes if args.flush_l2 else 0,
         }
     )
 
@@ -635,6 +657,7 @@ def main() -> None:
         warmup=args.warmup,
         replays=args.replays,
         cos_threshold=args.cos_threshold,
+        l2_flush=l2_flush,
     )
     study.optimize(objective, n_trials=args.trials, timeout=None if args.timeout <= 0 else args.timeout)
 

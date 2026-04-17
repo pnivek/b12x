@@ -30,6 +30,7 @@ from b12x.moe.fused.reference import (
     moe_reference_nvfp4,
 )
 from b12x.cute.fp4 import as_grouped_scale_view, swizzle_block_scale
+from b12x.cute.utils import get_hardware_info
 
 
 LEGACY_BATCH_SIZES = [1, 2, 4, 8]
@@ -54,6 +55,9 @@ TP_SIZE = 4
 TP_RANK = 0
 EP_SIZE = 1
 EP_RANK = 0
+_L2_FLUSH_BUFFER_CACHE: dict[tuple[int, int], torch.Tensor] = {}
+_AUTO_L2_FLUSH_MULTIPLIER = 2
+_FALLBACK_L2_FLUSH_BYTES = 32 << 20
 
 
 def require_sm120() -> None:
@@ -62,13 +66,58 @@ def require_sm120() -> None:
         raise RuntimeError(f"Requires sm_120 or sm_121, got sm_{major}{minor}")
 
 
-def bench_events(fn: Callable[[], None], *, warmup: int, iters: int) -> list[float]:
+def resolve_l2_flush_bytes(bytes_hint: int) -> int:
+    if bytes_hint < 0:
+        raise ValueError(f"l2 flush bytes must be non-negative, got {bytes_hint}")
+    if bytes_hint > 0:
+        return int(bytes_hint)
+    try:
+        l2_bytes = int(get_hardware_info().get_l2_cache_size_in_bytes())
+    except Exception:
+        l2_bytes = 0
+    if l2_bytes > 0:
+        return l2_bytes * _AUTO_L2_FLUSH_MULTIPLIER
+    return _FALLBACK_L2_FLUSH_BYTES
+
+
+def make_l2_flush_fn(
+    *,
+    enabled: bool,
+    bytes_hint: int = 0,
+) -> Callable[[], None] | None:
+    if not enabled:
+        return None
+    flush_bytes = resolve_l2_flush_bytes(bytes_hint)
+    device_idx = torch.cuda.current_device()
+    key = (device_idx, flush_bytes)
+    buffer = _L2_FLUSH_BUFFER_CACHE.get(key)
+    if buffer is None:
+        buffer = torch.empty(flush_bytes, dtype=torch.uint8, device=f"cuda:{device_idx}")
+        _L2_FLUSH_BUFFER_CACHE[key] = buffer
+
+    def flush(cache_buffer: torch.Tensor = buffer) -> None:
+        cache_buffer.bitwise_not_()
+
+    return flush
+
+
+def bench_events(
+    fn: Callable[[], None],
+    *,
+    warmup: int,
+    iters: int,
+    l2_flush: Callable[[], None] | None = None,
+) -> list[float]:
     for _ in range(warmup):
+        if l2_flush is not None:
+            l2_flush()
         fn()
     torch.cuda.synchronize()
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     for i in range(iters):
+        if l2_flush is not None:
+            l2_flush()
         starts[i].record()
         fn()
         ends[i].record()
@@ -776,9 +825,10 @@ def bench_repeated(
     warmup: int,
     iters: int,
     repeats: int,
+    l2_flush: Callable[[], None] | None = None,
 ) -> TimingStats:
     return summarize_timing_runs(
-        [bench_events(fn, warmup=warmup, iters=iters) for _ in range(repeats)]
+        [bench_events(fn, warmup=warmup, iters=iters, l2_flush=l2_flush) for _ in range(repeats)]
     )
 
 
@@ -926,6 +976,7 @@ def bench_multilayer_graph_mode(
     device: torch.device,
 ) -> None:
     graph_num_layers = args.graph_num_layers
+    l2_flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
     if graph_num_layers < 2:
         raise ValueError("--graph-num-layers must be at least 2 in multi-layer graph mode")
 
@@ -1068,12 +1119,14 @@ def bench_multilayer_graph_mode(
                 warmup=args.warmup,
                 iters=args.iters,
                 repeats=args.repeats,
+                l2_flush=l2_flush,
             )
             eager_stats = bench_repeated(
                 eager_chain,
                 warmup=args.warmup,
                 iters=args.iters,
                 repeats=args.repeats,
+                l2_flush=l2_flush,
             )
             ratio_stats = RatioStats([graph_stats.median_ms / eager_stats.median_ms])
 
@@ -1167,6 +1220,18 @@ def bench_e2e() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--flush-l2",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Evict GPU L2 before each warmup and timed launch (default: enabled).",
+    )
+    parser.add_argument(
+        "--l2-flush-bytes",
+        type=int,
+        default=0,
+        help="Bytes to touch when evicting L2; 0 uses 2x the reported L2 size.",
+    )
     args = parser.parse_args()
     batch_sizes = (
         args.batch_sizes
@@ -1187,6 +1252,8 @@ def bench_e2e() -> None:
     require_sm120()
     torch.empty(1, device="cuda")
     device = torch.device("cuda")
+    l2_flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
+    l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes) if args.flush_l2 else 0
 
     spec = build_model_spec(model_path, model_profile)
 
@@ -1204,6 +1271,10 @@ def bench_e2e() -> None:
     print(f"Scale contract: {args.scale_contract}")
     print(f"Validation: {args.validate}")
     print(f"Fast math: {'on' if args.fast_math else 'off'}")
+    if args.flush_l2:
+        print(f"L2 flush: on ({l2_flush_bytes / (1 << 20):.1f} MiB per launch)")
+    else:
+        print("L2 flush: off")
     print(f"Graph mode: {args.graph_mode}")
     print(f"Graph only: {'yes' if args.graph_only else 'no'}")
     print(f"Timing passes per batch size: {args.repeats} x {args.iters} iterations")
@@ -1433,9 +1504,19 @@ def bench_e2e() -> None:
             for _ in range(args.repeats):
                 ref_run = None
                 if ref_launch is not None:
-                    ref_run = bench_events(ref_launch, warmup=args.warmup, iters=args.iters)
+                    ref_run = bench_events(
+                        ref_launch,
+                        warmup=args.warmup,
+                        iters=args.iters,
+                        l2_flush=l2_flush,
+                    )
                     ref_runs_ms.append(ref_run)
-                backend_run = bench_events(backend_e2e, warmup=args.warmup, iters=args.iters)
+                backend_run = bench_events(
+                    backend_e2e,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                    l2_flush=l2_flush,
+                )
                 backend_runs_ms.append(backend_run)
                 if ref_run is not None:
                     ratio_runs.append(statistics.median(backend_run) / statistics.median(ref_run))
@@ -1476,7 +1557,12 @@ def bench_e2e() -> None:
 
                     # Warm graph replay separately; replay latency is the value
                     # that should drive the default summary.
-                    graph_times = bench_events(replay, warmup=args.warmup, iters=args.iters)
+                    graph_times = bench_events(
+                        replay,
+                        warmup=args.warmup,
+                        iters=args.iters,
+                        l2_flush=l2_flush,
+                    )
                     graph_latencies[name] = statistics.median(graph_times)
                     print(f" {fmt_us(graph_times)}")
                 except Exception as exc:
