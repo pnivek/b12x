@@ -8,7 +8,10 @@ from functools import lru_cache
 import torch
 
 from .kernel import (
+    PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT,
+    _should_use_schedule_multi_row_kernel,
     clear_sparse_nsa_indexer_kernel_cache,
+    _should_use_schedule_single_row_kernel,
     run_sparse_nsa_paged_logits_kernel,
     supports_sparse_nsa_paged_logits_kernel,
 )
@@ -17,6 +20,10 @@ from .extend_kernel import (
     supports_sparse_nsa_extend_logits_kernel,
 )
 from .reference import sparse_nsa_extend_logits_reference, sparse_nsa_paged_logits_reference
+from .schedule_metadata import (
+    build_paged_mqa_schedule_metadata_torch,
+    build_paged_mqa_schedule_metadata_triton,
+)
 
 
 _INDEX_HEAD_DIM = 128
@@ -60,18 +67,16 @@ def get_paged_mqa_logits_metadata(
     context_lens: torch.Tensor,
     block_kv: int,
     num_sms: int | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Return a placeholder paged-MQA schedule tensor matching DeepGEMM's API.
-
-    The current b12x paged decode kernel does not consume schedule metadata yet,
-    but serving code should still flow through the same two-step contract:
-    build metadata first, then hand it back into the decode logits call.
-    """
+    """Build DeepGEMM-style paged-MQA schedule metadata on the input device."""
 
     if context_lens.ndim not in (1, 2):
         raise ValueError(
             f"context_lens must be rank-1 or rank-2, got {tuple(context_lens.shape)}"
         )
+    if context_lens.ndim == 2 and context_lens.shape[1] == 0:
+        raise ValueError("context_lens rank-2 input must have a non-empty trailing dimension")
     if context_lens.dtype != torch.int32:
         raise ValueError(
             f"context_lens must have dtype torch.int32, got {context_lens.dtype}"
@@ -80,14 +85,49 @@ def get_paged_mqa_logits_metadata(
         raise ValueError("context_lens must be contiguous")
     if block_kv <= 0:
         raise ValueError(f"block_kv must be positive, got {block_kv}")
+    if out is not None:
+        if out.ndim != 2 or out.shape[1] != 2:
+            raise ValueError(f"out must have shape (num_sms + 1, 2), got {tuple(out.shape)}")
+        if out.dtype != torch.int32:
+            raise ValueError(f"out must have dtype torch.int32, got {out.dtype}")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
+        if out.device != context_lens.device:
+            raise ValueError(
+                f"out device {out.device} does not match context_lens device {context_lens.device}"
+            )
+        if num_sms is None:
+            num_sms = out.shape[0] - 1
     if num_sms is None:
-        num_sms = torch.cuda.get_device_properties(context_lens.device).multi_processor_count
+        if context_lens.device.type == "cuda":
+            num_sms = torch.cuda.get_device_properties(context_lens.device).multi_processor_count
+        else:
+            num_sms = 1
     if num_sms <= 0:
         raise ValueError(f"num_sms must be positive, got {num_sms}")
-    return torch.zeros(
-        (num_sms + 1, 2),
-        dtype=torch.int32,
-        device=context_lens.device,
+    if out is not None and out.shape[0] != num_sms + 1:
+        raise ValueError(
+            f"out leading dimension {out.shape[0]} does not match num_sms + 1 ({num_sms + 1})"
+        )
+
+    schedule = out
+    if schedule is None:
+        schedule = torch.empty(
+            (num_sms + 1, 2),
+            dtype=torch.int32,
+            device=context_lens.device,
+        )
+    builder = (
+        build_paged_mqa_schedule_metadata_triton
+        if context_lens.device.type == "cuda"
+        else build_paged_mqa_schedule_metadata_torch
+    )
+    return builder(
+        context_lens,
+        block_kv=block_kv,
+        num_sms=num_sms,
+        pages_per_split=PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT,
+        out=schedule,
     )
 
 
@@ -95,6 +135,21 @@ def clear_nsa_indexer_caches() -> None:
     """Clear any cached NSA indexer runtime state."""
     clear_sparse_nsa_indexer_kernel_cache()
     _cached_width_cap_tensor.cache_clear()
+
+
+def uses_paged_mqa_schedule_metadata(
+    *,
+    q_rows: int,
+    max_pages: int,
+) -> bool:
+    """Return whether decode should use a schedule-driven scorer path."""
+    return _should_use_schedule_single_row_kernel(
+        q_rows=q_rows,
+        max_pages=max_pages,
+    ) or _should_use_schedule_multi_row_kernel(
+        q_rows=q_rows,
+        max_pages=max_pages,
+    )
 
 
 def make_nsa_indexer_contract_phantoms(
@@ -168,12 +223,15 @@ def _make_active_width_tensor(
             "seqlens_per_query must be rank-1 when computing active width, got "
             f"{tuple(seqlens_per_query.shape)}"
         )
+    active_width = seqlens_per_query.amax().reshape(1)
+    if _is_cuda_graph_capture_active(seqlens_per_query.device):
+        return active_width.clamp_(min=0, max=int(width))
     width_cap = _cached_width_cap_tensor(
         int(width),
         seqlens_per_query.device.type,
         seqlens_per_query.device.index,
     )
-    return torch.minimum(seqlens_per_query.amax().reshape(1), width_cap)
+    return torch.minimum(active_width, width_cap)
 
 
 def _validate_paged_decode_inputs(
@@ -226,6 +284,11 @@ def _validate_paged_decode_inputs(
         if paged_mqa_schedule_metadata.shape[1] != 2:
             raise ValueError(
                 "paged_mqa_schedule_metadata trailing dimension must be 2, got "
+                f"{tuple(paged_mqa_schedule_metadata.shape)}"
+            )
+        if paged_mqa_schedule_metadata.shape[0] < 2:
+            raise ValueError(
+                "paged_mqa_schedule_metadata must have at least two rows, got "
                 f"{tuple(paged_mqa_schedule_metadata.shape)}"
             )
         if paged_mqa_schedule_metadata.dtype != torch.int32:
@@ -313,12 +376,27 @@ def sparse_nsa_index_decode_logits_paged(
             page_size=page_size,
         )
 
+    schedule_metadata = None
+    if uses_paged_mqa_schedule_metadata(
+        q_rows=valid_q_rows,
+        max_pages=int(metadata.real_page_table.shape[1]),
+    ):
+        schedule_metadata = metadata.paged_mqa_schedule_metadata
+        if schedule_metadata is None:
+            if _is_cuda_graph_capture_active(q_fp8.device):
+                raise ValueError(
+                    "paged_mqa_schedule_metadata must be precomputed before CUDA graph capture "
+                    "for the scheduled decode path"
+                )
+            schedule_metadata = get_paged_mqa_logits_metadata(seqlens_valid, page_size)
+
     logits_valid = run_sparse_nsa_paged_logits_kernel(
         q_fp8=q_fp8[:valid_q_rows],
         weights=weights_f[:valid_q_rows],
         index_k_cache=index_k_cache,
         real_page_table=metadata.real_page_table,
         seqlens_per_query=seqlens_valid,
+        schedule_metadata=schedule_metadata,
         active_width=active_width,
         active_width_hint=metadata.active_width_hint,
         page_size=page_size,

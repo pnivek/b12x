@@ -86,9 +86,13 @@ def _make_fake_backend(
     nsa_backend_module,
     num_q_heads: int | None = None,
 ):
+    backend_cls = nsa_backend_module.NativeSparseAttnBackend
+
     class _FakeBackend:
         _get_b12x_workspace = _get_b12x_workspace_method(nsa_backend_module)
         _reshape_b12x_decode_kv_rows = _get_b12x_decode_kv_reshape_method(nsa_backend_module)
+        _b12x_eager_extend_total_q_capacity = backend_cls._b12x_eager_extend_total_q_capacity
+        _b12x_eager_extend_batch_capacity = backend_cls._b12x_eager_extend_batch_capacity
 
         def __init__(self):
             self.device = device
@@ -101,6 +105,16 @@ def _make_fake_backend(
             self.real_page_size = 64
             self.b12x_workspaces: dict[str, object] = {}
             self.b12x_mla_workspaces = self.b12x_workspaces
+            self.max_running_requests = 32
+            self.server_args = type(
+                "_FakeServerArgs",
+                (),
+                {
+                    "chunked_prefill_size": -1,
+                    "max_prefill_tokens": 4096,
+                    "prefill_max_requests": None,
+                },
+            )()
 
     return _FakeBackend()
 

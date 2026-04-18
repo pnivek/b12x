@@ -14,6 +14,7 @@ from b12x.attention.nsa_indexer import (
     sparse_nsa_index_extend_logits,
     sparse_nsa_paged_logits_reference,
     unpack_nsa_index_k_cache_reference,
+    uses_paged_mqa_schedule_metadata,
 )
 
 __all__ = [
@@ -28,4 +29,5 @@ __all__ = [
     "sparse_nsa_index_extend_logits",
     "sparse_nsa_paged_logits_reference",
     "unpack_nsa_index_k_cache_reference",
+    "uses_paged_mqa_schedule_metadata",
 ]

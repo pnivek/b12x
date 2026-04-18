@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import pathlib
 import statistics
@@ -33,9 +34,11 @@ from b12x.integration.nsa_indexer import (
     NSAIndexerExtendLogitsMetadata,
     NSAIndexerPagedDecodeMetadata,
     clear_nsa_indexer_caches,
+    get_paged_mqa_logits_metadata,
     pack_nsa_index_k_cache_reference,
     sparse_nsa_index_decode_logits_paged,
     sparse_nsa_index_extend_logits,
+    uses_paged_mqa_schedule_metadata,
 )
 
 from benchmarks.common import (
@@ -50,11 +53,21 @@ from benchmarks.common import (
     scatter_rows_into_pool,
 )
 
+try:
+    from sgl_kernel.top_k import (
+        fast_topk_transform_fused as _sgl_fast_topk_transform_fused,
+        fast_topk_transform_ragged_fused as _sgl_fast_topk_transform_ragged_fused,
+    )
+except Exception:  # pragma: no cover - optional dependency
+    _sgl_fast_topk_transform_fused = None
+    _sgl_fast_topk_transform_ragged_fused = None
+
 
 MODEL_PATH = pathlib.Path("/data/models/GLM-5.1-NVFP4")
 DEFAULT_BATCH_SIZES = (1, 2, 4, 8)
 DEFAULT_CACHE_LENS = (1024, 32768, 131072)
 DEFAULT_PREFILL_Q_LENS = (16384,)
+DEFAULT_DECODE_ROW_PATTERN = "uniform"
 DEFAULT_TP_SIZE = 8
 DEFAULT_TP_RANK = 0
 DEFAULT_POOL_FACTOR = 6
@@ -62,10 +75,15 @@ DEFAULT_GRAPH_WIDTH = 8192
 MLA_MAX_ABS_TOL = 0.10
 MLA_RMSE_TOL = 0.005
 MLA_COS_TOL = 0.9995
+_RAGGED_TOPK_CHUNK = 4096
 
 
 def _align_up(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
+
+
+def _align_down(value: int, multiple: int) -> int:
+    return (value // multiple) * multiple
 
 
 @dataclass(frozen=True)
@@ -101,10 +119,38 @@ class DecodeCase:
     cache_len: int
     topk: int
     q_len: int = 1
+    row_cache_lens: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.row_cache_lens is None:
+            return
+        if self.mode != "decode":
+            raise ValueError("row_cache_lens is only supported for decode cases")
+        if len(self.row_cache_lens) != self.batch_size:
+            raise ValueError(
+                "row_cache_lens length must match batch_size, got "
+                f"{len(self.row_cache_lens)} vs {self.batch_size}"
+            )
+        if any(cache_len <= 0 for cache_len in self.row_cache_lens):
+            raise ValueError(f"row_cache_lens must be positive, got {self.row_cache_lens}")
+        if max(self.row_cache_lens) != self.cache_len:
+            raise ValueError(
+                f"row_cache_lens max must equal cache_len {self.cache_len}, got {self.row_cache_lens}"
+            )
 
     @property
     def total_q(self) -> int:
         return self.batch_size * self.q_len
+
+    @property
+    def decode_row_cache_lens(self) -> tuple[int, ...]:
+        if self.row_cache_lens is not None:
+            return self.row_cache_lens
+        return (self.cache_len,) * self.batch_size
+
+    @property
+    def is_heterogeneous_decode(self) -> bool:
+        return len(set(self.decode_row_cache_lens)) > 1
 
 
 @dataclass(frozen=True)
@@ -185,6 +231,29 @@ def _resolve_topk(*, cache_len: int, topk_cap: int) -> int:
     return min(cache_len, topk_cap)
 
 
+def _build_decode_row_cache_lens(
+    *,
+    batch_size: int,
+    cache_len: int,
+    page_size: int,
+    pattern: str,
+) -> tuple[int, ...] | None:
+    allowed_patterns = {"uniform", "staggered"}
+    if pattern not in allowed_patterns:
+        raise ValueError(
+            f"unsupported decode row pattern {pattern!r}, expected one of {sorted(allowed_patterns)}"
+        )
+    if pattern == "uniform" or batch_size <= 1:
+        return None
+    row_cache_lens = []
+    for row_idx in range(batch_size):
+        row_len = cache_len * (batch_size - row_idx) // batch_size
+        row_len = max(_align_down(row_len, page_size), page_size)
+        row_cache_lens.append(min(row_len, cache_len))
+    row_cache_lens[0] = cache_len
+    return tuple(row_cache_lens)
+
+
 def _build_decode_cases(
     *,
     modes: list[str],
@@ -192,6 +261,8 @@ def _build_decode_cases(
     cache_lens: list[int],
     verify_q_lens: list[int],
     topk_cap: int,
+    decode_row_pattern: str,
+    page_size: int,
 ) -> list[DecodeCase]:
     cases: list[DecodeCase] = []
     allowed_modes = {"decode", "prefill", "verify"}
@@ -211,6 +282,12 @@ def _build_decode_cases(
                         cache_len=cache_len,
                         topk=topk,
                         q_len=1,
+                        row_cache_lens=_build_decode_row_cache_lens(
+                            batch_size=batch_size,
+                            cache_len=cache_len,
+                            page_size=page_size,
+                            pattern=decode_row_pattern,
+                        ),
                     )
                 )
             for prefill_mode in ("prefill", "verify"):
@@ -271,8 +348,11 @@ def _assert_decode_contract_match(
     topk: int,
 ) -> None:
     del page_table_1, seqlens, topk
-    if not torch.equal(actual, expected):
-        mismatch = int((actual != expected).sum().item())
+    sort_pad = torch.iinfo(actual.dtype).max
+    actual_canon = torch.sort(torch.where(actual >= 0, actual, sort_pad), dim=1).values
+    expected_canon = torch.sort(torch.where(expected >= 0, expected, sort_pad), dim=1).values
+    if not torch.equal(actual_canon, expected_canon):
+        mismatch = int((actual_canon != expected_canon).sum().item())
         raise BenchmarkFailure(case, f"topk mismatch: {mismatch} differing entries")
 
 
@@ -282,15 +362,39 @@ def _select_paged_topk_from_logits(
     page_table_1: torch.Tensor,
     seqlens: torch.Tensor,
     topk: int,
+    cu_seqlens_q: torch.Tensor | None = None,
+    query_row_to_batch: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if (
+        _sgl_fast_topk_transform_fused is not None
+        and logits.is_cuda
+        and topk == 2048
+        and cu_seqlens_q is not None
+    ):
+        try:
+            return _sgl_fast_topk_transform_fused(
+                score=logits,
+                lengths=seqlens,
+                page_table_size_1=page_table_1,
+                cu_seqlens_q=cu_seqlens_q,
+                topk=topk,
+            )
+        except Exception:
+            pass
+
     rows = logits.shape[0]
     output = torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
     gather_k = min(topk, logits.shape[1], page_table_1.shape[1])
     if gather_k == 0:
         return output
-    topk_pos = torch.argsort(logits, dim=1, descending=True, stable=True)[:, :gather_k]
-    topk_values = torch.gather(logits, 1, topk_pos)
-    gathered = torch.gather(page_table_1, 1, topk_pos.to(torch.long))
+    topk_values, topk_pos = torch.topk(logits, k=gather_k, dim=1, largest=True, sorted=False)
+    if query_row_to_batch is None:
+        gathered = torch.gather(page_table_1, 1, topk_pos.to(torch.long))
+    else:
+        gathered = page_table_1[
+            query_row_to_batch.to(torch.long).unsqueeze(1),
+            topk_pos.to(torch.long),
+        ]
     output[:, :gather_k] = torch.where(
         torch.isfinite(topk_values),
         gathered,
@@ -299,7 +403,32 @@ def _select_paged_topk_from_logits(
     return output
 
 
-def _select_ragged_topk_from_logits(
+def _rank_topk_candidates(
+    *,
+    values: torch.Tensor,
+    positions: torch.Tensor,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if values.shape != positions.shape:
+        raise ValueError("values and positions must have the same shape")
+    if values.ndim != 2:
+        raise ValueError(f"values must be rank-2, got {tuple(values.shape)}")
+    gather_k = min(topk, values.shape[1])
+    if gather_k == 0:
+        empty_values = values[:, :0]
+        empty_positions = positions[:, :0]
+        return empty_values, empty_positions
+    pos_order = torch.argsort(positions, dim=1, descending=False, stable=True)
+    positions = torch.gather(positions, 1, pos_order)
+    values = torch.gather(values, 1, pos_order)
+    value_order = torch.argsort(values, dim=1, descending=True, stable=True)[:, :gather_k]
+    return (
+        torch.gather(values, 1, value_order),
+        torch.gather(positions, 1, value_order),
+    )
+
+
+def _select_ragged_topk_from_logits_chunked(
     *,
     logits: torch.Tensor,
     k_start: torch.Tensor,
@@ -311,19 +440,108 @@ def _select_ragged_topk_from_logits(
     gather_k = min(topk, logits.shape[1])
     if gather_k == 0:
         return output
-    positions = torch.arange(logits.shape[1], device=logits.device, dtype=torch.int32).unsqueeze(0)
+
     row_start = k_start.unsqueeze(1)
     row_end = row_start + lengths.unsqueeze(1)
-    valid = (positions >= row_start) & (positions < row_end)
-    masked_logits = torch.where(valid, logits, torch.full_like(logits, float("-inf")))
-    topk_pos = torch.argsort(masked_logits, dim=1, descending=True, stable=True)[:, :gather_k]
-    topk_values = torch.gather(masked_logits, 1, topk_pos)
+    best_values = torch.full(
+        (rows, gather_k),
+        float("-inf"),
+        dtype=logits.dtype,
+        device=logits.device,
+    )
+    best_pos = torch.full((rows, gather_k), -1, dtype=torch.int32, device=logits.device)
+
+    for chunk_start in range(0, logits.shape[1], _RAGGED_TOPK_CHUNK):
+        chunk_end = min(chunk_start + _RAGGED_TOPK_CHUNK, logits.shape[1])
+        local_k = min(gather_k, chunk_end - chunk_start)
+        if local_k == 0:
+            continue
+        chunk_logits = logits[:, chunk_start:chunk_end]
+        positions = torch.arange(
+            chunk_start,
+            chunk_end,
+            dtype=torch.int32,
+            device=logits.device,
+        ).unsqueeze(0)
+        valid = (positions >= row_start) & (positions < row_end)
+        masked_logits = torch.where(valid, chunk_logits, torch.full_like(chunk_logits, float("-inf")))
+        chunk_values, chunk_pos = torch.topk(
+            masked_logits,
+            k=local_k,
+            dim=1,
+            largest=True,
+            sorted=False,
+        )
+        chunk_pos = chunk_pos.to(torch.int32) + chunk_start
+        chunk_values, chunk_pos = _rank_topk_candidates(
+            values=chunk_values,
+            positions=chunk_pos,
+            topk=local_k,
+        )
+        merged_values = torch.cat([best_values, chunk_values], dim=1)
+        merged_pos = torch.cat([best_pos, chunk_pos], dim=1)
+        best_values, best_pos = _rank_topk_candidates(
+            values=merged_values,
+            positions=merged_pos,
+            topk=gather_k,
+        )
+
     output[:, :gather_k] = torch.where(
-        torch.isfinite(topk_values),
-        topk_pos.to(torch.int32),
-        torch.full_like(topk_pos, -1, dtype=torch.int32),
+        torch.isfinite(best_values),
+        best_pos,
+        torch.full_like(best_pos, -1),
     )
     return output
+
+
+def _select_ragged_topk_from_logits(
+    *,
+    logits: torch.Tensor,
+    k_start: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+) -> torch.Tensor:
+    if _sgl_fast_topk_transform_ragged_fused is not None and logits.is_cuda and topk == 2048:
+        try:
+            return _sgl_fast_topk_transform_ragged_fused(
+                score=logits,
+                lengths=lengths,
+                topk_indices_offset=k_start,
+                topk=topk,
+                row_starts=k_start,
+            )
+        except Exception:
+            pass
+
+    return _select_ragged_topk_from_logits_chunked(
+        logits=logits,
+        k_start=k_start,
+        lengths=lengths,
+        topk=topk,
+    )
+
+
+def _capture_and_bench_cuda_graph(
+    fn,
+    *,
+    warmup: int,
+    replays: int,
+    prepare=None,
+    l2_flush=None,
+) -> dict[str, list[float]]:
+    graph = capture_cuda_graph(fn, warmup=warmup, prepare=prepare)
+    try:
+        return bench_cuda_graph(
+            graph,
+            replays=replays,
+            prepare=prepare,
+            l2_flush=l2_flush,
+        )
+    finally:
+        torch.cuda.synchronize()
+        del graph
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 def _make_decode_graph_prepare(
@@ -336,6 +554,8 @@ def _make_decode_graph_prepare(
     graph_real_page_table: torch.Tensor,
     graph_cache_seqlens_int32: torch.Tensor,
     graph_nsa_cache_seqlens_int32: torch.Tensor,
+    graph_paged_mqa_schedule_metadata: torch.Tensor | None = None,
+    schedule_block_kv: int | None = None,
 ):
     live_width = live_page_table_1.shape[1]
     live_block_width = live_real_page_table.shape[1]
@@ -345,6 +565,14 @@ def _make_decode_graph_prepare(
         graph_real_page_table[:, :live_block_width].copy_(live_real_page_table)
         graph_cache_seqlens_int32.copy_(cache_seqlens_int32)
         graph_nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens_int32)
+        if graph_paged_mqa_schedule_metadata is not None:
+            if schedule_block_kv is None:
+                raise ValueError("schedule_block_kv must be provided when graph schedule metadata is set")
+            get_paged_mqa_logits_metadata(
+                graph_cache_seqlens_int32,
+                schedule_block_kv,
+                out=graph_paged_mqa_schedule_metadata,
+            )
 
     return prepare
 
@@ -548,17 +776,14 @@ def _run_decode_case(
         width_blocks=aligned_graph_width // cfg.page_size,
         page_size=cfg.page_size,
     )
-    full_cache_seqlens = torch.full(
-        (case.batch_size,),
-        case.cache_len,
+    full_cache_seqlens = torch.tensor(
+        case.decode_row_cache_lens,
         dtype=torch.int32,
         device=device,
     )
-    nsa_cache_seqlens = torch.full(
-        (case.batch_size,),
-        case.topk,
-        dtype=torch.int32,
-        device=device,
+    nsa_cache_seqlens = torch.minimum(
+        full_cache_seqlens,
+        torch.full((case.batch_size,), case.topk, dtype=torch.int32, device=device),
     )
     graph_candidate_page_table = torch.full(
         (case.batch_size, aligned_graph_width),
@@ -574,6 +799,19 @@ def _run_decode_case(
     )
     graph_cache_seqlens = torch.empty_like(full_cache_seqlens)
     graph_nsa_cache_seqlens = torch.empty_like(nsa_cache_seqlens)
+    use_graph_schedule_metadata = uses_paged_mqa_schedule_metadata(
+        q_rows=case.batch_size,
+        max_pages=graph_real_page_table.shape[1],
+    )
+    graph_schedule_metadata = (
+        torch.empty(
+            (torch.cuda.get_device_properties(device).multi_processor_count + 1, 2),
+            dtype=torch.int32,
+            device=device,
+        )
+        if use_graph_schedule_metadata
+        else None
+    )
     prepare_decode_graph = _make_decode_graph_prepare(
         live_page_table_1=live_candidate_page_table,
         live_real_page_table=live_real_page_table,
@@ -583,11 +821,14 @@ def _run_decode_case(
         graph_real_page_table=graph_real_page_table,
         graph_cache_seqlens_int32=graph_cache_seqlens,
         graph_nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
+        graph_paged_mqa_schedule_metadata=graph_schedule_metadata,
+        schedule_block_kv=cfg.page_size,
     )
     prepare_decode_graph()
     indexer_metadata = NSAIndexerPagedDecodeMetadata(
         real_page_table=graph_real_page_table,
         cache_seqlens_int32=graph_cache_seqlens,
+        paged_mqa_schedule_metadata=graph_schedule_metadata,
     )
 
     def run_indexer():
@@ -631,6 +872,8 @@ def _run_decode_case(
         seqlens=graph_cache_seqlens,
         topk=case.topk,
     )
+    del expected_logits
+    del expected_topk
 
     mla_metadata = MLASparseDecodeMetadata(
         page_table_1=actual_topk,
@@ -648,8 +891,8 @@ def _run_decode_case(
     )
     split_cfg = select_sparse_mla_split_decode_config(
         q_all=q_all,
-        kv_cache=mla_kv_cache,
-        page_table_1=mla_selected_indices,
+        kv_cache=kv_cache,
+        page_table_1=actual_topk,
         output_dtype=q_all.dtype,
         v_head_dim=cfg.kv_lora_rank,
     )
@@ -718,31 +961,34 @@ def _run_decode_case(
             case,
             f"MLA cos {mla_sanity.cos:.6f} fell below {MLA_COS_TOL:.6f}",
         )
+    del actual_output
+    del expected_output
 
     clear_nsa_indexer_caches()
-    indexer_graph = capture_cuda_graph(
+    indexer_stats = _capture_and_bench_cuda_graph(
         run_indexer,
         warmup=warmup,
+        replays=replays,
         prepare=prepare_decode_graph,
+        l2_flush=l2_flush,
     )
-    indexer_stats = bench_cuda_graph(indexer_graph, replays=replays, l2_flush=l2_flush)
     indexer_us = statistics.median(indexer_stats["replay_us"])
 
     clear_mla_caches()
     prepare_decode_graph()
-    mla_graph = capture_cuda_graph(run_mla, warmup=warmup)
-    mla_stats = bench_cuda_graph(mla_graph, replays=replays, l2_flush=l2_flush)
+    mla_stats = _capture_and_bench_cuda_graph(
+        run_mla,
+        warmup=warmup,
+        replays=replays,
+        l2_flush=l2_flush,
+    )
     mla_us = statistics.median(mla_stats["replay_us"])
 
     clear_nsa_indexer_caches()
     clear_mla_caches()
-    step_graph = capture_cuda_graph(
+    step_stats = _capture_and_bench_cuda_graph(
         run_step,
         warmup=warmup,
-        prepare=prepare_decode_graph,
-    )
-    step_stats = bench_cuda_graph(
-        step_graph,
         replays=replays,
         prepare=prepare_decode_graph,
         l2_flush=l2_flush,
@@ -806,28 +1052,21 @@ def _run_prefill_or_verify_case(
         pool_locs=pool_locs,
         pool_tokens=pool_tokens,
     )
-    base_candidate_page_table = make_dense_candidate_page_table(
-        batch_size=case.batch_size,
-        token_locs=pool_locs,
-        width=case.cache_len,
-        fill_value=-1,
-    )
     base_real_page_table = make_dense_real_page_table(
         batch_size=case.batch_size,
         token_locs=pool_locs,
         width_blocks=aligned_graph_width // cfg.page_size,
         page_size=cfg.page_size,
     )
-    live_candidate_page_table = torch.repeat_interleave(
-        base_candidate_page_table,
-        repeats=case.q_len,
-        dim=0,
-    )
-    live_real_page_table = torch.repeat_interleave(
-        base_real_page_table,
-        repeats=case.q_len,
-        dim=0,
-    )
+    query_row_to_batch = torch.arange(
+        case.batch_size,
+        dtype=torch.int32,
+        device=device,
+    ).repeat_interleave(case.q_len)
+    live_real_page_table = base_real_page_table.index_select(
+        0,
+        query_row_to_batch.to(torch.long),
+    ).contiguous()
     batch_cache_seqlens = torch.full(
         (case.batch_size,),
         case.cache_len,
@@ -855,12 +1094,6 @@ def _run_prefill_or_verify_case(
         dtype=torch.int32,
         device=device,
     )
-    graph_candidate_page_table = torch.full(
-        (case.total_q, aligned_graph_width),
-        -1,
-        dtype=torch.int32,
-        device=device,
-    )
     graph_real_page_table = torch.full(
         (case.total_q, aligned_graph_width // cfg.page_size),
         -1,
@@ -870,6 +1103,19 @@ def _run_prefill_or_verify_case(
     graph_batch_cache_seqlens = torch.empty_like(batch_cache_seqlens)
     graph_expanded_cache_seqlens = torch.empty_like(expanded_cache_seqlens)
     graph_nsa_cache_seqlens = torch.empty_like(nsa_cache_seqlens)
+    use_graph_schedule_metadata = uses_paged_mqa_schedule_metadata(
+        q_rows=case.total_q,
+        max_pages=graph_real_page_table.shape[1],
+    )
+    graph_schedule_metadata = (
+        torch.empty(
+            (torch.cuda.get_device_properties(device).multi_processor_count + 1, 2),
+            dtype=torch.int32,
+            device=device,
+        )
+        if use_graph_schedule_metadata
+        else None
+    )
     live_extend_lengths = torch.arange(
         case.cache_len - case.q_len + 1,
         case.cache_len + 1,
@@ -884,13 +1130,16 @@ def _run_prefill_or_verify_case(
     graph_extend_lengths = torch.empty_like(live_extend_lengths)
 
     def prepare_verify_graph() -> None:
-        live_width = live_candidate_page_table.shape[1]
-        live_block_width = live_real_page_table.shape[1]
-        graph_candidate_page_table[:, :live_width].copy_(live_candidate_page_table)
-        graph_real_page_table[:, :live_block_width].copy_(live_real_page_table)
+        graph_real_page_table[:, : live_real_page_table.shape[1]].copy_(live_real_page_table)
         graph_batch_cache_seqlens.copy_(batch_cache_seqlens)
         graph_expanded_cache_seqlens.copy_(expanded_cache_seqlens)
         graph_nsa_cache_seqlens.copy_(nsa_cache_seqlens)
+        if graph_schedule_metadata is not None:
+            get_paged_mqa_logits_metadata(
+                graph_expanded_cache_seqlens,
+                cfg.page_size,
+                out=graph_schedule_metadata,
+            )
         graph_extend_k_start.copy_(live_extend_k_start)
         graph_extend_lengths.copy_(live_extend_lengths)
 
@@ -904,11 +1153,23 @@ def _run_prefill_or_verify_case(
         seq_lens=batch_cache_seqlens,
         page_size=cfg.page_size,
     )
+    use_runtime_ragged_topk = (
+        device.type == "cuda"
+        and case.topk == 2048
+        and _sgl_fast_topk_transform_ragged_fused is not None
+    )
 
     if case.mode == "verify":
+        base_candidate_page_table = make_dense_candidate_page_table(
+            batch_size=case.batch_size,
+            token_locs=pool_locs,
+            width=case.cache_len,
+            fill_value=-1,
+        )
         indexer_metadata = NSAIndexerPagedDecodeMetadata(
             real_page_table=graph_real_page_table,
             cache_seqlens_int32=graph_expanded_cache_seqlens,
+            paged_mqa_schedule_metadata=graph_schedule_metadata,
         )
 
         def run_indexer():
@@ -921,18 +1182,15 @@ def _run_prefill_or_verify_case(
             )
             return _select_paged_topk_from_logits(
                 logits=logits,
-                page_table_1=graph_candidate_page_table,
+                page_table_1=base_candidate_page_table,
                 seqlens=graph_expanded_cache_seqlens,
                 topk=case.topk,
+                cu_seqlens_q=cu_seqlens_q,
+                query_row_to_batch=query_row_to_batch,
             )
 
         clear_nsa_indexer_caches()
         actual_topk = run_indexer()
-        query_row_to_batch = torch.arange(
-            case.batch_size,
-            dtype=torch.int32,
-            device=device,
-        ).repeat_interleave(case.q_len)
         expected_logits = sparse_nsa_paged_logits_reference(
             q_fp8=q_fp8,
             weights=weights,
@@ -944,19 +1202,23 @@ def _run_prefill_or_verify_case(
         )
         expected_topk = _select_paged_topk_from_logits(
             logits=expected_logits,
-            page_table_1=graph_candidate_page_table,
+            page_table_1=base_candidate_page_table,
             seqlens=graph_expanded_cache_seqlens,
             topk=case.topk,
+            cu_seqlens_q=cu_seqlens_q,
+            query_row_to_batch=query_row_to_batch,
         )
         torch.cuda.synchronize()
         _assert_decode_contract_match(
             case=case,
             actual=actual_topk,
             expected=expected_topk,
-            page_table_1=graph_candidate_page_table,
+            page_table_1=base_candidate_page_table,
             seqlens=graph_expanded_cache_seqlens,
             topk=case.topk,
         )
+        del expected_logits
+        del expected_topk
         mla_selected_indices = actual_topk
         mla_kv_cache = kv_cache
         mla_k_nope = k_nope
@@ -985,28 +1247,31 @@ def _run_prefill_or_verify_case(
 
         clear_nsa_indexer_caches()
         actual_topk = run_indexer()
-        expected_logits = sparse_nsa_extend_logits_reference(
-            q_fp8=q_fp8,
-            weights=weights,
-            kv_fp8=extend_kv_fp8,
-            k_start=graph_extend_k_start,
-            k_end=graph_extend_k_start + graph_extend_lengths,
-        )
-        expected_topk = _select_ragged_topk_from_logits(
-            logits=expected_logits,
-            k_start=graph_extend_k_start,
-            lengths=graph_extend_lengths,
-            topk=case.topk,
-        )
-        torch.cuda.synchronize()
-        _assert_decode_contract_match(
-            case=case,
-            actual=actual_topk,
-            expected=expected_topk,
-            page_table_1=graph_candidate_page_table,
-            seqlens=graph_expanded_cache_seqlens,
-            topk=case.topk,
-        )
+        if not use_runtime_ragged_topk:
+            expected_logits = sparse_nsa_extend_logits_reference(
+                q_fp8=q_fp8,
+                weights=weights,
+                kv_fp8=extend_kv_fp8,
+                k_start=graph_extend_k_start,
+                k_end=graph_extend_k_start + graph_extend_lengths,
+            )
+            expected_topk = _select_ragged_topk_from_logits(
+                logits=expected_logits,
+                k_start=graph_extend_k_start,
+                lengths=graph_extend_lengths,
+                topk=case.topk,
+            )
+            torch.cuda.synchronize()
+            _assert_decode_contract_match(
+                case=case,
+                actual=actual_topk,
+                expected=expected_topk,
+                page_table_1=actual_topk,
+                seqlens=graph_expanded_cache_seqlens,
+                topk=case.topk,
+            )
+            del expected_logits
+            del expected_topk
         mla_selected_indices = actual_topk
         mla_kv_cache = extend_kv_cache
         mla_k_nope = extend_k_nope
@@ -1097,15 +1362,13 @@ def _run_prefill_or_verify_case(
             case,
             f"MLA cos {mla_sanity.cos:.6f} fell below {MLA_COS_TOL:.6f}",
         )
+    del actual_output
+    del expected_output
 
     clear_nsa_indexer_caches()
-    indexer_graph = capture_cuda_graph(
+    indexer_stats = _capture_and_bench_cuda_graph(
         run_indexer,
         warmup=warmup,
-        prepare=prepare_verify_graph,
-    )
-    indexer_stats = bench_cuda_graph(
-        indexer_graph,
         replays=replays,
         prepare=prepare_verify_graph,
         l2_flush=l2_flush,
@@ -1114,19 +1377,19 @@ def _run_prefill_or_verify_case(
 
     clear_mla_caches()
     prepare_verify_graph()
-    mla_graph = capture_cuda_graph(run_mla, warmup=warmup)
-    mla_stats = bench_cuda_graph(mla_graph, replays=replays, l2_flush=l2_flush)
+    mla_stats = _capture_and_bench_cuda_graph(
+        run_mla,
+        warmup=warmup,
+        replays=replays,
+        l2_flush=l2_flush,
+    )
     mla_us = statistics.median(mla_stats["replay_us"])
 
     clear_nsa_indexer_caches()
     clear_mla_caches()
-    step_graph = capture_cuda_graph(
+    step_stats = _capture_and_bench_cuda_graph(
         run_step,
         warmup=warmup,
-        prepare=prepare_verify_graph,
-    )
-    step_stats = bench_cuda_graph(
-        step_graph,
         replays=replays,
         prepare=prepare_verify_graph,
         l2_flush=l2_flush,
@@ -1160,6 +1423,8 @@ def collect_case_reports(
         cache_lens=_parse_csv_ints(args.cache_lens),
         verify_q_lens=_parse_csv_ints(args.verify_q_lens),
         topk_cap=min(args.topk_cap, cfg.index_topk),
+        decode_row_pattern=args.decode_row_pattern,
+        page_size=cfg.page_size,
     )
     reports: list[CaseReport] = []
     case_seed = args.seed
@@ -1195,9 +1460,14 @@ def collect_case_reports(
 
 def _render_case_line(report: CaseReport) -> str:
     split_flag = "on" if report.split_enabled else "off"
+    row_ctx_desc = ""
+    if report.case.mode == "decode" and report.case.is_heterogeneous_decode:
+        row_ctx_desc = (
+            f" rowctx={min(report.case.decode_row_cache_lens):6d}-{report.case.cache_len:6d}"
+        )
     return (
         f"glm51-{report.case.mode:6s} tp8 bs={report.case.batch_size:2d} "
-        f"q={report.case.q_len:2d} ctx={report.case.cache_len:6d} "
+        f"q={report.case.q_len:2d} ctx={report.case.cache_len:6d}{row_ctx_desc} "
         f"graphw={report.graph_width:6d} topk={report.case.topk:4d} split={split_flag:>3s} "
         f"chunk={report.chunk_size:3d} nchunks={report.num_chunks:d} | "
         f"step={report.total_us:8.2f} us | "
@@ -1243,6 +1513,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--cache-lens",
         default="1024,32768,131072",
         help=f"decode cache lengths, default {','.join(str(v) for v in DEFAULT_CACHE_LENS)}",
+    )
+    parser.add_argument(
+        "--decode-row-pattern",
+        default=DEFAULT_DECODE_ROW_PATTERN,
+        help=(
+            "decode-only per-row context pattern: uniform or staggered "
+            "(staggered uses row contexts [ctx, ctx*(bs-1)/bs, ..., ctx/bs])"
+        ),
     )
     parser.add_argument(
         "--verify-q-lens",

@@ -23,9 +23,11 @@ from b12x.integration.nsa_indexer import (
     NSAIndexerExtendLogitsMetadata,
     NSAIndexerPagedDecodeMetadata,
     clear_nsa_indexer_caches,
+    get_paged_mqa_logits_metadata,
     pack_nsa_index_k_cache_reference,
     sparse_nsa_index_decode_logits_paged,
     sparse_nsa_index_extend_logits,
+    uses_paged_mqa_schedule_metadata,
 )
 
 from benchmarks.common import (
@@ -286,16 +288,36 @@ def _run_decode_case(
         device=device,
     )
     graph_seqlens = torch.empty_like(seqlens)
+    use_graph_schedule_metadata = uses_paged_mqa_schedule_metadata(
+        q_rows=q_rows,
+        max_pages=graph_real_page_table.shape[1],
+    )
+    graph_schedule_metadata = (
+        torch.empty(
+            (torch.cuda.get_device_properties(device).multi_processor_count + 1, 2),
+            dtype=torch.int32,
+            device=device,
+        )
+        if use_graph_schedule_metadata
+        else None
+    )
 
     def prepare_decode_graph() -> None:
         graph_page_table_1[:, :cache_len].copy_(live_page_table_1)
         graph_real_page_table[:, : live_real_page_table.shape[1]].copy_(live_real_page_table)
         graph_seqlens.copy_(seqlens)
+        if graph_schedule_metadata is not None:
+            get_paged_mqa_logits_metadata(
+                graph_seqlens,
+                cfg.page_size,
+                out=graph_schedule_metadata,
+            )
 
     prepare_decode_graph()
     metadata = NSAIndexerPagedDecodeMetadata(
         real_page_table=graph_real_page_table,
         cache_seqlens_int32=graph_seqlens,
+        paged_mqa_schedule_metadata=graph_schedule_metadata,
     )
 
     def run():

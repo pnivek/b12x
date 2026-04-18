@@ -11,6 +11,7 @@ from b12x.integration.nsa_indexer import (
     NSAIndexerExtendLogitsMetadata,
     NSAIndexerPagedDecodeMetadata,
     clear_nsa_indexer_caches,
+    get_paged_mqa_logits_metadata,
     pack_nsa_index_k_cache_reference,
     sparse_nsa_index_decode_logits_paged,
     sparse_nsa_index_extend_logits,
@@ -565,6 +566,10 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_cuda_graph_capture() -> None:
         seqlens_expanded=seqlens,
         extend_lens=[1, 1, 1, 0],
     )
+    metadata.paged_mqa_schedule_metadata = get_paged_mqa_logits_metadata(
+        seqlens[:active_rows].contiguous(),
+        64,
+    )
 
     clear_nsa_indexer_caches()
     captured_out = None
@@ -597,6 +602,7 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_cuda_graph_capture() -> None:
         metadata=NSAIndexerPagedDecodeMetadata(
             real_page_table=real_page_table[:active_rows],
             cache_seqlens_int32=seqlens[:active_rows],
+            paged_mqa_schedule_metadata=metadata.paged_mqa_schedule_metadata,
         ),
     )
     expected = metadata.topk_transform(expected_logits, topk)

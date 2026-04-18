@@ -3,7 +3,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.attention.nsa_indexer.kernel import _split_index_k_cache_runtime_views
+from b12x.attention.nsa_indexer.kernel import (
+    PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT,
+    _split_index_k_cache_runtime_views,
+)
 from b12x.attention.nsa_indexer.reference import (
     sparse_nsa_extend_logits_reference,
     sparse_nsa_paged_logits_reference,
@@ -16,6 +19,7 @@ from b12x.integration.nsa_indexer import (
     pack_nsa_index_k_cache_reference,
     sparse_nsa_index_decode_logits_paged,
     sparse_nsa_index_extend_logits,
+    uses_paged_mqa_schedule_metadata,
 )
 
 
@@ -58,6 +62,32 @@ def _assert_logits_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
 
+def _paged_mqa_schedule_reference(
+    context_lens: torch.Tensor,
+    *,
+    block_kv: int,
+    num_sms: int,
+) -> torch.Tensor:
+    rows = context_lens[:, -1].tolist() if context_lens.ndim == 2 else context_lens.tolist()
+    split_kv = block_kv * PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT
+    prefix_sum: list[int] = []
+    total = 0
+    for row in rows:
+        total += max((int(row) + split_kv - 1) // split_kv, 0)
+        prefix_sum.append(total)
+
+    q, r = divmod(total, num_sms)
+    out: list[list[int]] = []
+    for sm_idx in range(num_sms + 1):
+        seg_start = sm_idx * q + min(sm_idx, r)
+        q_idx = 0
+        while q_idx < len(prefix_sum) and prefix_sum[q_idx] <= seg_start:
+            q_idx += 1
+        kv_split_idx = seg_start if q_idx == 0 else seg_start - prefix_sum[q_idx - 1]
+        out.append([q_idx, kv_split_idx])
+    return torch.tensor(out, dtype=torch.int32)
+
+
 def test_sparse_nsa_index_runtime_views_preserve_page_stride() -> None:
     device = torch.device("cpu")
     page_count = 3
@@ -82,20 +112,32 @@ def test_sparse_nsa_index_runtime_views_preserve_page_stride() -> None:
     assert scale_bytes[1, 2, 0].item() == index_k_cache[1, data_bytes + 2 * 4].item()
 
 
-def test_get_paged_mqa_logits_metadata_matches_deepgemm_shape() -> None:
-    context_lens_1d = torch.tensor([64, 128, 192], dtype=torch.int32)
+def test_get_paged_mqa_logits_metadata_matches_deepgemm_partitioning() -> None:
+    context_lens_1d = torch.tensor([0, 64, 4096, 4097, 16384], dtype=torch.int32)
     schedule_1d = get_paged_mqa_logits_metadata(context_lens_1d, 64, 5)
+    expected_1d = _paged_mqa_schedule_reference(context_lens_1d, block_kv=64, num_sms=5)
     assert schedule_1d.shape == (6, 2)
     assert schedule_1d.dtype == torch.int32
     assert schedule_1d.is_contiguous()
-    assert torch.count_nonzero(schedule_1d).item() == 0
+    assert torch.equal(schedule_1d.cpu(), expected_1d)
 
-    context_lens_2d = torch.tensor([[64, 65], [128, 129]], dtype=torch.int32)
+    context_lens_2d = torch.tensor([[64, 65], [0, 8192], [128, 129]], dtype=torch.int32)
     schedule_2d = get_paged_mqa_logits_metadata(context_lens_2d, 64, 7)
+    expected_2d = _paged_mqa_schedule_reference(context_lens_2d, block_kv=64, num_sms=7)
     assert schedule_2d.shape == (8, 2)
     assert schedule_2d.dtype == torch.int32
     assert schedule_2d.is_contiguous()
-    assert torch.count_nonzero(schedule_2d).item() == 0
+    assert torch.equal(schedule_2d.cpu(), expected_2d)
+
+
+def test_uses_paged_mqa_schedule_metadata_only_for_long_rows() -> None:
+    assert not uses_paged_mqa_schedule_metadata(q_rows=0, max_pages=2048)
+    assert not uses_paged_mqa_schedule_metadata(q_rows=1, max_pages=128)
+    assert not uses_paged_mqa_schedule_metadata(q_rows=2, max_pages=512)
+    assert not uses_paged_mqa_schedule_metadata(q_rows=9, max_pages=2048)
+    assert uses_paged_mqa_schedule_metadata(q_rows=1, max_pages=2048)
+    assert uses_paged_mqa_schedule_metadata(q_rows=2, max_pages=2048)
+    assert uses_paged_mqa_schedule_metadata(q_rows=8, max_pages=2048)
 
 
 def test_sparse_nsa_index_decode_logits_paged_matches_reference_cpu() -> None:
@@ -194,6 +236,55 @@ def test_sparse_nsa_index_decode_logits_paged_cuda_kernel_matches_reference() ->
     _assert_logits_close(actual, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for paged kernel coverage")
+def test_sparse_nsa_index_decode_logits_paged_cuda_schedule_kernel_matches_reference() -> None:
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(72_111)
+
+    q_rows = 2
+    num_heads = 8
+    width_blocks = 1024
+    page_starts = [2, 1100]
+    num_tokens = (max(page_starts) + 40) * 64
+    seqlens = torch.tensor([2048, 2304], dtype=torch.int32, device=device)
+    real_page_table = _make_real_page_table(
+        page_starts=page_starts,
+        seqlens=seqlens.tolist(),
+        width_blocks=width_blocks,
+        device=device,
+    )
+    q_fp8 = (
+        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32).to(device=device) / 2
+    ).to(torch.float8_e4m3fn)
+    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32).to(device=device)
+    index_k_cache = pack_nsa_index_k_cache_reference(
+        torch.randn((num_tokens, 128), generator=gen, dtype=torch.float32).to(device=device) / 3
+    )
+
+    actual = sparse_nsa_index_decode_logits_paged(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        metadata=NSAIndexerPagedDecodeMetadata(
+            real_page_table=real_page_table,
+            cache_seqlens_int32=seqlens,
+            paged_mqa_schedule_metadata=get_paged_mqa_logits_metadata(seqlens, 64, 8),
+        ),
+    )
+    expected = sparse_nsa_paged_logits_reference(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        real_page_table=real_page_table,
+        query_row_to_batch=torch.arange(q_rows, dtype=torch.int32, device=device),
+        seqlens_per_query=seqlens,
+    )
+
+    torch.cuda.synchronize(device)
+    _assert_logits_close(actual, expected)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture coverage")
 def test_sparse_nsa_index_decode_logits_paged_cuda_graph_replay_tracks_live_width_without_stale_output() -> None:
     device = torch.device("cuda")
@@ -232,15 +323,17 @@ def test_sparse_nsa_index_decode_logits_paged_cuda_graph_replay_tracks_live_widt
         device=device,
     )
     graph_seqlens = torch.empty((rows,), dtype=torch.int32, device=device)
+    graph_schedule_metadata = torch.empty((9, 2), dtype=torch.int32, device=device)
 
     def prepare(page_table: torch.Tensor, seqlens: torch.Tensor) -> None:
         graph_real_page_table[:, :live_width_blocks].copy_(page_table)
         graph_seqlens.copy_(seqlens)
+        get_paged_mqa_logits_metadata(graph_seqlens, 64, 8, out=graph_schedule_metadata)
 
     metadata = NSAIndexerPagedDecodeMetadata(
         real_page_table=graph_real_page_table,
         cache_seqlens_int32=graph_seqlens,
-        paged_mqa_schedule_metadata=get_paged_mqa_logits_metadata(graph_seqlens, 64, 8),
+        paged_mqa_schedule_metadata=graph_schedule_metadata,
     )
 
     clear_nsa_indexer_caches()

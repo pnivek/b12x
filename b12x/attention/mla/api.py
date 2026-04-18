@@ -183,11 +183,16 @@ def _run_sparse_mla(
             output_dtype=q_all.dtype,
             v_head_dim=v_head_dim,
         )
-        if force_split and split_cfg is None and supports_sparse_mla_kernel(
-            q_all=q_all,
-            kv_cache=kv_cache,
-            page_table_1=selected_indices,
-            v_head_dim=v_head_dim,
+        if (
+            force_split
+            and split_cfg is None
+            and q_all.device.type == "cuda"
+            and supports_sparse_mla_kernel(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=selected_indices,
+                v_head_dim=v_head_dim,
+            )
         ):
             forced_width = int(selected_indices.shape[1])
             if active_token_counts is not None and active_token_counts.numel() > 0:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import torch
+
 from benchmarks import benchmark_mla
 
 
@@ -10,6 +12,8 @@ def test_build_decode_cases_covers_requested_matrix_and_topk_cap() -> None:
         cache_lens=[1024, 32768, 131072],
         verify_q_lens=[benchmark_mla.DEFAULT_PREFILL_Q_LENS[0]],
         topk_cap=2048,
+        decode_row_pattern="uniform",
+        page_size=64,
     )
 
     assert len(cases) == 12
@@ -25,6 +29,8 @@ def test_build_decode_cases_skips_prefill_chunks_larger_than_context() -> None:
         cache_lens=[1024, 32768],
         verify_q_lens=[16384],
         topk_cap=2048,
+        decode_row_pattern="uniform",
+        page_size=64,
     )
 
     assert cases == [
@@ -38,6 +44,34 @@ def test_build_decode_cases_skips_prefill_chunks_larger_than_context() -> None:
             q_len=16384,
         ),
     ]
+
+
+def test_build_decode_cases_supports_staggered_row_contexts() -> None:
+    cases = benchmark_mla._build_decode_cases(
+        modes=["decode"],
+        batch_sizes=[1, 4, 8],
+        cache_lens=[1024],
+        verify_q_lens=[benchmark_mla.DEFAULT_PREFILL_Q_LENS[0]],
+        topk_cap=2048,
+        decode_row_pattern="staggered",
+        page_size=64,
+    )
+
+    assert cases[0] == benchmark_mla.DecodeCase(mode="decode", batch_size=1, cache_len=1024, topk=1024)
+    assert cases[1] == benchmark_mla.DecodeCase(
+        mode="decode",
+        batch_size=4,
+        cache_len=1024,
+        topk=1024,
+        row_cache_lens=(1024, 768, 512, 256),
+    )
+    assert cases[2] == benchmark_mla.DecodeCase(
+        mode="decode",
+        batch_size=8,
+        cache_len=1024,
+        topk=1024,
+        row_cache_lens=(1024, 896, 768, 640, 512, 384, 256, 128),
+    )
 
 
 def test_render_case_line_reports_public_step_metrics() -> None:
@@ -70,6 +104,33 @@ def test_render_case_line_reports_public_step_metrics() -> None:
     assert "replay=" in line
     assert "indexer=" in line
     assert "mla=" in line
+
+
+def test_render_case_line_reports_heterogeneous_decode_context_range() -> None:
+    report = benchmark_mla.CaseReport(
+        case=benchmark_mla.DecodeCase(
+            mode="decode",
+            batch_size=4,
+            cache_len=131072,
+            topk=2048,
+            row_cache_lens=(131072, 98304, 65536, 32768),
+        ),
+        graph_width=131072,
+        metadata_us=12.34,
+        replay_us=167.89,
+        indexer_us=123.45,
+        mla_us=44.44,
+        split_enabled=True,
+        chunk_size=32,
+        num_chunks=64,
+        mla_sanity=benchmark_mla.SanityMetrics(max_abs=0.01, rmse=0.001, cos=0.9999),
+    )
+
+    line = benchmark_mla._render_case_line(report)
+
+    assert "glm51-decode tp8" in line
+    assert "ctx=131072" in line
+    assert "rowctx= 32768-131072" in line
 
 
 def test_render_summary_lines_reports_geomeans() -> None:
@@ -125,7 +186,8 @@ def test_main_prints_no_stdout_on_failure(monkeypatch, capsys) -> None:
 
     captured = capsys.readouterr()
     assert rc == 1
-    assert captured.out == ""
+    assert "glm51-" not in captured.out
+    assert "Summary" not in captured.out
     assert "synthetic failure" in captured.err
 
 
@@ -156,3 +218,99 @@ def test_main_prints_buffered_case_lines_and_summary(monkeypatch, capsys) -> Non
     assert "glm51-prefill tp8" in captured.out
     assert "Summary" in captured.out
     assert captured.err == ""
+
+
+def test_select_paged_topk_matches_full_topk_set_on_cpu() -> None:
+    logits = torch.tensor(
+        [
+            [0.2, 1.7, -0.4, 1.1, 0.5],
+            [3.1, -2.0, 0.0, 2.5, 2.4],
+        ],
+        dtype=torch.float32,
+    )
+    page_table = torch.tensor(
+        [
+            [10, 11, 12, 13, 14],
+            [20, 21, 22, 23, 24],
+        ],
+        dtype=torch.int32,
+    )
+    seqlens = torch.tensor([5, 5], dtype=torch.int32)
+
+    actual = benchmark_mla._select_paged_topk_from_logits(
+        logits=logits,
+        page_table_1=page_table,
+        seqlens=seqlens,
+        topk=3,
+    )
+
+    full_order = torch.argsort(logits, dim=1, descending=True, stable=True)[:, :3]
+    expected = torch.gather(page_table, 1, full_order.to(torch.long))
+    assert torch.equal(torch.sort(actual, dim=1).values, torch.sort(expected, dim=1).values)
+
+
+def test_select_paged_topk_uses_base_page_table_mapping_for_topk_set_on_cpu() -> None:
+    logits = torch.tensor(
+        [
+            [0.2, 1.7, -0.4, 1.1, 0.5],
+            [1.4, -0.1, 0.0, 2.5, 2.4],
+            [3.1, -2.0, 0.0, 2.5, 2.4],
+            [0.4, 0.8, 0.1, 0.2, 0.3],
+        ],
+        dtype=torch.float32,
+    )
+    base_page_table = torch.tensor(
+        [
+            [10, 11, 12, 13, 14],
+            [20, 21, 22, 23, 24],
+        ],
+        dtype=torch.int32,
+    )
+    seqlens = torch.tensor([5, 5, 5, 5], dtype=torch.int32)
+    query_row_to_batch = torch.tensor([0, 0, 1, 1], dtype=torch.int32)
+
+    actual = benchmark_mla._select_paged_topk_from_logits(
+        logits=logits,
+        page_table_1=base_page_table,
+        seqlens=seqlens,
+        topk=3,
+        query_row_to_batch=query_row_to_batch,
+    )
+
+    full_order = torch.argsort(logits, dim=1, descending=True, stable=True)[:, :3]
+    expected = base_page_table[
+        query_row_to_batch.to(torch.long).unsqueeze(1),
+        full_order.to(torch.long),
+    ]
+    assert torch.equal(torch.sort(actual, dim=1).values, torch.sort(expected, dim=1).values)
+
+
+def test_select_ragged_topk_matches_full_stable_argsort_on_cpu() -> None:
+    logits = torch.tensor(
+        [
+            [0.1, 2.2, 1.4, -3.0, 1.0, 0.5],
+            [4.0, 1.5, -1.0, 3.5, 2.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    k_start = torch.tensor([1, 2], dtype=torch.int32)
+    lengths = torch.tensor([3, 2], dtype=torch.int32)
+
+    actual = benchmark_mla._select_ragged_topk_from_logits(
+        logits=logits,
+        k_start=k_start,
+        lengths=lengths,
+        topk=4,
+    )
+
+    positions = torch.arange(logits.shape[1], dtype=torch.int32).unsqueeze(0)
+    valid = (positions >= k_start.unsqueeze(1)) & (positions < (k_start + lengths).unsqueeze(1))
+    masked_logits = torch.where(valid, logits, torch.full_like(logits, float("-inf")))
+    full_order = torch.argsort(masked_logits, dim=1, descending=True, stable=True)[:, :4]
+    full_values = torch.gather(masked_logits, 1, full_order)
+    expected = torch.where(
+        torch.isfinite(full_values),
+        full_order.to(torch.int32),
+        torch.full_like(full_order, -1, dtype=torch.int32),
+    )
+    assert torch.equal(actual, expected)

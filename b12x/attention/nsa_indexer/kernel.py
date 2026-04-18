@@ -40,6 +40,12 @@ _WARP_THREADS = 32
 _PAGED_WARPS_PER_CTA = 4
 _PAGED_THREADS_PER_CTA = _WARP_THREADS * _PAGED_WARPS_PER_CTA
 _PAGED_TOKENS_PER_GROUP = 8
+PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT = 4
+_SCHEDULE_MIN_PAGES = 1024
+_ENABLE_MULTI_ROW_SCHEDULE = True
+_SCHEDULE_SINGLE_ROW_PARALLEL_CTAS = 2
+_SCHEDULE_MULTI_ROW_PARALLEL_CTAS = 4
+_SCHEDULE_MULTI_ROW_MAX_Q_ROWS = 8
 _MAX_SUPPORTED_Q_HEADS = 64
 _EAGER_HOST_LAUNCHER_CACHE_SIZE = 32
 _PAGED_Q_HEAD_TILE = 16
@@ -153,12 +159,18 @@ def _resolve_sparse_nsa_persistent_ctas(
     active_width_hint: int | None,
 ) -> int:
     persistent_ctas = _default_sparse_nsa_persistent_ctas(device_index)
-    if q_rows >= 4:
+    live_width = None
+    live_pages = None
+    if active_width_hint is not None:
+        live_width = min(max(int(active_width_hint), 0), int(width_tokens))
+        live_pages = (live_width + _PAGE_SIZE - 1) // _PAGE_SIZE
+    if q_rows > 1 and live_pages is not None and live_pages >= 512:
+        persistent_ctas = max(persistent_ctas // q_rows, 1)
+    elif q_rows >= 4:
         persistent_ctas = max(persistent_ctas // 2, 1)
     if active_width_hint is None:
         return persistent_ctas
-    live_width = min(max(int(active_width_hint), 0), int(width_tokens))
-    live_pages = (live_width + _PAGE_SIZE - 1) // _PAGE_SIZE
+    assert live_pages is not None
     del num_heads
     max_work = max(live_pages, 1)
     return min(persistent_ctas, max_work)
@@ -609,8 +621,7 @@ class SparseNSAPagedLogitsKernel:
         seq_len = Int32(seqlens_per_query[q_idx])
         if seq_len > live_width:
             seq_len = live_width
-        live_pages = (live_width + Int32(_PAGE_SIZE - 1)) // Int32(_PAGE_SIZE)
-        total_work = live_pages
+        total_work = (seq_len + Int32(_PAGE_SIZE - 1)) // Int32(_PAGE_SIZE)
 
         storage = smem.allocate(SharedStorage)
         mbar_ptr_k = storage.mbar_ptr_k.data_ptr()
@@ -618,9 +629,6 @@ class SparseNSAPagedLogitsKernel:
             cute.make_layout((self.padded_q_heads, _INDEX_HEAD_DIM), stride=(_INDEX_HEAD_DIM, 1))
         )
         s_w = storage.weights.get_tensor(cute.make_layout((self.padded_q_heads,), stride=(1,)))
-        s_k_page = storage.k_page.get_tensor(
-            cute.make_layout((_PAGE_SIZE, _INDEX_HEAD_DIM), stride=(_INDEX_HEAD_DIM, 1))
-        )
         k_page_base_addr = shared_ptr_to_u32(storage.k_page.data_ptr())
         k_page_perm_base_addr = shared_ptr_to_u32(storage.k_page_perm.data_ptr())
         s_k_page_stage = storage.k_page.get_tensor(
@@ -648,9 +656,8 @@ class SparseNSAPagedLogitsKernel:
         if cta_idx < total_work:
             if tx == 0:
                 cute.arch.mbarrier_init(mbar_ptr_k, Int32(1))
-            if warp_idx == Int32(0):
-                if use_external_k_tma_desc == Int32(0):
-                    cpasync.prefetch_descriptor(tma_atom_k)
+            if warp_idx == Int32(0) and use_external_k_tma_desc == Int32(0):
+                cpasync.prefetch_descriptor(tma_atom_k)
 
             num_heads = Int32(self.num_heads_static)
             q_linear = tx
@@ -673,7 +680,6 @@ class SparseNSAPagedLogitsKernel:
                 w_linear += Int32(_PAGED_THREADS_PER_CTA)
             cute.arch.sync_threads()
 
-            batch_row = q_idx
             producer_state = pipeline.PipelineStateSimple(1, Int32(0))
             consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
             head_tile_slot = warp_idx % Int32(self.num_q_head_tiles)
@@ -683,7 +689,7 @@ class SparseNSAPagedLogitsKernel:
                 page_col = work_idx
                 page_base = page_col * Int32(_PAGE_SIZE)
                 if page_base < seq_len:
-                    page_id = Int32(real_page_table[batch_row, page_col])
+                    page_id = Int32(real_page_table[q_idx, page_col])
                     if page_id >= Int32(0):
                         if warp_idx == Int32(0):
                             _issue_index_k_tma_copy(
@@ -762,12 +768,654 @@ class SparseNSAPagedLogitsKernel:
                 work_idx += Int32(self.persistent_ctas)
 
 
+def _should_use_schedule_kernel(
+    *,
+    q_rows: int,
+    max_pages: int,
+) -> bool:
+    return q_rows > 0 and max_pages >= _SCHEDULE_MIN_PAGES
+
+
+def _should_use_schedule_single_row_kernel(
+    *,
+    q_rows: int,
+    max_pages: int,
+) -> bool:
+    return q_rows == 1 and _should_use_schedule_kernel(q_rows=q_rows, max_pages=max_pages)
+
+
+def _should_use_schedule_multi_row_kernel(
+    *,
+    q_rows: int,
+    max_pages: int,
+) -> bool:
+    return (
+        _ENABLE_MULTI_ROW_SCHEDULE
+        and
+        q_rows > 1
+        and q_rows <= _SCHEDULE_MULTI_ROW_MAX_Q_ROWS
+        and _should_use_schedule_kernel(q_rows=q_rows, max_pages=max_pages)
+    )
+
+
+class SparseNSAScheduledSingleRowLogitsKernel:
+    """Schedule-driven scorer for the long single-row decode case."""
+
+    def __init__(self, parallel_ctas: int, num_heads_static: int):
+        self.parallel_ctas = int(parallel_ctas)
+        self.num_heads_static = int(num_heads_static)
+        self.num_q_head_tiles = _num_q_head_tiles(self.num_heads_static)
+        if self.num_q_head_tiles not in (1, 2, 4):
+            raise ValueError(
+                f"paged logits kernel only supports 1/2/4 head tiles, got {self.num_q_head_tiles}"
+            )
+        self.padded_q_heads = self.num_q_head_tiles * _PAGED_Q_HEAD_TILE
+        self.token_groups = _PAGED_WARPS_PER_CTA // self.num_q_head_tiles
+        self.tokens_per_work = _PAGED_TOKENS_PER_GROUP * self.token_groups
+        self.page_splits = _PAGE_SIZE // self.tokens_per_work
+        self.schedule_pages_per_split = int(PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT)
+
+    @cute.jit
+    def __call__(
+        self,
+        q_bytes: cute.Tensor,
+        weights: cute.Tensor,
+        k_quant_bytes: cute.Tensor,
+        k_tma_desc_ptrs: cute.Tensor,
+        use_patched_k_tma_desc: cute.Tensor,
+        k_scales: cute.Tensor,
+        real_page_table: cute.Tensor,
+        seqlens_per_query: cute.Tensor,
+        schedule_metadata: cute.Tensor,
+        active_width: cute.Tensor,
+        logits_out: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        k_tma_source = _make_paged_index_k_tma_source(k_quant_bytes)
+        tma_atom_k, tma_tensor_k = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
+            k_tma_source,
+            cute.make_layout((_PAGE_SIZE, _INDEX_HEAD_DIM), stride=(_INDEX_HEAD_DIM, 1)),
+            (_PAGE_SIZE, _INDEX_HEAD_DIM),
+            1,
+        )
+        self.kernel(
+            q_bytes,
+            weights,
+            tma_tensor_k,
+            k_tma_desc_ptrs,
+            use_patched_k_tma_desc,
+            k_scales,
+            real_page_table,
+            seqlens_per_query,
+            schedule_metadata,
+            active_width,
+            logits_out,
+            tma_atom_k,
+        ).launch(
+            grid=(
+                schedule_metadata.shape[0] - 1,
+                self.parallel_ctas,
+                1,
+            ),
+            block=[_PAGED_THREADS_PER_CTA, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        q_bytes: cute.Tensor,
+        weights: cute.Tensor,
+        k_tma_tensor: cute.Tensor,
+        k_tma_desc_ptrs: cute.Tensor,
+        use_patched_k_tma_desc: cute.Tensor,
+        k_scales: cute.Tensor,
+        real_page_table: cute.Tensor,
+        seqlens_per_query: cute.Tensor,
+        schedule_metadata: cute.Tensor,
+        active_width: cute.Tensor,
+        logits_out: cute.Tensor,
+        tma_atom_k: cute.CopyAtom,
+    ):
+        tx, _, _ = cute.arch.thread_idx()
+        interval_idx, cta_lane_idx, _ = cute.arch.block_idx()
+        lane = tx % Int32(_WARP_THREADS)
+        warp_idx = tx // Int32(_WARP_THREADS)
+
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class SharedStorage:
+            mbar_ptr_k: cute.struct.MemRange[cutlass.Int64, 1]
+            q_bytes: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint8, self.padded_q_heads * _INDEX_HEAD_DIM],
+                16,
+            ]
+            weights: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, self.padded_q_heads],
+                16,
+            ]
+            k_page: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint8, _PAGE_SIZE * _INDEX_HEAD_DIM],
+                1024,
+            ]
+            k_page_perm: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint8, _PAGE_SIZE * _INDEX_HEAD_DIM],
+                1024,
+            ]
+            scales: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, _PAGE_SIZE],
+                16,
+            ]
+            partial_logits: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, self.tokens_per_work * self.num_q_head_tiles],
+                16,
+            ]
+
+        width_tokens = Int32(real_page_table.shape[1]) * Int32(_PAGE_SIZE)
+        live_width = Int32(active_width[Int32(0)])
+        if live_width > width_tokens:
+            live_width = width_tokens
+        seq_len = Int32(seqlens_per_query[Int32(0)])
+        if seq_len > live_width:
+            seq_len = live_width
+        live_pages = (seq_len + Int32(_PAGE_SIZE - 1)) // Int32(_PAGE_SIZE)
+
+        start_q_idx = Int32(schedule_metadata[interval_idx, Int32(0)])
+        start_split_idx = Int32(schedule_metadata[interval_idx, Int32(1)])
+        end_q_idx = Int32(schedule_metadata[interval_idx + Int32(1), Int32(0)])
+        end_split_idx = Int32(schedule_metadata[interval_idx + Int32(1), Int32(1)])
+
+        interval_page_start = start_split_idx * Int32(self.schedule_pages_per_split)
+        interval_page_end = live_pages
+        if end_q_idx == Int32(0):
+            interval_page_end = end_split_idx * Int32(self.schedule_pages_per_split)
+            if interval_page_end > live_pages:
+                interval_page_end = live_pages
+
+        storage = smem.allocate(SharedStorage)
+        mbar_ptr_k = storage.mbar_ptr_k.data_ptr()
+        s_q = storage.q_bytes.get_tensor(
+            cute.make_layout((self.padded_q_heads, _INDEX_HEAD_DIM), stride=(_INDEX_HEAD_DIM, 1))
+        )
+        s_w = storage.weights.get_tensor(cute.make_layout((self.padded_q_heads,), stride=(1,)))
+        k_page_base_addr = shared_ptr_to_u32(storage.k_page.data_ptr())
+        k_page_perm_base_addr = shared_ptr_to_u32(storage.k_page_perm.data_ptr())
+        s_k_page_stage = storage.k_page.get_tensor(
+            cute.make_layout(
+                (_PAGE_SIZE, _INDEX_HEAD_DIM, 1),
+                stride=(_INDEX_HEAD_DIM, 1, _PAGE_SIZE * _INDEX_HEAD_DIM),
+            )
+        )
+        s_scale = storage.scales.get_tensor(cute.make_layout((_PAGE_SIZE,), stride=(1,)))
+        s_partial_logits = storage.partial_logits.get_tensor(
+            cute.make_layout(
+                (self.tokens_per_work, self.num_q_head_tiles),
+                stride=(self.num_q_head_tiles, 1),
+            )
+        )
+        load_k_tma, _, _ = copy_utils.tma_get_copy_fn(
+            tma_atom_k,
+            0,
+            cute.make_layout(1),
+            cute.local_tile(k_tma_tensor, (_PAGE_SIZE, _INDEX_HEAD_DIM), (0, 0, None)),
+            s_k_page_stage,
+        )
+        use_external_k_tma_desc = Int32(use_patched_k_tma_desc[Int32(0)])
+        k_tma_desc_ptr = Int64(k_tma_desc_ptrs[Int32(0)])
+
+        if (
+            start_q_idx == Int32(0)
+            and interval_page_start < interval_page_end
+            and cta_lane_idx < Int32(self.parallel_ctas)
+        ):
+            if tx == 0:
+                cute.arch.mbarrier_init(mbar_ptr_k, Int32(1))
+            if warp_idx == Int32(0) and use_external_k_tma_desc == Int32(0):
+                cpasync.prefetch_descriptor(tma_atom_k)
+
+            num_heads = Int32(self.num_heads_static)
+            q_linear = tx
+            total_q_bytes = Int32(self.padded_q_heads * _INDEX_HEAD_DIM)
+            while q_linear < total_q_bytes:
+                head_idx = q_linear // Int32(_INDEX_HEAD_DIM)
+                col_idx = q_linear - head_idx * Int32(_INDEX_HEAD_DIM)
+                s_q[head_idx, col_idx] = (
+                    q_bytes[Int32(0), head_idx, col_idx]
+                    if head_idx < num_heads
+                    else cutlass.Uint8(0)
+                )
+                q_linear += Int32(_PAGED_THREADS_PER_CTA)
+
+            w_linear = tx
+            while w_linear < Int32(self.padded_q_heads):
+                s_w[w_linear] = (
+                    Float32(weights[Int32(0), w_linear]) if w_linear < num_heads else Float32(0.0)
+                )
+                w_linear += Int32(_PAGED_THREADS_PER_CTA)
+            cute.arch.sync_threads()
+
+            producer_state = pipeline.PipelineStateSimple(1, Int32(0))
+            consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
+            head_tile_slot = warp_idx % Int32(self.num_q_head_tiles)
+            token_group = warp_idx // Int32(self.num_q_head_tiles)
+            page_col = interval_page_start + cta_lane_idx
+            while page_col < interval_page_end:
+                page_base = page_col * Int32(_PAGE_SIZE)
+                if page_base < seq_len:
+                    page_id = Int32(real_page_table[Int32(0), page_col])
+                    if page_id >= Int32(0):
+                        if warp_idx == Int32(0):
+                            _issue_index_k_tma_copy(
+                                load_k_tma,
+                                producer_state,
+                                mbar_ptr_k,
+                                Int32(_PAGE_SIZE * _INDEX_HEAD_DIM),
+                                page_id,
+                                k_page_base_addr,
+                                tma_desc_ptr=k_tma_desc_ptr,
+                                use_external_tma_desc=use_external_k_tma_desc,
+                            )
+                        scale_idx = tx
+                        while scale_idx < Int32(_PAGE_SIZE):
+                            s_scale[scale_idx] = Float32(k_scales[page_id, scale_idx])
+                            scale_idx += Int32(_PAGED_THREADS_PER_CTA)
+                        cute.arch.mbarrier_wait(
+                            mbar_ptr_k + consumer_state.index,
+                            phase=consumer_state.phase,
+                        )
+                        cute.arch.sync_threads()
+                        _repack_k_page_to_permuted(k_page_base_addr, k_page_perm_base_addr, tx)
+                        cute.arch.sync_threads()
+
+                        valid_slots = seq_len - page_base
+                        if valid_slots > Int32(_PAGE_SIZE):
+                            valid_slots = Int32(_PAGE_SIZE)
+                        split_idx = Int32(0)
+                        while split_idx < Int32(self.page_splits):
+                            token_base = (
+                                split_idx * Int32(self.tokens_per_work)
+                                + token_group * Int32(_PAGED_TOKENS_PER_GROUP)
+                            )
+                            zero_idx = tx
+                            while zero_idx < Int32(self.tokens_per_work * self.num_q_head_tiles):
+                                token_idx = zero_idx // Int32(self.num_q_head_tiles)
+                                head_tile_idx = zero_idx - token_idx * Int32(self.num_q_head_tiles)
+                                s_partial_logits[token_idx, head_tile_idx] = Float32(0.0)
+                                zero_idx += Int32(_PAGED_THREADS_PER_CTA)
+                            cute.arch.sync_threads()
+                            if token_base < valid_slots:
+                                head_tile_base = head_tile_slot * Int32(_PAGED_Q_HEAD_TILE)
+                                _compute_mxfp8_tile_partials(
+                                    s_q,
+                                    s_w,
+                                    num_heads,
+                                    k_page_perm_base_addr,
+                                    token_base,
+                                    head_tile_base,
+                                    lane,
+                                    s_partial_logits,
+                                    token_group * Int32(_PAGED_TOKENS_PER_GROUP),
+                                    head_tile_slot,
+                                )
+                            cute.arch.sync_threads()
+                            if head_tile_slot == Int32(0) and lane < Int32(_PAGED_TOKENS_PER_GROUP):
+                                slot_idx = token_base + lane
+                                if slot_idx < valid_slots:
+                                    logit = Float32(0.0)
+                                    head_tile_idx = Int32(0)
+                                    partial_row = token_group * Int32(_PAGED_TOKENS_PER_GROUP) + lane
+                                    while head_tile_idx < Int32(self.num_q_head_tiles):
+                                        logit = Float32(
+                                            logit + s_partial_logits[partial_row, head_tile_idx]
+                                        )
+                                        head_tile_idx += Int32(1)
+                                    logits_out[Int32(0), page_base + slot_idx] = Float32(
+                                        logit * s_scale[slot_idx]
+                                    )
+                            cute.arch.sync_threads()
+                            split_idx += Int32(1)
+                        producer_state.advance()
+                        consumer_state.advance()
+                        cute.arch.sync_threads()
+
+                page_col += Int32(self.parallel_ctas)
+
+
+class SparseNSAScheduledMultiRowLogitsKernel:
+    """Schedule-driven scorer for long multi-row decode."""
+
+    def __init__(self, parallel_ctas: int, num_heads_static: int):
+        self.parallel_ctas = int(parallel_ctas)
+        self.num_heads_static = int(num_heads_static)
+        self.num_q_head_tiles = _num_q_head_tiles(self.num_heads_static)
+        if self.num_q_head_tiles not in (1, 2, 4):
+            raise ValueError(
+                f"paged logits kernel only supports 1/2/4 head tiles, got {self.num_q_head_tiles}"
+            )
+        self.padded_q_heads = self.num_q_head_tiles * _PAGED_Q_HEAD_TILE
+        self.token_groups = _PAGED_WARPS_PER_CTA // self.num_q_head_tiles
+        self.tokens_per_work = _PAGED_TOKENS_PER_GROUP * self.token_groups
+        self.page_splits = _PAGE_SIZE // self.tokens_per_work
+        self.schedule_pages_per_split = int(PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT)
+
+    @cute.jit
+    def __call__(
+        self,
+        q_bytes: cute.Tensor,
+        weights: cute.Tensor,
+        k_quant_bytes: cute.Tensor,
+        k_tma_desc_ptrs: cute.Tensor,
+        use_patched_k_tma_desc: cute.Tensor,
+        k_scales: cute.Tensor,
+        real_page_table: cute.Tensor,
+        seqlens_per_query: cute.Tensor,
+        schedule_metadata: cute.Tensor,
+        active_width: cute.Tensor,
+        logits_out: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        k_tma_source = _make_paged_index_k_tma_source(k_quant_bytes)
+        tma_atom_k, tma_tensor_k = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
+            k_tma_source,
+            cute.make_layout((_PAGE_SIZE, _INDEX_HEAD_DIM), stride=(_INDEX_HEAD_DIM, 1)),
+            (_PAGE_SIZE, _INDEX_HEAD_DIM),
+            1,
+        )
+        self.kernel(
+            q_bytes,
+            weights,
+            tma_tensor_k,
+            k_tma_desc_ptrs,
+            use_patched_k_tma_desc,
+            k_scales,
+            real_page_table,
+            seqlens_per_query,
+            schedule_metadata,
+            active_width,
+            logits_out,
+            tma_atom_k,
+        ).launch(
+            grid=(
+                schedule_metadata.shape[0] - 1,
+                self.parallel_ctas,
+                1,
+            ),
+            block=[_PAGED_THREADS_PER_CTA, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        q_bytes: cute.Tensor,
+        weights: cute.Tensor,
+        k_tma_tensor: cute.Tensor,
+        k_tma_desc_ptrs: cute.Tensor,
+        use_patched_k_tma_desc: cute.Tensor,
+        k_scales: cute.Tensor,
+        real_page_table: cute.Tensor,
+        seqlens_per_query: cute.Tensor,
+        schedule_metadata: cute.Tensor,
+        active_width: cute.Tensor,
+        logits_out: cute.Tensor,
+        tma_atom_k: cute.CopyAtom,
+    ):
+        tx, _, _ = cute.arch.thread_idx()
+        interval_idx, cta_lane_idx, _ = cute.arch.block_idx()
+        lane = tx % Int32(_WARP_THREADS)
+        warp_idx = tx // Int32(_WARP_THREADS)
+
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class SharedStorage:
+            mbar_ptr_k: cute.struct.MemRange[cutlass.Int64, 1]
+            q_bytes: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint8, self.padded_q_heads * _INDEX_HEAD_DIM],
+                16,
+            ]
+            weights: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, self.padded_q_heads],
+                16,
+            ]
+            k_page: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint8, _PAGE_SIZE * _INDEX_HEAD_DIM],
+                1024,
+            ]
+            k_page_perm: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint8, _PAGE_SIZE * _INDEX_HEAD_DIM],
+                1024,
+            ]
+            scales: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, _PAGE_SIZE],
+                16,
+            ]
+            partial_logits: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, self.tokens_per_work * self.num_q_head_tiles],
+                16,
+            ]
+
+        width_tokens = Int32(real_page_table.shape[1]) * Int32(_PAGE_SIZE)
+        live_width = Int32(active_width[Int32(0)])
+        if live_width > width_tokens:
+            live_width = width_tokens
+        q_rows = Int32(seqlens_per_query.shape[0])
+        total_schedule_intervals = Int32(schedule_metadata.shape[0] - 1)
+        start_q_idx = Int32(schedule_metadata[interval_idx, Int32(0)])
+        start_split_idx = Int32(schedule_metadata[interval_idx, Int32(1)])
+        end_q_idx = Int32(schedule_metadata[interval_idx + Int32(1), Int32(0)])
+        end_split_idx = Int32(schedule_metadata[interval_idx + Int32(1), Int32(1)])
+
+        storage = smem.allocate(SharedStorage)
+        mbar_ptr_k = storage.mbar_ptr_k.data_ptr()
+        s_q = storage.q_bytes.get_tensor(
+            cute.make_layout((self.padded_q_heads, _INDEX_HEAD_DIM), stride=(_INDEX_HEAD_DIM, 1))
+        )
+        s_w = storage.weights.get_tensor(cute.make_layout((self.padded_q_heads,), stride=(1,)))
+        k_page_base_addr = shared_ptr_to_u32(storage.k_page.data_ptr())
+        k_page_perm_base_addr = shared_ptr_to_u32(storage.k_page_perm.data_ptr())
+        s_k_page_stage = storage.k_page.get_tensor(
+            cute.make_layout(
+                (_PAGE_SIZE, _INDEX_HEAD_DIM, 1),
+                stride=(_INDEX_HEAD_DIM, 1, _PAGE_SIZE * _INDEX_HEAD_DIM),
+            )
+        )
+        s_scale = storage.scales.get_tensor(cute.make_layout((_PAGE_SIZE,), stride=(1,)))
+        s_partial_logits = storage.partial_logits.get_tensor(
+            cute.make_layout(
+                (self.tokens_per_work, self.num_q_head_tiles),
+                stride=(self.num_q_head_tiles, 1),
+            )
+        )
+        load_k_tma, _, _ = copy_utils.tma_get_copy_fn(
+            tma_atom_k,
+            0,
+            cute.make_layout(1),
+            cute.local_tile(k_tma_tensor, (_PAGE_SIZE, _INDEX_HEAD_DIM), (0, 0, None)),
+            s_k_page_stage,
+        )
+        use_external_k_tma_desc = Int32(use_patched_k_tma_desc[Int32(0)])
+        k_tma_desc_ptr = Int64(k_tma_desc_ptrs[Int32(0)])
+
+        if interval_idx < total_schedule_intervals and cta_lane_idx < Int32(self.parallel_ctas):
+            if tx == 0:
+                cute.arch.mbarrier_init(mbar_ptr_k, Int32(1))
+            if warp_idx == Int32(0) and use_external_k_tma_desc == Int32(0):
+                cpasync.prefetch_descriptor(tma_atom_k)
+
+            num_heads = Int32(self.num_heads_static)
+            producer_state = pipeline.PipelineStateSimple(1, Int32(0))
+            consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
+            head_tile_slot = warp_idx % Int32(self.num_q_head_tiles)
+            token_group = warp_idx // Int32(self.num_q_head_tiles)
+            current_q_idx = start_q_idx
+            current_split_idx = start_split_idx
+
+            while current_q_idx < q_rows and (
+                current_q_idx < end_q_idx
+                or (current_q_idx == end_q_idx and end_split_idx > Int32(0))
+            ):
+                seq_len = Int32(seqlens_per_query[current_q_idx])
+                if seq_len > live_width:
+                    seq_len = live_width
+                live_pages = (seq_len + Int32(_PAGE_SIZE - 1)) // Int32(_PAGE_SIZE)
+                row_total_splits = (
+                    live_pages + Int32(self.schedule_pages_per_split - 1)
+                ) // Int32(self.schedule_pages_per_split)
+                row_split_start = current_split_idx if current_q_idx == start_q_idx else Int32(0)
+                row_split_end = row_total_splits
+                if current_q_idx == end_q_idx:
+                    row_split_end = end_split_idx
+                    if row_split_end > row_total_splits:
+                        row_split_end = row_total_splits
+
+                if row_split_start < row_split_end:
+                    q_linear = tx
+                    total_q_bytes = Int32(self.padded_q_heads * _INDEX_HEAD_DIM)
+                    while q_linear < total_q_bytes:
+                        head_idx = q_linear // Int32(_INDEX_HEAD_DIM)
+                        col_idx = q_linear - head_idx * Int32(_INDEX_HEAD_DIM)
+                        s_q[head_idx, col_idx] = (
+                            q_bytes[current_q_idx, head_idx, col_idx]
+                            if head_idx < num_heads
+                            else cutlass.Uint8(0)
+                        )
+                        q_linear += Int32(_PAGED_THREADS_PER_CTA)
+
+                    w_linear = tx
+                    while w_linear < Int32(self.padded_q_heads):
+                        s_w[w_linear] = (
+                            Float32(weights[current_q_idx, w_linear])
+                            if w_linear < num_heads
+                            else Float32(0.0)
+                        )
+                        w_linear += Int32(_PAGED_THREADS_PER_CTA)
+                    cute.arch.sync_threads()
+
+                    row_page_end = row_split_end * Int32(self.schedule_pages_per_split)
+                    if row_page_end > live_pages:
+                        row_page_end = live_pages
+                    page_col = row_split_start * Int32(self.schedule_pages_per_split) + cta_lane_idx
+                    while page_col < row_page_end:
+                        page_base = page_col * Int32(_PAGE_SIZE)
+                        if page_base < seq_len:
+                            page_id = Int32(real_page_table[current_q_idx, page_col])
+                            if page_id >= Int32(0):
+                                if warp_idx == Int32(0):
+                                    _issue_index_k_tma_copy(
+                                        load_k_tma,
+                                        producer_state,
+                                        mbar_ptr_k,
+                                        Int32(_PAGE_SIZE * _INDEX_HEAD_DIM),
+                                        page_id,
+                                        k_page_base_addr,
+                                        tma_desc_ptr=k_tma_desc_ptr,
+                                        use_external_tma_desc=use_external_k_tma_desc,
+                                    )
+                                scale_idx = tx
+                                while scale_idx < Int32(_PAGE_SIZE):
+                                    s_scale[scale_idx] = Float32(k_scales[page_id, scale_idx])
+                                    scale_idx += Int32(_PAGED_THREADS_PER_CTA)
+                                cute.arch.mbarrier_wait(
+                                    mbar_ptr_k + consumer_state.index,
+                                    phase=consumer_state.phase,
+                                )
+                                cute.arch.sync_threads()
+                                _repack_k_page_to_permuted(k_page_base_addr, k_page_perm_base_addr, tx)
+                                cute.arch.sync_threads()
+
+                                valid_slots = seq_len - page_base
+                                if valid_slots > Int32(_PAGE_SIZE):
+                                    valid_slots = Int32(_PAGE_SIZE)
+                                split_idx = Int32(0)
+                                while split_idx < Int32(self.page_splits):
+                                    token_base = (
+                                        split_idx * Int32(self.tokens_per_work)
+                                        + token_group * Int32(_PAGED_TOKENS_PER_GROUP)
+                                    )
+                                    zero_idx = tx
+                                    while zero_idx < Int32(
+                                        self.tokens_per_work * self.num_q_head_tiles
+                                    ):
+                                        token_idx = zero_idx // Int32(self.num_q_head_tiles)
+                                        head_tile_idx = (
+                                            zero_idx - token_idx * Int32(self.num_q_head_tiles)
+                                        )
+                                        s_partial_logits[token_idx, head_tile_idx] = Float32(0.0)
+                                        zero_idx += Int32(_PAGED_THREADS_PER_CTA)
+                                    cute.arch.sync_threads()
+                                    if token_base < valid_slots:
+                                        head_tile_base = head_tile_slot * Int32(_PAGED_Q_HEAD_TILE)
+                                        _compute_mxfp8_tile_partials(
+                                            s_q,
+                                            s_w,
+                                            num_heads,
+                                            k_page_perm_base_addr,
+                                            token_base,
+                                            head_tile_base,
+                                            lane,
+                                            s_partial_logits,
+                                            token_group * Int32(_PAGED_TOKENS_PER_GROUP),
+                                            head_tile_slot,
+                                        )
+                                    cute.arch.sync_threads()
+                                    if (
+                                        head_tile_slot == Int32(0)
+                                        and lane < Int32(_PAGED_TOKENS_PER_GROUP)
+                                    ):
+                                        slot_idx = token_base + lane
+                                        if slot_idx < valid_slots:
+                                            logit = Float32(0.0)
+                                            head_tile_idx = Int32(0)
+                                            partial_row = (
+                                                token_group * Int32(_PAGED_TOKENS_PER_GROUP) + lane
+                                            )
+                                            while head_tile_idx < Int32(self.num_q_head_tiles):
+                                                logit = Float32(
+                                                    logit
+                                                    + s_partial_logits[partial_row, head_tile_idx]
+                                                )
+                                                head_tile_idx += Int32(1)
+                                            logits_out[current_q_idx, page_base + slot_idx] = Float32(
+                                                logit * s_scale[slot_idx]
+                                            )
+                                    cute.arch.sync_threads()
+                                    split_idx += Int32(1)
+                                producer_state.advance()
+                                consumer_state.advance()
+                                cute.arch.sync_threads()
+
+                        page_col += Int32(self.parallel_ctas)
+
+                current_q_idx += Int32(1)
+                current_split_idx = Int32(0)
+
+
 @lru_cache(maxsize=32)
 def _build_sparse_nsa_paged_kernel(
     persistent_ctas: int,
     num_heads_static: int,
 ) -> SparseNSAPagedLogitsKernel:
     return SparseNSAPagedLogitsKernel(persistent_ctas, num_heads_static)
+
+
+@lru_cache(maxsize=16)
+def _build_sparse_nsa_schedule_single_row_kernel(
+    parallel_ctas: int,
+    num_heads_static: int,
+) -> SparseNSAScheduledSingleRowLogitsKernel:
+    return SparseNSAScheduledSingleRowLogitsKernel(parallel_ctas, num_heads_static)
+
+
+@lru_cache(maxsize=16)
+def _build_sparse_nsa_schedule_multi_row_kernel(
+    parallel_ctas: int,
+    num_heads_static: int,
+) -> SparseNSAScheduledMultiRowLogitsKernel:
+    return SparseNSAScheduledMultiRowLogitsKernel(parallel_ctas, num_heads_static)
 
 
 def _split_index_k_cache_runtime_views(index_k_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -789,6 +1437,8 @@ def _split_index_k_cache_runtime_views(index_k_cache: torch.Tensor) -> tuple[tor
 
 def clear_sparse_nsa_indexer_kernel_cache() -> None:
     _build_sparse_nsa_paged_kernel.cache_clear()
+    _build_sparse_nsa_schedule_single_row_kernel.cache_clear()
+    _build_sparse_nsa_schedule_multi_row_kernel.cache_clear()
     cache = getattr(_get_cached_paged_index_k_tma_descriptor, "_cache", None)
     if cache is not None:
         cache.clear()
@@ -854,6 +1504,7 @@ def run_sparse_nsa_paged_logits_kernel(
     index_k_cache: torch.Tensor,
     real_page_table: torch.Tensor,
     seqlens_per_query: torch.Tensor,
+    schedule_metadata: torch.Tensor | None,
     active_width: torch.Tensor | None = None,
     active_width_hint: int | None = None,
     page_size: int = _PAGE_SIZE,
@@ -907,16 +1558,8 @@ def run_sparse_nsa_paged_logits_kernel(
         dtype=torch.float32,
         device=q_fp8.device,
     )
-
-    persistent_ctas = _resolve_sparse_nsa_persistent_ctas(
-        device_index=q_fp8.device.index or 0,
-        q_rows=rows,
-        num_heads=q_fp8.shape[1],
-        width_tokens=width_tokens,
-        active_width_hint=active_width_hint,
-    )
-    kernel = _build_sparse_nsa_paged_kernel(persistent_ctas, q_fp8.shape[1])
-    args = (
+    _cp = contract_phantoms or {}
+    common_args = (
         _to_kernel_tensor(q_bytes, cutlass.Uint8),
         _to_kernel_tensor(weights.contiguous(), cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(k_quant_bytes, cutlass.Uint8),
@@ -925,13 +1568,8 @@ def run_sparse_nsa_paged_logits_kernel(
         _to_kernel_tensor(k_scales, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(real_page_table.contiguous(), cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(seqlens_per_query.contiguous(), cutlass.Int32, assumed_align=4),
-        _to_kernel_tensor(active_width.contiguous(), cutlass.Int32, assumed_align=4),
-        _to_kernel_tensor(logits, cutlass.Float32, assumed_align=4),
-        current_cuda_stream(),
     )
-    _cp = contract_phantoms or {}
-    cache_key = (
-        persistent_ctas,
+    common_cache_key = (
         q_fp8.shape[1],
         _tensor_meta_key(_cp.get("q_bytes", q_bytes)),
         _tensor_meta_key(_cp.get("weights", weights)),
@@ -944,5 +1582,66 @@ def run_sparse_nsa_paged_logits_kernel(
         _tensor_meta_key(active_width),
         _tensor_meta_key(_cp.get("logits", logits)),
     )
+    max_pages = int(real_page_table.shape[1])
+    if _should_use_schedule_single_row_kernel(q_rows=rows, max_pages=max_pages):
+        if schedule_metadata is None:
+            raise ValueError("schedule_metadata is required for the scheduled single-row decode path")
+        kernel = _build_sparse_nsa_schedule_single_row_kernel(
+            _SCHEDULE_SINGLE_ROW_PARALLEL_CTAS,
+            q_fp8.shape[1],
+        )
+        args = (
+            *common_args,
+            _to_kernel_tensor(schedule_metadata.contiguous(), cutlass.Int32, assumed_align=4),
+            _to_kernel_tensor(active_width.contiguous(), cutlass.Int32, assumed_align=4),
+            _to_kernel_tensor(logits, cutlass.Float32, assumed_align=4),
+            current_cuda_stream(),
+        )
+        cache_key = (
+            "schedule_single_row",
+            _SCHEDULE_SINGLE_ROW_PARALLEL_CTAS,
+            *common_cache_key,
+            _tensor_meta_key(schedule_metadata),
+        )
+    elif _should_use_schedule_multi_row_kernel(q_rows=rows, max_pages=max_pages):
+        if schedule_metadata is None:
+            raise ValueError("schedule_metadata is required for the scheduled multi-row decode path")
+        kernel = _build_sparse_nsa_schedule_multi_row_kernel(
+            _SCHEDULE_MULTI_ROW_PARALLEL_CTAS,
+            q_fp8.shape[1],
+        )
+        args = (
+            *common_args,
+            _to_kernel_tensor(schedule_metadata.contiguous(), cutlass.Int32, assumed_align=4),
+            _to_kernel_tensor(active_width.contiguous(), cutlass.Int32, assumed_align=4),
+            _to_kernel_tensor(logits, cutlass.Float32, assumed_align=4),
+            current_cuda_stream(),
+        )
+        cache_key = (
+            "schedule_multi_row",
+            _SCHEDULE_MULTI_ROW_PARALLEL_CTAS,
+            *common_cache_key,
+            _tensor_meta_key(schedule_metadata),
+        )
+    else:
+        persistent_ctas = _resolve_sparse_nsa_persistent_ctas(
+            device_index=device_index,
+            q_rows=rows,
+            num_heads=q_fp8.shape[1],
+            width_tokens=width_tokens,
+            active_width_hint=active_width_hint,
+        )
+        kernel = _build_sparse_nsa_paged_kernel(persistent_ctas, q_fp8.shape[1])
+        args = (
+            *common_args,
+            _to_kernel_tensor(active_width.contiguous(), cutlass.Int32, assumed_align=4),
+            _to_kernel_tensor(logits, cutlass.Float32, assumed_align=4),
+            current_cuda_stream(),
+        )
+        cache_key = (
+            "persistent",
+            persistent_ctas,
+            *common_cache_key,
+        )
     _run_cached_host_launcher(kernel, cache_key, args)
     return logits
