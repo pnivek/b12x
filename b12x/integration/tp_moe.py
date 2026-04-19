@@ -28,6 +28,7 @@ from b12x.moe.fused.silu import (
     MoEStaticKernelSilu,
 )
 from b12x.moe.tuning import lookup_max_active_clusters
+from b12x.runtime_control import raise_if_kernel_resolution_frozen
 
 _NVFP4_BLOCK_SIZE = 16
 _RUNTIME_MEMREF_LIMIT = (1 << 31) - 1
@@ -1410,6 +1411,7 @@ def _get_static_kernel(
     token_weights_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype, (state_E, max_rows), stride_order=(1, 0), assumed_align=16,
     )
+    raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=cache_key)
     compiled = cute.compile(
         kernel,
         a_input_fake, topk_ids_fake, topk_weights_fake,
@@ -1564,6 +1566,7 @@ def _get_micro_kernel(
     token_weights_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype, (state_E, max_rows), stride_order=(1, 0), assumed_align=16,
     )
+    raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=cache_key)
     compiled = cute.compile(
         kernel,
         a_input_fake, topk_ids_fake, topk_weights_fake,
@@ -1818,6 +1821,7 @@ def _get_dynamic_kernel(
     scatter_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     token_map_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
     token_weights_fake = make_ptr(alpha_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=cache_key)
     compiled = cute.compile(
         launch,
         a_input_fake, topk_ids_fake, topk_weights_fake,

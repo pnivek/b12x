@@ -28,6 +28,7 @@ from b12x.cute.fp4 import (
     shared_ptr_to_u32,
     st_shared_v4_u32,
 )
+from b12x.runtime_control import raise_if_kernel_resolution_frozen
 from b12x.cute.utils import current_cuda_stream
 
 
@@ -93,6 +94,11 @@ def _run_cached_host_launcher(
 ) -> None:
     cache, compiled = _launcher_cache_lookup(kernel, cache_key)
     if compiled is None:
+        raise_if_kernel_resolution_frozen(
+            "eager host launcher compile",
+            target=kernel,
+            cache_key=cache_key,
+        )
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",

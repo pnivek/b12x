@@ -55,6 +55,7 @@ from b12x.cute.utils import (
     sm120_make_smem_layout_sfa,
     sm120_make_smem_layout_sfb,
 )
+from b12x.runtime_control import raise_if_kernel_resolution_frozen
 
 
 # Workaround for nvidia-cutlass-dsl 4.4.1 bug:
@@ -1667,25 +1668,31 @@ def _get_compiled_dense_gemm(
             make_ptr(alpha_dtype, alpha_data_ptr, cute.AddressSpace.gmem, assumed_align=16),
         ]
 
+    launch = _DenseGemmLaunch(
+        m=m,
+        n=n,
+        k=k,
+        l=l,
+        a_major=a_major,
+        b_major=b_major,
+        c_major=c_major,
+        ab_dtype=ab_dtype,
+        sf_dtype=sf_dtype,
+        c_dtype=c_dtype,
+        alpha_dtype=alpha_dtype,
+        sf_vec_size=sf_vec_size,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        sm_count=sm_count,
+        sm_version=sm_version,
+    )
+    raise_if_kernel_resolution_frozen(
+        "cute.compile",
+        target=launch,
+        cache_key=(m, n, k, l, mma_tiler_mn, cluster_shape_mn, sm_count, sm_version),
+    )
     compiled_kernel = cute.compile(
-        _DenseGemmLaunch(
-            m=m,
-            n=n,
-            k=k,
-            l=l,
-            a_major=a_major,
-            b_major=b_major,
-            c_major=c_major,
-            ab_dtype=ab_dtype,
-            sf_dtype=sf_dtype,
-            c_dtype=c_dtype,
-            alpha_dtype=alpha_dtype,
-            sf_vec_size=sf_vec_size,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            sm_count=sm_count,
-            sm_version=sm_version,
-        ),
+        launch,
         *_make_runtime_pointers(None),
         current_cuda_stream(),
     )
