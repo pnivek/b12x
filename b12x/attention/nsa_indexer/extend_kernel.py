@@ -11,7 +11,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32, Uint32
+from cutlass import Boolean, Float32, Int32, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import Int64, dsl_user_op
@@ -280,24 +280,38 @@ def _zero_score_frag(score_frag: cute.Tensor) -> None:
     for reg_id in cutlass.range_constexpr(8):
         score_frag[0, 0, reg_id] = Float32(0.0)
 
-
 @cute.jit
-def _pack_q_mxfp8_reg(
-    s_q_bytes: cute.Tensor,
-    row: Int32,
+def _pack_q_mxfp8_reg_global(
+    q_u32: cute.Tensor,
+    head_idx: Int32,
+    abs_row: Int32,
     col_pair_base: Int32,
+    valid_q_rows: Int32,
 ) -> Uint32:
-    b0 = Uint32(s_q_bytes[row, col_pair_base + Int32(0)])
-    b1 = Uint32(s_q_bytes[row, col_pair_base + Int32(1)])
-    b2 = Uint32(s_q_bytes[row, col_pair_base + Int32(8)])
-    b3 = Uint32(s_q_bytes[row, col_pair_base + Int32(9)])
-    return b0 | (b1 << Int32(8)) | (b2 << Int32(16)) | (b3 << Int32(24))
+    """Pack 4 FP8 bytes from global q_u32 into one MMA register word.
+
+    Original smem path accessed s_q_bytes[row, col_pair_base+{0,1,8,9}].
+    Global view is u32, so we read two u32 values and extract the same
+    4 bytes via shifts.  Uses cutlass.select_ to avoid early return
+    (not allowed in CuTe JIT functions).
+    """
+    u32_idx_lo = col_pair_base // Int32(4)
+    u32_idx_hi = u32_idx_lo + Int32(2)
+    byte_shift = (col_pair_base % Int32(4)) * Int32(8)
+    lo = Uint32(q_u32[abs_row, head_idx, u32_idx_lo]) if abs_row < valid_q_rows else Uint32(0)
+    hi = Uint32(q_u32[abs_row, head_idx, u32_idx_hi]) if abs_row < valid_q_rows else Uint32(0)
+    lo_half = (lo >> byte_shift) & Uint32(0xFFFF)
+    hi_half = ((hi >> byte_shift) & Uint32(0xFFFF)) << Int32(16)
+    return lo_half | hi_half
 
 
 @cute.jit
 def _literal_qk_mma_into_sfrag_mxfp8_raw(
     s_frag: cute.Tensor,
-    s_q_bytes: cute.Tensor,
+    q_u32: cute.Tensor,
+    head_idx: Int32,
+    q_tile_base: Int32,
+    valid_q_rows: Int32,
     k_base_addr: Int32,
     lane,
     warp_q_idx,
@@ -306,7 +320,6 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
     num_mma_q,
     num_mma_kv,
     num_mma_d_qk,
-    upcast_stride_q,
     upcast_stride_k,
 ):
     unit_scale = Uint32(0x7F7F7F7F)
@@ -325,15 +338,18 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
         col_base = Int32(mma_pair * 32) + thread_id_in_group * Int32(2)
         for mma_q in cutlass.range_constexpr(num_mma_q):
             row_base_q = warp_q_idx * Int32(16) + mma_q * Int32(16)
-            q_regs[mma_q, 0] = _pack_q_mxfp8_reg(s_q_bytes, row_base_q + group_id, col_base)
-            q_regs[mma_q, 1] = _pack_q_mxfp8_reg(
-                s_q_bytes, row_base_q + group_id + Int32(8), col_base
+            abs_row_0 = q_tile_base + row_base_q + group_id
+            q_regs[mma_q, 0] = _pack_q_mxfp8_reg_global(
+                q_u32, head_idx, abs_row_0, col_base, valid_q_rows
             )
-            q_regs[mma_q, 2] = _pack_q_mxfp8_reg(
-                s_q_bytes, row_base_q + group_id, col_base + Int32(16)
+            q_regs[mma_q, 1] = _pack_q_mxfp8_reg_global(
+                q_u32, head_idx, abs_row_0 + Int32(8), col_base, valid_q_rows
             )
-            q_regs[mma_q, 3] = _pack_q_mxfp8_reg(
-                s_q_bytes, row_base_q + group_id + Int32(8), col_base + Int32(16)
+            q_regs[mma_q, 2] = _pack_q_mxfp8_reg_global(
+                q_u32, head_idx, abs_row_0, col_base + Int32(16), valid_q_rows
+            )
+            q_regs[mma_q, 3] = _pack_q_mxfp8_reg_global(
+                q_u32, head_idx, abs_row_0 + Int32(8), col_base + Int32(16), valid_q_rows
             )
 
         k_offset_cur = k_offset
@@ -394,36 +410,6 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
 
 
 @cute.jit
-def _stage_q_tile_raw(
-    q_u32: cute.Tensor,
-    head_idx: Int32,
-    q_tile_base: Int32,
-    q_base_addr: Int32,
-    valid_q_rows: Int32,
-    lane: Int32,
-):
-    linear = lane
-    total = Int32(_BLOCK_Q * _FP8_ROW_VECS)
-    while linear < total:
-        row = linear // Int32(_FP8_ROW_VECS)
-        vec_idx = linear - row * Int32(_FP8_ROW_VECS)
-        q_row = q_tile_base + row
-        dst_addr = q_base_addr + row * Int32(_INDEX_HEAD_DIM) + vec_idx * Int32(16)
-        v0 = Uint32(0)
-        v1 = Uint32(0)
-        v2 = Uint32(0)
-        v3 = Uint32(0)
-        if q_row < valid_q_rows:
-            src_u32 = vec_idx * Int32(4)
-            v0 = Uint32(q_u32[q_row, head_idx, src_u32 + Int32(0)])
-            v1 = Uint32(q_u32[q_row, head_idx, src_u32 + Int32(1)])
-            v2 = Uint32(q_u32[q_row, head_idx, src_u32 + Int32(2)])
-            v3 = Uint32(q_u32[q_row, head_idx, src_u32 + Int32(3)])
-        st_shared_v4_u32(dst_addr, v0, v1, v2, v3)
-        linear += Int32(_THREADS_PER_CTA)
-
-
-@cute.jit
 def _repack_k_tile_to_permuted(
     k_linear_base_addr: Int32,
     k_perm_base_addr: Int32,
@@ -445,7 +431,10 @@ def _repack_k_tile_to_permuted(
 
 
 class SparseNSAExtendLogitsKernel:
-    """Tile-wise ragged logits kernel with TMA K staging and tensor-core inner loops."""
+    """Ragged logits kernel with Q and weights read from global memory.
+
+    Phase 1 only: Q and weights read from global (no per-head smem staging or syncs).
+    """
 
     @cute.jit
     def __call__(
@@ -515,12 +504,8 @@ class SparseNSAExtendLogitsKernel:
         @cute.struct
         class SharedStorage:
             mbar_ptr_k: cute.struct.MemRange[cutlass.Int64, 1]
-            q_tile: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint8, _BLOCK_Q * _INDEX_HEAD_DIM],
-                16,
-            ]
-            weights: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, _BLOCK_Q],
+            tile_live: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, 1],
                 16,
             ]
             k_linear: cute.struct.Align[
@@ -546,16 +531,12 @@ class SparseNSAExtendLogitsKernel:
 
         storage = smem.allocate(SharedStorage)
         mbar_ptr_k = storage.mbar_ptr_k.data_ptr()
-        q_base_addr = shared_ptr_to_u32(storage.q_tile.data_ptr())
         k_linear_base_addr = shared_ptr_to_u32(storage.k_linear.data_ptr())
         k_perm_base_addr = shared_ptr_to_u32(storage.k_perm.data_ptr())
-        s_weights = storage.weights.get_tensor(cute.make_layout((_BLOCK_Q,), stride=(1,)))
         s_scales = storage.scales.get_tensor(cute.make_layout((_BLOCK_K,), stride=(1,)))
         s_k_start = storage.k_start.get_tensor(cute.make_layout((_BLOCK_Q,), stride=(1,)))
         s_k_end = storage.k_end.get_tensor(cute.make_layout((_BLOCK_Q,), stride=(1,)))
-        s_q_bytes = storage.q_tile.get_tensor(
-            cute.make_layout((_BLOCK_Q, _INDEX_HEAD_DIM), stride=(_INDEX_HEAD_DIM, 1))
-        )
+        s_tile_live = storage.tile_live.get_tensor(cute.make_layout((1,), stride=(1,)))
         s_k_linear_bytes = storage.k_linear.get_tensor(
             cute.make_layout((_BLOCK_K * _INDEX_HEAD_DIM,), stride=(1,))
         )
@@ -570,21 +551,21 @@ class SparseNSAExtendLogitsKernel:
             row_linear += Int32(_THREADS_PER_CTA)
         cute.arch.sync_threads()
 
-        if tx == 0:
+        # Phase 2: Parallel liveness via warp ballot
+        # Warp 0 threads (tx 0-31) each check one Q-row; ballot
+        # combines all 32 predicates in one hardware instruction.
+        if warp_idx == Int32(0):
             tile_k_end = k_tile_base + Int32(_BLOCK_K)
             if tile_k_end > k_total_rows:
                 tile_k_end = k_total_rows
-            tile_live = Int32(0)
-            if k_tile_base < tile_k_end:
-                for row_idx in cutlass.range_constexpr(_BLOCK_Q):
-                    row_start = Int32(s_k_start[row_idx])
-                    row_end = Int32(s_k_end[row_idx])
-                    row_live = cutlass.select_(row_end > k_tile_base, Int32(1), Int32(0))
-                    row_live = cutlass.select_(row_start < tile_k_end, row_live, Int32(0))
-                    tile_live = cutlass.select_(row_live != Int32(0), Int32(1), tile_live)
-            s_q_bytes[Int32(0), Int32(0)] = cutlass.Int8(tile_live)
+            row_start = Int32(s_k_start[tx])
+            row_end = Int32(s_k_end[tx])
+            row_live = (row_end > k_tile_base) & (row_start < tile_k_end) & (k_tile_base < tile_k_end)
+            ballot = cute.arch.vote_ballot_sync(Boolean(row_live))
+            if tx == Int32(0):
+                s_tile_live[Int32(0)] = ballot
         cute.arch.sync_threads()
-        if Int32(s_q_bytes[Int32(0), Int32(0)]) != Int32(0):
+        if s_tile_live[Int32(0)] != Int32(0):
             producer_state = pipeline.PipelineStateSimple(1, Int32(0))
             consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
             if warp_idx == Int32(0):
@@ -620,22 +601,14 @@ class SparseNSAExtendLogitsKernel:
 
             head_idx = Int32(0)
             while head_idx < num_heads:
-                _stage_q_tile_raw(q_u32, head_idx, q_tile_base, q_base_addr, valid_q_rows, tx)
-
-                weight_linear = tx
-                while weight_linear < Int32(_BLOCK_Q):
-                    q_row = q_tile_base + weight_linear
-                    s_weights[weight_linear] = (
-                        Float32(weights[q_row, head_idx]) if q_row < valid_q_rows else Float32(0.0)
-                    )
-                    weight_linear += Int32(_THREADS_PER_CTA)
-                cute.arch.sync_threads()
-
                 score_frag = cute.make_rmem_tensor(frag_layout, Float32)
                 _zero_score_frag(score_frag)
                 _literal_qk_mma_into_sfrag_mxfp8_raw(
                     score_frag,
-                    s_q_bytes,
+                    q_u32,
+                    head_idx,
+                    q_tile_base,
+                    valid_q_rows,
                     k_perm_base_addr,
                     lane,
                     warp_q_idx,
@@ -644,7 +617,6 @@ class SparseNSAExtendLogitsKernel:
                     Int32(1),
                     Int32(1),
                     Int32(_INDEX_HEAD_DIM // 16),
-                    Int32(0),
                     Int32(_FP8_ROW_VECS),
                 )
                 lane_group = lane // Int32(4)
@@ -655,9 +627,12 @@ class SparseNSAExtendLogitsKernel:
                         acc_frag[0, 0, reg_id] = Float32(
                             acc_frag[0, 0, reg_id]
                             + attention_utils.fmax(score_frag[0, 0, reg_id], Float32(0.0))
-                            * s_weights[q_local]
+                            * (
+                        Float32(weights[q_tile_base + q_local, head_idx])
+                        if q_tile_base + q_local < valid_q_rows
+                        else Float32(0.0)
+                    )
                         )
-                cute.arch.sync_threads()
                 head_idx += Int32(1)
 
             lane_group = lane // Int32(4)
