@@ -877,19 +877,22 @@ def _make_exact_relu2_bs1_nemotron_plan(
     *,
     device: torch.device,
     dtype: torch.dtype,
+    num_tokens: int = 1,
 ) -> TPMoEPlan:
+    num_topk = 22
+    total_pairs = num_topk * num_tokens
     return TPMoEPlan(
         implementation="static",
-        state_E=22,
+        state_E=total_pairs,
         weight_E=512,
-        routed_rows=22,
-        max_rows=22,
+        routed_rows=total_pairs,
+        max_rows=total_pairs,
         k=1024,
         n=2688,
-        num_topk=22,
+        num_topk=num_topk,
         device=device,
         dtype=dtype,
-        max_tokens_per_launch=1,
+        max_tokens_per_launch=num_tokens,
     )
 
 
@@ -1859,17 +1862,25 @@ def _is_exact_relu2_bs1_nemotron_case(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
 ) -> bool:
-    return (
+    if not (
         activation == "relu2"
         and a.dtype == torch.bfloat16
-        and a.shape == (1, 1024)
+        and a.dim() == 2
+        and a.shape[1] == 1024
         and w1_fp4.shape == (512, 2688, 512)
         and w2_fp4.shape == (512, 1024, 1344)
-        and topk_ids.shape == (1, 22)
-        and topk_weights.shape == (1, 22)
+        and topk_ids.dim() == 2
+        and topk_ids.shape[1] == 22
+        and topk_weights.shape == topk_ids.shape
         and a1_gscale.numel() == 1
         and a2_gscale.numel() == 1
-    )
+    ):
+        return False
+    num_tokens = a.shape[0]
+    # Specialized decode path supports bs=1 and bs=2 (the common chatbot
+    # single-request / speculative-verify regime). Larger batches go through
+    # the generic static/dynamic path.
+    return num_tokens in (1, 2) and topk_ids.shape[0] == num_tokens
 
 
 def _get_exact_relu2_bs1_nemotron_launcher(
@@ -1888,13 +1899,17 @@ def _get_exact_relu2_bs1_nemotron_launcher(
     fast_math: bool,
 ) -> _ExactRelu2Bs1NemotronLauncher:
     global _LAST_EXACT_RELU2_BS1_NEMOTRON
-    plan = _make_exact_relu2_bs1_nemotron_plan(device=a.device, dtype=a.dtype)
+    num_tokens = int(a.shape[0])
+    plan = _make_exact_relu2_bs1_nemotron_plan(
+        device=a.device, dtype=a.dtype, num_tokens=num_tokens,
+    )
     cache_key = (
         plan.device.index or 0,
         plan.dtype,
         topk_ids_dtype,
         input_scales_are_reciprocal,
         fast_math,
+        num_tokens,
         w1_fp4.data_ptr(),
         w1_blockscale.data_ptr(),
         w1_alphas.data_ptr(),
@@ -1934,7 +1949,7 @@ def _get_exact_relu2_bs1_nemotron_launcher(
     compiled, mac = _get_micro_kernel(
         plan.state_E,
         plan.weight_E,
-        1,
+        num_tokens,
         plan.k,
         plan.n,
         plan.num_topk,

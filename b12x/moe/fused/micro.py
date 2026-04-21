@@ -881,12 +881,18 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                 barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
             )
 
+        # Whether the single_token path needs a true pair_idx//num_topk. For
+        # bs=1 this is constantly 0, so keep the Int32(0) hot path.
+        _single_token_multi = self.single_token and a_input.shape[0] > 1
         pair_idx = Int32(bidz)
         while pair_idx < total_pairs:
-            token_idx = Int32(0)
+            if cutlass.const_expr(self.single_token and not _single_token_multi):
+                # bs=1 single_token: token is always 0; preserves original codegen.
+                token_idx = Int32(0)
+            else:
+                token_idx = pair_idx // num_topk
             weight = cutlass.Float32(0.0)
             if cutlass.const_expr(not self.single_token):
-                token_idx = pair_idx // num_topk
                 weight = topk_weights[pair_idx].to(cutlass.Float32)
 
             expert_id = Int32(0)
@@ -923,9 +929,18 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
             packed_local_expert_id = local_expert_id
             packed_row = row
             if cutlass.const_expr(self.share_input_across_experts):
-                should_quantize = Int32(1) if pair_idx == Int32(0) else Int32(0)
-                packed_local_expert_id = Int32(0)
-                packed_row = Int32(0)
+                if cutlass.const_expr(not _single_token_multi):
+                    # bs=1 single_token share_input: one token, one quant.
+                    should_quantize = Int32(1) if pair_idx == Int32(0) else Int32(0)
+                    packed_local_expert_id = Int32(0)
+                    packed_row = Int32(0)
+                else:
+                    # bs>=2 single_token share_input: quantize each unique token
+                    # exactly once (first pair of each token); packed_row carries
+                    # the token index into packed_a[0, token, :].
+                    should_quantize = Int32(1) if (pair_idx % num_topk == Int32(0)) else Int32(0)
+                    packed_local_expert_id = Int32(0)
+                    packed_row = pair_idx // num_topk
             if should_quantize > Int32(0):
                 scale_idx = Int32(0) if cutlass.const_expr(self.share_expert_scales) else expert_id
                 gs_value = input_global_scale[scale_idx].to(cutlass.Float32)
@@ -1163,7 +1178,16 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                         weight_expert_idx = topk_ids[local_expert_idx].to(Int32)
                     else:
                         weight_expert_idx = weight_expert_ids[local_expert_idx]
-                    valid_rows = Int32(1)
+                    # Share_input single_token: packed_a holds one row per
+                    # token; sweep all num_tokens rows so every token gets
+                    # activated+quantized+fc2'd before the scatter picks the
+                    # work unit's unique_tok row.
+                    # Non-share single_token: each pair has its own slot with
+                    # a single valid row — stays at 1.
+                    if cutlass.const_expr(self.share_input_across_experts):
+                        valid_rows = Int32(a_input.shape[0])
+                    else:
+                        valid_rows = Int32(1)
                 else:
                     weight_expert_idx = weight_expert_ids[local_expert_idx]
                     valid_rows = row_counts[local_expert_idx]
@@ -1689,6 +1713,17 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                             epi_rows = Int32(0)
                         pair_cols_per_row = Int32(self.tile_shape_mnk[1] // 2)
 
+                        # Decide at Python-time whether the scatter needs a
+                        # runtime local_row==unique_tok gate. Only bs>=2 with
+                        # single_token+share_input needs it; bs=1 single_token
+                        # has epi_rows=1 so local_row is structurally 0 and
+                        # unique_tok is 0, matching automatically. Keeping this
+                        # as a const_expr branch preserves bs=1 codegen.
+                        _needs_row_gate = (
+                            self.single_token
+                            and self.share_input_across_experts
+                            and a_input.shape[0] > 1
+                        )
                         pair_idx = Int32(tidx)
                         while pair_idx < epi_rows * pair_cols_per_row:
                             local_row = pair_idx // pair_cols_per_row
@@ -1703,24 +1738,45 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                             else:
                                 tok = _ld_shared_i32(scatter_tok_base_addr + cached_row * Int32(4))
                                 wv = _ld_shared_f32(scatter_weight_base_addr + cached_row * Int32(4))
-                            sc_v0 = cutlass.Float32(
-                                sC[local_row, local_pair_col * Int32(2), epi_buffer]
-                            )
-                            sc_v1 = cutlass.Float32(
-                                sC[local_row, local_pair_col * Int32(2) + Int32(1), epi_buffer]
-                            )
-                            if cutlass.const_expr(_per_cta_accum):
-                                # Accumulate in fp32 registers. One thread owns
-                                # one (output_tile_idx, pair); we emit the bf16
-                                # atomic_add once after the work loop.
-                                cta_acc[output_tile_idx, 0] += wv * sc_v0
-                                cta_acc[output_tile_idx, 1] += wv * sc_v1
+                            if cutlass.const_expr(_needs_row_gate):
+                                # bs>=2 single-token: threads split by local_row
+                                # own distinct (token, col) accumulators; only
+                                # contribute to the row matching this work unit's
+                                # unique_tok.
+                                if Int32(local_row) == unique_tok:
+                                    sc_v0 = cutlass.Float32(
+                                        sC[local_row, local_pair_col * Int32(2), epi_buffer]
+                                    )
+                                    sc_v1 = cutlass.Float32(
+                                        sC[local_row, local_pair_col * Int32(2) + Int32(1), epi_buffer]
+                                    )
+                                    if cutlass.const_expr(_per_cta_accum):
+                                        cta_acc[output_tile_idx, 0] += wv * sc_v0
+                                        cta_acc[output_tile_idx, 1] += wv * sc_v1
+                                    else:
+                                        scatter_add_bf16x2(
+                                            get_ptr_as_int64(scatter_output, tok * scatter_N + global_col),
+                                            wv * sc_v0,
+                                            wv * sc_v1,
+                                        )
                             else:
-                                scatter_add_bf16x2(
-                                    get_ptr_as_int64(scatter_output, tok * scatter_N + global_col),
-                                    wv * sc_v0,
-                                    wv * sc_v1,
+                                sc_v0 = cutlass.Float32(
+                                    sC[local_row, local_pair_col * Int32(2), epi_buffer]
                                 )
+                                sc_v1 = cutlass.Float32(
+                                    sC[local_row, local_pair_col * Int32(2) + Int32(1), epi_buffer]
+                                )
+                                if cutlass.const_expr(_per_cta_accum):
+                                    # bs=1 single-token: accumulate in fp32 regs;
+                                    # emit one bf16x2 atomic after the work loop.
+                                    cta_acc[output_tile_idx, 0] += wv * sc_v0
+                                    cta_acc[output_tile_idx, 1] += wv * sc_v1
+                                else:
+                                    scatter_add_bf16x2(
+                                        get_ptr_as_int64(scatter_output, tok * scatter_N + global_col),
+                                        wv * sc_v0,
+                                        wv * sc_v1,
+                                    )
                             pair_idx += Int32(self.num_mma_warps * self.num_threads_per_warp)
 
                         # Post-scatter barrier: needed to ensure all warps
@@ -1753,22 +1809,36 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                         cta_id_in_cluster=cta_id_in_cluster,
                     )
 
-            # Final scatter pass: each active thread (tidx < pair_cols_per_row)
-            # emits one bf16x2 atomic per output tile from its fp32 accumulator.
-            # For 64 active threads × output_tile_cnt=8 this is 512 atomics per
-            # CTA (vs ~5600 per CTA before). Single-token share-input means all
-            # contributions land at scatter_output[0, :].
+            # Final scatter pass. Thread T owns (row = T//pair_cols,
+            # col = (T % pair_cols) * 2) across all output_tiles. For
+            # num_tokens=1 we take a no-row-math hot path that preserves bs=1
+            # codegen; for num_tokens>1 the thread maps its tidx to a row/col
+            # pair over both tokens.
             if cutlass.const_expr(_per_cta_accum):
                 _final_pair_cols = Int32(self.tile_shape_mnk[1] // 2)
                 _scatter_N = Int32(scatter_output.shape[1])
-                if Int32(tidx) < _final_pair_cols:
-                    for _ot in cutlass.range_constexpr(output_tile_cnt):
-                        _gcol = Int32(_ot) * Int32(self.tile_shape_mnk[1]) + Int32(tidx) * Int32(2)
-                        scatter_add_bf16x2(
-                            get_ptr_as_int64(scatter_output, _gcol),
-                            cta_acc[_ot, 0],
-                            cta_acc[_ot, 1],
-                        )
+                _acc_num_tokens = a_input.shape[0]
+                if cutlass.const_expr(_acc_num_tokens == 1):
+                    if Int32(tidx) < _final_pair_cols:
+                        for _ot in cutlass.range_constexpr(output_tile_cnt):
+                            _gcol = Int32(_ot) * Int32(self.tile_shape_mnk[1]) + Int32(tidx) * Int32(2)
+                            scatter_add_bf16x2(
+                                get_ptr_as_int64(scatter_output, _gcol),
+                                cta_acc[_ot, 0],
+                                cta_acc[_ot, 1],
+                            )
+                else:
+                    _final_limit = Int32(_acc_num_tokens) * _final_pair_cols
+                    if Int32(tidx) < _final_limit:
+                        _my_row = Int32(tidx) // _final_pair_cols
+                        _my_col = Int32(tidx) - _my_row * _final_pair_cols
+                        for _ot in cutlass.range_constexpr(output_tile_cnt):
+                            _gcol = Int32(_ot) * Int32(self.tile_shape_mnk[1]) + _my_col * Int32(2)
+                            scatter_add_bf16x2(
+                                get_ptr_as_int64(scatter_output, _my_row * _scatter_N + _gcol),
+                                cta_acc[_ot, 0],
+                                cta_acc[_ot, 1],
+                            )
 
         # ===================================================================
         # DMA WARP (warp 4)
