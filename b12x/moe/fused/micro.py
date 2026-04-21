@@ -928,10 +928,21 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
             should_quantize = Int32(1)
             packed_local_expert_id = local_expert_id
             packed_row = row
+            quant_expert_id = expert_id
             if cutlass.const_expr(self.share_input_across_experts):
                 if cutlass.const_expr(not _single_token_multi):
-                    # bs=1 single_token share_input: one token, one quant.
-                    should_quantize = Int32(1) if pair_idx == Int32(0) else Int32(0)
+                    # bs=1 single_token share_input: every CTA redundantly
+                    # quantizes its own copy of the input into slot [0, 0]
+                    # using CTA-0's scale. Since quant is bit-deterministic,
+                    # all CTAs write identical bytes — so we skip the
+                    # cross-CTA grid barrier below (see the sync block after
+                    # the work-pair loop). ~7us win on sm_120/121 vs the
+                    # CTA-0-only + grid-barrier pattern.
+                    should_quantize = Int32(1) if pair_idx == Int32(bidz) else Int32(0)
+                    if cutlass.const_expr(not self.is_gated):
+                        quant_expert_id = topk_ids[Int32(0)].to(Int32)
+                    else:
+                        quant_expert_id = weight_expert_ids[Int32(0)]
                     packed_local_expert_id = Int32(0)
                     packed_row = Int32(0)
                 else:
@@ -942,7 +953,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                     packed_local_expert_id = Int32(0)
                     packed_row = pair_idx // num_topk
             if should_quantize > Int32(0):
-                scale_idx = Int32(0) if cutlass.const_expr(self.share_expert_scales) else expert_id
+                scale_idx = Int32(0) if cutlass.const_expr(self.share_expert_scales) else quant_expert_id
                 gs_value = input_global_scale[scale_idx].to(cutlass.Float32)
                 if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(0.0):
                     if self.fast_math:
@@ -992,9 +1003,21 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                 cute.arch.sync_threads()
             pair_idx += Int32(gdim_z)
 
-        self._resident_grid_barrier(
-            barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
-        )
+        # For the bs=1 share_input_across_experts path above, every CTA wrote
+        # its own bit-identical copy to packed_a_storage[0, 0], so no
+        # cross-CTA ordering is needed — just an intra-CTA fence to make
+        # this CTA's own writes visible to its own TMA reads. Other paths
+        # (bs>=2 share_input, non-share_input) still have CTA-0-specific
+        # writes (row_counts, per-token quant) and need the grid barrier.
+        if cutlass.const_expr(self.share_input_across_experts and not _single_token_multi):
+            cute.arch.sync_threads()
+            _threadfence()
+            cute.arch.fence_proxy("async.global")
+            cute.arch.sync_threads()
+        else:
+            self._resident_grid_barrier(
+                barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
+            )
 
         gA = cute.local_tile(mA, self.sa_tile_shape_mk, (None, None, None))
         # FC1 weights tile over N. Gated activation packs [up, gate] along N;
