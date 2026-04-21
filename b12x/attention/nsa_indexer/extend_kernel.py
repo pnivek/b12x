@@ -1098,10 +1098,16 @@ class SparseNSAExtendLogitsPrefillKernel:
                 for reg_id in cutlass.range_constexpr(8):
                     acc_frag[Int32(0), mma_kv, reg_id] = Float32(0.0)
 
+            # Precompute weight smem offsets (only 2 distinct q_local values per thread).
+            lane_group_pre = lane // Int32(4)
+            q_local_rs0 = warp_q_idx * Int32(16) + lane_group_pre
+            q_local_rs1 = q_local_rs0 + Int32(8)
+            w_off_rs0 = q_local_rs0 * num_heads * Int32(4)
+            w_off_rs1 = q_local_rs1 * num_heads * Int32(4)
+
             # Double-buffered cp.async Q staging with 1-stage software pipelining:
             # head h's MMA reads from buffer[h%2] while head h+1's cp.async writes
-            # the other buffer. Per-thread: one aligned 16B chunk of the 32x128 Q tile
-            # (256 threads x 16B = 4096B = one head's Q in smem).
+            # the other buffer. Per-thread: one aligned 16B chunk of the 32x128 Q tile.
             threads_per_row = Int32(8)
             row_local = tx // threads_per_row
             col_group = tx % threads_per_row
@@ -1159,23 +1165,23 @@ class SparseNSAExtendLogitsPrefillKernel:
                     Int32(_INDEX_HEAD_DIM // 16),
                     Int32(_FP8_ROW_VECS),
                 )
-                # Accumulate per K-sub-tile
+                # Accumulate per K-sub-tile (q_local always in [0,31], no bounds check needed)
                 lane_group = lane // Int32(4)
                 for mma_kv in cutlass.range_constexpr(_PREFILL_NUM_MMA_KV):
                     for reg_id in cutlass.range_constexpr(8):
                         row_slot = (reg_id % 4) // 2
                         q_local = warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
-                        if q_local < Int32(_PREFILL_BLOCK_Q):
-                            acc_frag[Int32(0), mma_kv, reg_id] = Float32(
-                                acc_frag[Int32(0), mma_kv, reg_id]
-                                + attention_utils.fmax(
-                                    score_frag[Int32(0), mma_kv, reg_id],
-                                    Float32(0.0),
-                                )
-                                * ld_shared_f32(
-                                    w_smem_base + (q_local * num_heads + head_idx) * Int32(4)
-                                )
+                        w_off = w_off_rs0 if row_slot == Int32(0) else w_off_rs1
+                        acc_frag[Int32(0), mma_kv, reg_id] = Float32(
+                            acc_frag[Int32(0), mma_kv, reg_id]
+                            + attention_utils.fmax(
+                                score_frag[Int32(0), mma_kv, reg_id],
+                                Float32(0.0),
                             )
+                            * ld_shared_f32(
+                                w_smem_base + w_off + head_idx * Int32(4)
+                            )
+                        )
                 head_idx += Int32(1)
 
             # Write back — each warp covers 32 Q × 32 K (via 2 K-sub-tiles)
