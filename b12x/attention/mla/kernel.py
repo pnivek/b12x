@@ -795,6 +795,7 @@ def _compute_score_tile_scaled(
     token_end: Int32,
     sm_scale_log2: Float32,
     lane: Int32,
+    nope_q_u32_offset: Int32,
 ):
     lane_group = lane // Int32(4)
     lane_pair_base = Int32(2) * (lane % Int32(4))
@@ -884,7 +885,7 @@ def _compute_score_tile_scaled(
         q_u32,
         q_idx,
         head_tile_start,
-        Int32(_MLA_NOPE_DIM // 2),
+        nope_q_u32_offset,
         Int32(_MLA_ROPE_VECS),
         Int32(_MLA_ROPE_VECS),
         q_base_addr,
@@ -1328,18 +1329,20 @@ def _store_output_group(
             )
             for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
                 dim_base = group_idx * Int32(_MLA_GROUP_SIZE) + mma_d * Int32(16) + lane_pair_base
-                out_tensor[out_row_idx, head_idx, dim_base + Int32(0)] = Float32(
-                    o_frag[0, mma_d, reg_base + 0] * inv_d
-                ).to(out_tensor.element_type)
-                out_tensor[out_row_idx, head_idx, dim_base + Int32(1)] = Float32(
-                    o_frag[0, mma_d, reg_base + 1] * inv_d
-                ).to(out_tensor.element_type)
-                out_tensor[out_row_idx, head_idx, dim_base + Int32(8)] = Float32(
-                    o_frag[0, mma_d, reg_base + 4] * inv_d
-                ).to(out_tensor.element_type)
-                out_tensor[out_row_idx, head_idx, dim_base + Int32(9)] = Float32(
-                    o_frag[0, mma_d, reg_base + 5] * inv_d
-                ).to(out_tensor.element_type)
+                # Guard: skip writes that fall outside v_head_dim (DSV4 last group).
+                if dim_base + Int32(9) < Int32(out_tensor.shape[2]):
+                    out_tensor[out_row_idx, head_idx, dim_base + Int32(0)] = Float32(
+                        o_frag[0, mma_d, reg_base + 0] * inv_d
+                    ).to(out_tensor.element_type)
+                    out_tensor[out_row_idx, head_idx, dim_base + Int32(1)] = Float32(
+                        o_frag[0, mma_d, reg_base + 1] * inv_d
+                    ).to(out_tensor.element_type)
+                    out_tensor[out_row_idx, head_idx, dim_base + Int32(8)] = Float32(
+                        o_frag[0, mma_d, reg_base + 4] * inv_d
+                    ).to(out_tensor.element_type)
+                    out_tensor[out_row_idx, head_idx, dim_base + Int32(9)] = Float32(
+                        o_frag[0, mma_d, reg_base + 5] * inv_d
+                    ).to(out_tensor.element_type)
 
 
 @cute.jit
@@ -1367,18 +1370,20 @@ def _store_output_group_chunked(
             )
             for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
                 dim_base = group_idx * Int32(_MLA_GROUP_SIZE) + mma_d * Int32(16) + lane_pair_base
-                out_tensor[out_row_idx, head_idx, out_chunk_idx, dim_base + Int32(0)] = Float32(
-                    o_frag[0, mma_d, reg_base + 0] * inv_d
-                ).to(out_tensor.element_type)
-                out_tensor[out_row_idx, head_idx, out_chunk_idx, dim_base + Int32(1)] = Float32(
-                    o_frag[0, mma_d, reg_base + 1] * inv_d
-                ).to(out_tensor.element_type)
-                out_tensor[out_row_idx, head_idx, out_chunk_idx, dim_base + Int32(8)] = Float32(
-                    o_frag[0, mma_d, reg_base + 4] * inv_d
-                ).to(out_tensor.element_type)
-                out_tensor[out_row_idx, head_idx, out_chunk_idx, dim_base + Int32(9)] = Float32(
-                    o_frag[0, mma_d, reg_base + 5] * inv_d
-                ).to(out_tensor.element_type)
+                # Guard: skip writes that fall outside v_head_dim (DSV4 last group).
+                if dim_base + Int32(9) < Int32(out_tensor.shape[3]):
+                    out_tensor[out_row_idx, head_idx, out_chunk_idx, dim_base + Int32(0)] = Float32(
+                        o_frag[0, mma_d, reg_base + 0] * inv_d
+                    ).to(out_tensor.element_type)
+                    out_tensor[out_row_idx, head_idx, out_chunk_idx, dim_base + Int32(1)] = Float32(
+                        o_frag[0, mma_d, reg_base + 1] * inv_d
+                    ).to(out_tensor.element_type)
+                    out_tensor[out_row_idx, head_idx, out_chunk_idx, dim_base + Int32(8)] = Float32(
+                        o_frag[0, mma_d, reg_base + 4] * inv_d
+                    ).to(out_tensor.element_type)
+                    out_tensor[out_row_idx, head_idx, out_chunk_idx, dim_base + Int32(9)] = Float32(
+                        o_frag[0, mma_d, reg_base + 5] * inv_d
+                    ).to(out_tensor.element_type)
 
 
 @cute.jit
@@ -1570,6 +1575,7 @@ def _compute_score_tile_scaled_from_staged_nope(
     token_end: Int32,
     sm_scale_log2: Float32,
     lane: Int32,
+    nope_q_u32_offset: Int32,
 ):
     lane_group = lane // Int32(4)
     lane_pair_base = Int32(2) * (lane % Int32(4))
@@ -1596,7 +1602,7 @@ def _compute_score_tile_scaled_from_staged_nope(
         q_u32,
         q_idx,
         head_tile_start,
-        Int32(_MLA_NOPE_DIM // 2),
+        nope_q_u32_offset,
         Int32(_MLA_ROPE_VECS),
         Int32(_MLA_ROPE_VECS),
         q_base_addr + Int32(_MLA_SCALE_GROUPS * _MLA_Q_NOPE_STAGE_BYTES),
@@ -1755,6 +1761,7 @@ def _pipeline_stage_q_async(
     q_idx: Int32,
     head_tile_start: Int32,
     lane: Int32,
+    nope_q_u32_offset: Int32,
 ):
     """Stage Q into smem (async). Call AFTER QK compute frees q_stage."""
     for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
@@ -1773,7 +1780,7 @@ def _pipeline_stage_q_async(
         q_u32,
         q_idx,
         head_tile_start,
-        Int32(_MLA_NOPE_DIM // 2),
+        nope_q_u32_offset,
         Int32(_MLA_ROPE_VECS),
         Int32(_MLA_ROPE_VECS),
         q_base_addr + Int32(_MLA_SCALE_GROUPS * _MLA_Q_NOPE_STAGE_BYTES),
@@ -1799,6 +1806,7 @@ def _pipeline_stage_tile_async(
     token_end: Int32,
     num_kv: Int32,
     lane: Int32,
+    nope_q_u32_offset: Int32,
 ):
     """Stage token indices, scales, Q, and K/V into smem for one tile (async)."""
     tile_tokens = token_end - token_base
@@ -1821,7 +1829,7 @@ def _pipeline_stage_tile_async(
         q_u32,
         q_idx,
         head_tile_start,
-        Int32(_MLA_NOPE_DIM // 2),
+        nope_q_u32_offset,
         Int32(_MLA_ROPE_VECS),
         Int32(_MLA_ROPE_VECS),
         q_base_addr + Int32(_MLA_SCALE_GROUPS * _MLA_Q_NOPE_STAGE_BYTES),
@@ -2109,6 +2117,7 @@ def _run_one_pass_sparse_mla_tile(
     out_row_idx: Int32,
     out_chunk_idx: Int32,
     lse_tensor: cute.Tensor | None,
+    nope_q_u32_offset: Int32,
 ):
     md_layout = cute.make_layout((1, 2), stride=(2, 1))
     frag_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 8), stride=(16, 8, 1))
@@ -2151,6 +2160,7 @@ def _run_one_pass_sparse_mla_tile(
                 token_end,
                 sm_scale_log2,
                 lane,
+                nope_q_u32_offset,
             )
         else:
             _compute_score_tile_scaled_from_staged_nope(
@@ -2170,6 +2180,7 @@ def _run_one_pass_sparse_mla_tile(
                 token_end,
                 sm_scale_log2,
                 lane,
+                nope_q_u32_offset,
             )
         _update_softmax_stats_b2(score_frag, m_frag, d_frag, o_rescale_frag)
         p_frag = cute.make_rmem_tensor(p_layout, Uint32)
@@ -2206,7 +2217,7 @@ def _run_one_pass_sparse_mla_tile(
 
         # Prologue: stage Q into smem once (Q is the same for all tiles)
         _pipeline_stage_q_async(
-            q_u32, q_base_addr, q_idx, head_tile_start, lane,
+            q_u32, q_base_addr, q_idx, head_tile_start, lane, nope_q_u32_offset,
         )
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
@@ -2344,8 +2355,9 @@ def get_sparse_mla_shared_storage_cls():
 class SparseMLAKernel:
     """Single-pass sparse MLA kernel using MXFP8 MMA for nope and BF16 MMA for rope."""
 
-    def __init__(self, head_tiles: int):
+    def __init__(self, head_tiles: int, nope_logical_dim: int = _MLA_NOPE_DIM):
         self.head_tiles = int(head_tiles)
+        self.nope_logical_dim = int(nope_logical_dim)
 
     @cute.jit
     def __call__(
@@ -2418,6 +2430,7 @@ class SparseMLAKernel:
             q_idx,
             Int32(0),
             None,
+            Int32(self.nope_logical_dim // 2),
         )
 
 @lru_cache(maxsize=16)
@@ -2425,8 +2438,7 @@ def _build_sparse_mla_kernel_for_shape(
     traits: SparseMLATraits,
     head_tiles: int,
 ) -> SparseMLAKernel:
-    del traits
-    return SparseMLAKernel(head_tiles)
+    return SparseMLAKernel(head_tiles, nope_logical_dim=traits.nope_logical_dim)
 
 
 def clear_sparse_mla_kernel_cache() -> None:
@@ -2482,7 +2494,7 @@ def run_sparse_mla_kernel(
         v_head_dim=output.shape[-1],
     )
     if traits is None:
-        raise ValueError("sparse MLA kernel only supports the exact CUDA GLM-5.1 contract")
+        raise ValueError("sparse MLA kernel supports GLM-5.1 (head_dim=576) or DSV4-Flash (head_dim=512) CUDA contract")
     if active_token_counts.dtype != torch.int32:
         raise ValueError(
             f"active_token_counts must have dtype torch.int32, got {active_token_counts.dtype}"

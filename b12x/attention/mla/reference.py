@@ -13,6 +13,12 @@ _MLA_GROUP_SIZE = 128
 _MLA_PACKED_DIM = 656
 
 
+def ue8m0_to_fp32(scales_ue8m0: torch.Tensor) -> torch.Tensor:
+    """Convert UE8M0 (uint8, value = 2^(byte-127)) scale bytes to FP32."""
+    exp = scales_ue8m0.to(torch.int32) - 127
+    return torch.pow(2.0, exp.to(torch.float32))
+
+
 def _as_2d_cache(x: torch.Tensor, expected_dim: int, name: str) -> torch.Tensor:
     if x.ndim == 3:
         if x.shape[1] != 1:
@@ -30,29 +36,67 @@ def pack_mla_kv_cache_reference(
     k_rope: torch.Tensor,
     *,
     group_size: int = _MLA_GROUP_SIZE,
+    nope_logical_dim: int = _MLA_NOPE_DIM,
 ) -> torch.Tensor:
-    """Pack MLA KV cache into the FP8+scale+rope byte layout used by NSA."""
+    """Pack MLA KV cache into the FP8+scale+rope byte layout used by NSA.
+
+    nope_logical_dim: the actual number of nope dims in k_nope (default=512 for
+    GLM-5.1). For DSV4 pass 448; the 4th MXFP8 group will be zero-padded to
+    fill the full 512-element storage slot (Option B).
+    """
 
     if group_size != _MLA_GROUP_SIZE:
         raise ValueError(f"Only group_size={_MLA_GROUP_SIZE} is supported in the reference.")
+    if nope_logical_dim > _MLA_NOPE_DIM:
+        raise ValueError(
+            f"nope_logical_dim {nope_logical_dim} exceeds storage dim {_MLA_NOPE_DIM}"
+        )
 
-    k_nope_2d = _as_2d_cache(k_nope, _MLA_NOPE_DIM, "k_nope")
+    k_nope_2d = _as_2d_cache(k_nope, nope_logical_dim, "k_nope")
     k_rope_2d = _as_2d_cache(k_rope, _MLA_ROPE_DIM, "k_rope")
     if k_nope_2d.shape[0] != k_rope_2d.shape[0]:
         raise ValueError("k_nope and k_rope must have the same token count")
 
+    num_tokens = k_nope_2d.shape[0]
     quant_bytes: list[torch.Tensor] = []
     scale_bytes: list[torch.Tensor] = []
     for block_start in range(0, _MLA_NOPE_DIM, group_size):
-        block = k_nope_2d[:, block_start : block_start + group_size].to(torch.float32)
-        scale = block.abs().amax(dim=1) / _FP8_E4M3_MAX
-        scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-        quant = (block / scale.unsqueeze(1)).clamp(_FP8_E4M3_MIN, _FP8_E4M3_MAX)
-        quant = quant.to(torch.float8_e4m3fn)
-        quant_bytes.append(quant.view(torch.uint8).reshape(block.shape[0], group_size))
-        scale_bytes.append(scale.view(torch.uint8).reshape(block.shape[0], 4))
+        block_end = min(block_start + group_size, nope_logical_dim)
+        if block_end <= block_start:
+            # Fully zero-padded group — store FP8 zeros and scale=1.0.
+            quant_bytes.append(
+                torch.zeros(num_tokens, group_size, dtype=torch.uint8, device=k_nope_2d.device)
+            )
+            scale_bytes.append(
+                torch.ones(num_tokens, 4, dtype=torch.uint8, device=k_nope_2d.device)
+                # torch.ones fills uint8; reinterpreting as fp32 gives ~2e-44, so use view trick:
+            )
+            # Replace with proper fp32(1.0) bytes:
+            scale_bytes[-1] = (
+                torch.ones(num_tokens, 1, dtype=torch.float32, device=k_nope_2d.device)
+                .view(torch.uint8)
+                .reshape(num_tokens, 4)
+            )
+        else:
+            real_elems = block_end - block_start
+            block_real = k_nope_2d[:, block_start:block_end].to(torch.float32)
+            if real_elems < group_size:
+                # Partial group — zero-pad to full group_size for quantization.
+                pad = torch.zeros(
+                    num_tokens, group_size - real_elems,
+                    dtype=torch.float32, device=k_nope_2d.device,
+                )
+                block = torch.cat([block_real, pad], dim=1)
+            else:
+                block = block_real
+            scale = block.abs().amax(dim=1) / _FP8_E4M3_MAX
+            scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+            quant = (block / scale.unsqueeze(1)).clamp(_FP8_E4M3_MIN, _FP8_E4M3_MAX)
+            quant = quant.to(torch.float8_e4m3fn)
+            quant_bytes.append(quant.view(torch.uint8).reshape(num_tokens, group_size))
+            scale_bytes.append(scale.view(torch.uint8).reshape(num_tokens, 4))
 
-    rope_bytes = k_rope_2d.view(torch.uint8).reshape(k_rope_2d.shape[0], _MLA_ROPE_DIM * 2)
+    rope_bytes = k_rope_2d.view(torch.uint8).reshape(num_tokens, _MLA_ROPE_DIM * 2)
     packed = torch.cat(
         [torch.cat(quant_bytes, dim=1), torch.cat(scale_bytes, dim=1), rope_bytes],
         dim=1,
@@ -94,10 +138,11 @@ def dense_mla_reference(
     page_table_1: torch.Tensor,
     sm_scale: float,
     v_head_dim: int,
+    nope_logical_dim: int = _MLA_NOPE_DIM,
 ) -> torch.Tensor:
     """Reference attention using the unquantized MLA cache tensors."""
 
-    k_nope_2d = _as_2d_cache(k_nope, _MLA_NOPE_DIM, "k_nope").to(torch.float32)
+    k_nope_2d = _as_2d_cache(k_nope, nope_logical_dim, "k_nope").to(torch.float32)
     k_rope_2d = _as_2d_cache(k_rope, _MLA_ROPE_DIM, "k_rope").to(torch.float32)
     k_all = torch.cat([k_nope_2d, k_rope_2d], dim=1)
     return _sparse_attention_reference(
@@ -117,14 +162,23 @@ def sparse_mla_reference(
     active_token_counts: torch.Tensor | None = None,
     sm_scale: float,
     v_head_dim: int,
+    nope_logical_dim: int = _MLA_NOPE_DIM,
 ) -> torch.Tensor:
-    """Reference attention using the packed NSA MLA cache layout."""
+    """Reference attention using the packed NSA MLA cache layout.
+
+    For DSV4 (nope_logical_dim=448) the unpacked K has 576 dims (512 nope
+    storage + 64 rope) but Q has only 512 dims.  We trim K_nope to the real
+    logical dim before concatenating with K_rope so the matmul shapes agree.
+    """
 
     kv = unpack_mla_kv_cache_reference(kv_cache).squeeze(1).to(torch.float32)
+    k_nope = kv[:, :nope_logical_dim]
+    k_rope = kv[:, _MLA_NOPE_DIM:]  # rope always starts at storage offset 512
+    k_all = torch.cat([k_nope, k_rope], dim=1)
     return _sparse_attention_reference(
         q_all=q_all,
-        k_all=kv,
-        v_all=kv[:, :v_head_dim],
+        k_all=k_all,
+        v_all=k_nope[:, :v_head_dim],
         page_table_1=page_table_1,
         active_token_counts=active_token_counts,
         sm_scale=sm_scale,

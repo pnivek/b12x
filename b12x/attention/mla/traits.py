@@ -1,4 +1,4 @@
-"""Trait selection for sparse MLA kernels under the current GLM-5.1 contract."""
+"""Trait selection for sparse MLA kernels — supports GLM-5.1 and DSV4-Flash."""
 
 from __future__ import annotations
 
@@ -7,10 +7,18 @@ from dataclasses import dataclass
 import torch
 
 
-_MLA_EXACT_HEAD_DIM = 576
-_MLA_EXACT_V_HEAD_DIM = 512
-_MLA_EXACT_PACKED_WIDTH = 656
-_MLA_EXACT_NOPE_GROUPS = _MLA_EXACT_V_HEAD_DIM // 128
+_MLA_PACKED_WIDTH = 656
+_MLA_ROPE_DIM = 64
+_MLA_GROUP_SIZE = 128
+
+# Supported (head_dim, v_head_dim) pairs.  head_dim = nope_logical + rope.
+# nope_logical must be a multiple of _MLA_GROUP_SIZE for full groups, OR
+# equal to k*128 + 64 for a single half-group (DSV4: 448 = 3*128 + 64).
+_SUPPORTED_SHAPES: dict[tuple[int, int], int] = {
+    # (head_dim, v_head_dim) -> nope_logical_dim
+    (576, 512): 512,  # GLM-5.1
+    (512, 448): 448,  # DSV4-Flash
+}
 
 
 def _dtype_num_bytes(dtype: torch.dtype) -> int:
@@ -29,6 +37,8 @@ class SparseMLATraits:
     num_threads: int
     head_dim: int
     v_head_dim: int
+    nope_logical_dim: int
+    rope_dim: int
     num_q_heads: int
     q_dtype: torch.dtype
     kv_dtype: torch.dtype
@@ -61,22 +71,29 @@ def select_sparse_mla_traits(
         return None
     if q_all.shape[1] <= 0:
         return None
-    if q_all.shape[2] != _MLA_EXACT_HEAD_DIM:
-        return None
-    if kv_cache.shape[1:] != (1, _MLA_EXACT_PACKED_WIDTH):
-        return None
-    if int(v_head_dim) != _MLA_EXACT_V_HEAD_DIM:
+    if kv_cache.shape[1:] != (1, _MLA_PACKED_WIDTH):
         return None
 
+    head_dim = int(q_all.shape[2])
+    v_head_dim_int = int(v_head_dim)
+    nope_logical_dim = _SUPPORTED_SHAPES.get((head_dim, v_head_dim_int))
+    if nope_logical_dim is None:
+        return None
+    if nope_logical_dim + _MLA_ROPE_DIM != head_dim:
+        return None
+
+    nope_groups = (nope_logical_dim + _MLA_GROUP_SIZE - 1) // _MLA_GROUP_SIZE
     heads_per_cta = 1
     kv_stage_bytes = 0
-    q_register_elements_per_lane = _MLA_EXACT_NOPE_GROUPS * 4 + 2
+    q_register_elements_per_lane = nope_groups * 4 + 2
     shared_storage_bytes = 0
     return SparseMLATraits(
         heads_per_cta=heads_per_cta,
         num_threads=heads_per_cta * 32,
-        head_dim=_MLA_EXACT_HEAD_DIM,
-        v_head_dim=_MLA_EXACT_V_HEAD_DIM,
+        head_dim=head_dim,
+        v_head_dim=v_head_dim_int,
+        nope_logical_dim=nope_logical_dim,
+        rope_dim=_MLA_ROPE_DIM,
         num_q_heads=int(q_all.shape[1]),
         q_dtype=q_all.dtype,
         kv_dtype=kv_cache.dtype,

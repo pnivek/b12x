@@ -91,6 +91,9 @@ class B12XAttentionArenaCaps:
     page_size: int = 64
     padded_heads: int = 128
     max_chunks_per_row: int = 64
+    # DSV4 support: nope_logical_dim=448, rope_dim=64 (GLM default: 512/64)
+    nope_logical_dim: int = 512
+    rope_dim: int = 64
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "device", _canonical_device(self.device))
@@ -102,6 +105,8 @@ class B12XAttentionArenaCaps:
         )
         object.__setattr__(self, "head_dim", max(int(self.head_dim), 1))
         object.__setattr__(self, "max_v_head_dim", max(int(self.max_v_head_dim), 1))
+        object.__setattr__(self, "nope_logical_dim", max(int(self.nope_logical_dim), 1))
+        object.__setattr__(self, "rope_dim", max(int(self.rope_dim), 1))
         object.__setattr__(self, "topk", max(int(self.topk), 1))
         object.__setattr__(
             self,

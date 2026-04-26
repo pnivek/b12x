@@ -190,18 +190,19 @@ def _zero_partial_head_tile(
                 out_base = Int32(group_idx * _MLA_GROUP_SIZE) + lane_pair_base
                 for mma_d in cutlass.range_constexpr(8):
                     dim_base = out_base + mma_d * Int32(16)
-                    tmp_output[q_idx, head_idx, chunk_idx, dim_base + Int32(0)] = Float32(
-                        0.0
-                    ).to(tmp_output.element_type)
-                    tmp_output[q_idx, head_idx, chunk_idx, dim_base + Int32(1)] = Float32(
-                        0.0
-                    ).to(tmp_output.element_type)
-                    tmp_output[q_idx, head_idx, chunk_idx, dim_base + Int32(8)] = Float32(
-                        0.0
-                    ).to(tmp_output.element_type)
-                    tmp_output[q_idx, head_idx, chunk_idx, dim_base + Int32(9)] = Float32(
-                        0.0
-                    ).to(tmp_output.element_type)
+                    if dim_base + Int32(9) < Int32(tmp_output.shape[3]):
+                        tmp_output[q_idx, head_idx, chunk_idx, dim_base + Int32(0)] = Float32(
+                            0.0
+                        ).to(tmp_output.element_type)
+                        tmp_output[q_idx, head_idx, chunk_idx, dim_base + Int32(1)] = Float32(
+                            0.0
+                        ).to(tmp_output.element_type)
+                        tmp_output[q_idx, head_idx, chunk_idx, dim_base + Int32(8)] = Float32(
+                            0.0
+                        ).to(tmp_output.element_type)
+                        tmp_output[q_idx, head_idx, chunk_idx, dim_base + Int32(9)] = Float32(
+                            0.0
+                        ).to(tmp_output.element_type)
             if lane % Int32(4) == Int32(0):
                 tmp_lse[q_idx, head_idx, chunk_idx] = Float32(-Float32.inf)
 
@@ -209,9 +210,10 @@ def _zero_partial_head_tile(
 class SparseMLASplitDecodeForwardKernel:
     """Chunk-local sparse MLA partial forward for decode."""
 
-    def __init__(self, launch_num_chunks: int, head_tiles: int):
+    def __init__(self, launch_num_chunks: int, head_tiles: int, nope_logical_dim: int = _MLA_NOPE_DIM):
         self.launch_num_chunks = int(launch_num_chunks)
         self.head_tiles = int(head_tiles)
+        self.nope_logical_dim = int(nope_logical_dim)
 
     @cute.jit
     def __call__(
@@ -314,6 +316,7 @@ class SparseMLASplitDecodeForwardKernel:
                 q_idx,
                 chunk_idx,
                 tmp_lse,
+                Int32(self.nope_logical_dim // 2),
             )
 
 
@@ -359,59 +362,60 @@ class SparseMLASplitDecodeMergeKernel:
             acc[frag_idx] = Float32(0.0)
 
         out_base = group_idx * Int32(_MLA_GROUP_SIZE) + lane * Int32(4)
-        tmp_output_lane = _split_output_lane_view(tmp_output, q_idx, head_idx, out_base)
-        tmp_lse_head = _split_lse_head_view(tmp_lse, q_idx, head_idx)
-        merged_m = Float32(-Float32.inf)
-        merged_d = Float32(1.0)
-        chunk_idx = Int32(0)
-        num_chunks = Int32(num_chunks_ptr[Int32(0)])
-        if num_chunks > Int32(_SPLIT_MAX_CHUNKS):
-            num_chunks = Int32(_SPLIT_MAX_CHUNKS)
+        if out_base + Int32(3) < Int32(output.shape[2]):
+            tmp_output_lane = _split_output_lane_view(tmp_output, q_idx, head_idx, out_base)
+            tmp_lse_head = _split_lse_head_view(tmp_lse, q_idx, head_idx)
+            merged_m = Float32(-Float32.inf)
+            merged_d = Float32(1.0)
+            chunk_idx = Int32(0)
+            num_chunks = Int32(num_chunks_ptr[Int32(0)])
+            if num_chunks > Int32(_SPLIT_MAX_CHUNKS):
+                num_chunks = Int32(_SPLIT_MAX_CHUNKS)
 
-        while chunk_idx < num_chunks and merged_m == Float32(-Float32.inf):
-            part_lse = Float32(tmp_lse_head[chunk_idx])
-            if part_lse != Float32(-Float32.inf):
-                acc[0] = Float32(tmp_output_lane[chunk_idx, Int32(0)])
-                acc[1] = Float32(tmp_output_lane[chunk_idx, Int32(1)])
-                acc[2] = Float32(tmp_output_lane[chunk_idx, Int32(2)])
-                acc[3] = Float32(tmp_output_lane[chunk_idx, Int32(3)])
-                merged_m = Float32(part_lse)
-                merged_d = Float32(1.0)
-            chunk_idx += Int32(1)
+            while chunk_idx < num_chunks and merged_m == Float32(-Float32.inf):
+                part_lse = Float32(tmp_lse_head[chunk_idx])
+                if part_lse != Float32(-Float32.inf):
+                    acc[0] = Float32(tmp_output_lane[chunk_idx, Int32(0)])
+                    acc[1] = Float32(tmp_output_lane[chunk_idx, Int32(1)])
+                    acc[2] = Float32(tmp_output_lane[chunk_idx, Int32(2)])
+                    acc[3] = Float32(tmp_output_lane[chunk_idx, Int32(3)])
+                    merged_m = Float32(part_lse)
+                    merged_d = Float32(1.0)
+                chunk_idx += Int32(1)
 
-        while chunk_idx < num_chunks:
-            part_lse = Float32(tmp_lse_head[chunk_idx])
-            if part_lse != Float32(-Float32.inf):
-                new_m = attention_utils.fmax(merged_m, part_lse)
-                prev_scale = _exp2_approx_ftz_f32(merged_m - new_m)
-                part_scale = _exp2_approx_ftz_f32(part_lse - new_m)
-                merged_d = Float32(merged_d * prev_scale + part_scale)
-                acc[0] = Float32(
-                    acc[0] * prev_scale + Float32(tmp_output_lane[chunk_idx, Int32(0)]) * part_scale
-                )
-                acc[1] = Float32(
-                    acc[1] * prev_scale + Float32(tmp_output_lane[chunk_idx, Int32(1)]) * part_scale
-                )
-                acc[2] = Float32(
-                    acc[2] * prev_scale + Float32(tmp_output_lane[chunk_idx, Int32(2)]) * part_scale
-                )
-                acc[3] = Float32(
-                    acc[3] * prev_scale + Float32(tmp_output_lane[chunk_idx, Int32(3)]) * part_scale
-                )
-                merged_m = Float32(new_m)
-            chunk_idx += Int32(1)
+            while chunk_idx < num_chunks:
+                part_lse = Float32(tmp_lse_head[chunk_idx])
+                if part_lse != Float32(-Float32.inf):
+                    new_m = attention_utils.fmax(merged_m, part_lse)
+                    prev_scale = _exp2_approx_ftz_f32(merged_m - new_m)
+                    part_scale = _exp2_approx_ftz_f32(part_lse - new_m)
+                    merged_d = Float32(merged_d * prev_scale + part_scale)
+                    acc[0] = Float32(
+                        acc[0] * prev_scale + Float32(tmp_output_lane[chunk_idx, Int32(0)]) * part_scale
+                    )
+                    acc[1] = Float32(
+                        acc[1] * prev_scale + Float32(tmp_output_lane[chunk_idx, Int32(1)]) * part_scale
+                    )
+                    acc[2] = Float32(
+                        acc[2] * prev_scale + Float32(tmp_output_lane[chunk_idx, Int32(2)]) * part_scale
+                    )
+                    acc[3] = Float32(
+                        acc[3] * prev_scale + Float32(tmp_output_lane[chunk_idx, Int32(3)]) * part_scale
+                    )
+                    merged_m = Float32(new_m)
+                chunk_idx += Int32(1)
 
-        if merged_m == Float32(-Float32.inf):
-            output[q_idx, head_idx, out_base + Int32(0)] = Float32(0.0).to(output.element_type)
-            output[q_idx, head_idx, out_base + Int32(1)] = Float32(0.0).to(output.element_type)
-            output[q_idx, head_idx, out_base + Int32(2)] = Float32(0.0).to(output.element_type)
-            output[q_idx, head_idx, out_base + Int32(3)] = Float32(0.0).to(output.element_type)
-        else:
-            inv_d = cute.arch.rcp_approx(merged_d)
-            output[q_idx, head_idx, out_base + Int32(0)] = Float32(acc[0] * inv_d).to(output.element_type)
-            output[q_idx, head_idx, out_base + Int32(1)] = Float32(acc[1] * inv_d).to(output.element_type)
-            output[q_idx, head_idx, out_base + Int32(2)] = Float32(acc[2] * inv_d).to(output.element_type)
-            output[q_idx, head_idx, out_base + Int32(3)] = Float32(acc[3] * inv_d).to(output.element_type)
+            if merged_m == Float32(-Float32.inf):
+                output[q_idx, head_idx, out_base + Int32(0)] = Float32(0.0).to(output.element_type)
+                output[q_idx, head_idx, out_base + Int32(1)] = Float32(0.0).to(output.element_type)
+                output[q_idx, head_idx, out_base + Int32(2)] = Float32(0.0).to(output.element_type)
+                output[q_idx, head_idx, out_base + Int32(3)] = Float32(0.0).to(output.element_type)
+            else:
+                inv_d = cute.arch.rcp_approx(merged_d)
+                output[q_idx, head_idx, out_base + Int32(0)] = Float32(acc[0] * inv_d).to(output.element_type)
+                output[q_idx, head_idx, out_base + Int32(1)] = Float32(acc[1] * inv_d).to(output.element_type)
+                output[q_idx, head_idx, out_base + Int32(2)] = Float32(acc[2] * inv_d).to(output.element_type)
+                output[q_idx, head_idx, out_base + Int32(3)] = Float32(acc[3] * inv_d).to(output.element_type)
 
 
 @lru_cache(maxsize=16)
@@ -420,8 +424,9 @@ def _build_sparse_mla_split_forward_kernel(
     launch_num_chunks: int,
     head_tiles: int,
 ) -> SparseMLASplitDecodeForwardKernel:
-    del traits
-    return SparseMLASplitDecodeForwardKernel(launch_num_chunks, head_tiles)
+    return SparseMLASplitDecodeForwardKernel(
+        launch_num_chunks, head_tiles, nope_logical_dim=traits.nope_logical_dim
+    )
 
 
 @lru_cache(maxsize=1)
@@ -456,7 +461,7 @@ def run_sparse_mla_split_decode_forward(
         v_head_dim=tmp_output.shape[-1],
     )
     if traits is None:
-        raise ValueError("sparse MLA split decode only supports the exact CUDA GLM-5.1 contract")
+        raise ValueError("sparse MLA split decode supports GLM-5.1 (head_dim=576) or DSV4-Flash (head_dim=512) CUDA contract")
     if active_token_counts.dtype != torch.int32:
         raise ValueError(
             f"active_token_counts must have dtype torch.int32, got {active_token_counts.dtype}"
