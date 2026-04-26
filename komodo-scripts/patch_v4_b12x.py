@@ -36,9 +36,17 @@ if "id=cubins-cache," in content and "cubins-cache-v2," not in content:
 elif "cubins-cache-v2," in content:
     print("  cubins-cache-v2 already set")
 
+# 2b. Use a separate repo-cache id so we don't inherit the triton build's
+#     vllm-project/vllm remote (which would refuse to find our fork branch).
+if "id=repo-cache," in content and "id=repo-cache-b12x," not in content:
+    content = content.replace("id=repo-cache,", "id=repo-cache-b12x,")
+    print("  Forked repo-cache -> repo-cache-b12x (fresh clone of fork)")
+elif "id=repo-cache-b12x," in content:
+    print("  repo-cache-b12x already set")
+
 # 3. Swap vLLM source repo URL to our fork
 ORIG_VLLM_URL = "https://github.com/vllm-project/vllm.git"
-FORK_VLLM_URL = "https://github.com/pnivek/vllm-ds4-sm12x.git"
+FORK_VLLM_URL = "https://github.com/pnivek/vllm.git"
 if ORIG_VLLM_URL in content:
     content = content.replace(ORIG_VLLM_URL, FORK_VLLM_URL)
     print(f"  Swapped vLLM source -> {FORK_VLLM_URL}")
