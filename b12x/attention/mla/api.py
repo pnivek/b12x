@@ -330,6 +330,10 @@ def _run_sparse_mla(
                 "b12x MLA fell back to the PyTorch reference during CUDA graph capture; "
                 "the current q/kv/page-table contract is not supported by the compiled kernel path"
             )
+        # Derive nope_logical_dim from workspace if available (DSV4=448, GLM=512).
+        nope_logical_dim = getattr(workspace, "nope_logical_dim", None)
+        if nope_logical_dim is None:
+            nope_logical_dim = int(q_all.shape[-1]) - 64  # head_dim - rope_dim
         output = sparse_mla_reference(
             q_all=q_all,
             kv_cache=kv_cache,
@@ -337,6 +341,7 @@ def _run_sparse_mla(
             active_token_counts=active_token_counts,
             sm_scale=sm_scale,
             v_head_dim=v_head_dim,
+            nope_logical_dim=int(nope_logical_dim),
         )
     return output
 
