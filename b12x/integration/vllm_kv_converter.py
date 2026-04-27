@@ -119,6 +119,42 @@ def _extract_rope(token_data: torch.Tensor) -> torch.Tensor:
     return rope_bytes.view(torch.bfloat16).reshape(rope_bytes.shape[0], 1, _DSV4_ROPE_DIM)
 
 
+def gather_and_dequant_fp8ds(
+    vllm_cache: torch.Tensor,
+    page_table_1: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fast path: gather rows + dequant to BF16 only — skip the pack/unpack round-trip.
+
+    Returns:
+        k_nope_bf16: ``(num_q*topk, 448)`` bf16
+        k_rope_bf16: ``(num_q*topk, 64)`` bf16
+        new_page_table: ``(num_q, topk)`` int32 — arange-based, unmasked
+            (caller is responsible for masking via active_token_counts).
+    """
+    num_blocks, vllm_cache_flat = _validate_inputs(vllm_cache, page_table_1, block_size)
+    num_q, topk = page_table_1.shape
+    num_rows = num_q * topk
+    flat_slots = page_table_1.reshape(-1)
+
+    valid = (flat_slots >= 0) & (flat_slots < num_blocks * block_size)
+    safe_slots = torch.where(valid, flat_slots, torch.zeros_like(flat_slots))
+
+    token_data, token_scales = _gather_token_rows(vllm_cache_flat, safe_slots, block_size)
+    k_nope = _dequant_nope(token_data, token_scales).squeeze(1)  # (num_rows, 448)
+    k_rope = _extract_rope(token_data).squeeze(1)                # (num_rows, 64)
+
+    if (~valid).any():
+        invalid_rows = (~valid).nonzero(as_tuple=False).squeeze(-1)
+        k_nope[invalid_rows] = 0
+        k_rope[invalid_rows] = 0
+
+    new_page_table = torch.arange(
+        num_rows, dtype=torch.int32, device=page_table_1.device
+    ).reshape(num_q, topk)
+    return k_nope, k_rope, new_page_table
+
+
 def convert_fp8ds_to_b12x_gathered(
     vllm_cache: torch.Tensor,
     page_table_1: torch.Tensor,
