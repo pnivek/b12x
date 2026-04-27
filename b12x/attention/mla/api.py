@@ -139,6 +139,7 @@ def sparse_mla_extend_forward(
     workspace: B12XAttentionWorkspace,
     sm_scale: float,
     v_head_dim: int,
+    attn_sink: torch.Tensor | None = None,
 ) -> torch.Tensor:
     workspace.prepare_extend(
         metadata.selected_token_offsets,
@@ -151,6 +152,7 @@ def sparse_mla_extend_forward(
         workspace=workspace,
         sm_scale=sm_scale,
         v_head_dim=v_head_dim,
+        attn_sink=attn_sink,
     )
 
 
@@ -306,6 +308,7 @@ def _run_sparse_mla(
             output=output,
             launch_num_chunks=launch_num_chunks,
             workspace=workspace,
+            attn_sink=attn_sink,
         )
     elif not use_reference and supports_sparse_mla_kernel(
         q_all=q_all,
@@ -326,6 +329,7 @@ def _run_sparse_mla(
             sm_scale=sm_scale_tensor,
             output=output,
             workspace=workspace,
+            attn_sink=attn_sink,
         )
     else:
         if _is_cuda_graph_capture_active(q_all.device):

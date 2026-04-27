@@ -1011,6 +1011,77 @@ def _update_softmax_stats_b2(
 
 
 @cute.jit
+def _apply_attn_sink_finalize(
+    o_frag0: cute.Tensor,
+    o_frag1: cute.Tensor,
+    o_frag2: cute.Tensor,
+    o_frag3: cute.Tensor,
+    m_frag: cute.Tensor,
+    d_frag: cute.Tensor,
+    attn_sink: cute.Tensor,
+    head_tile_start: Int32,
+    lane: Int32,
+):
+    """Fold per-head attn_sink into softmax (m, d) and rescale O accumulators.
+
+    Sink contributes an additional logit `sink_per_head` to the softmax denominator:
+        d_new = d_frag * exp2(m_old - m_new) + exp2(sink * LOG2_E - m_new)
+        m_new = max(m_old, sink * LOG2_E)
+    The O accumulator must be rescaled by exp2(m_old - m_new) since the existing
+    o_frag is partially-normalized by the running m. After this call, o_frag's
+    normalization basis is m_new.
+
+    A sink value of -inf acts as the no-op sentinel: m_new == m_old, rescale == 1,
+    sink_term == 0, so d_frag and o_frags are untouched.
+    """
+    LOG2_E_f = Float32(attention_utils.LOG2_E)
+    lane_group = lane // Int32(4)
+    for row_slot in cutlass.range_constexpr(2):
+        head_local = lane_group + Int32(8) * row_slot
+        head_idx = head_tile_start + head_local
+        # Bounds-safe load: heads beyond num_heads in the tile get -inf (no contribution).
+        sink_val = (
+            Float32(attn_sink[head_idx]) * LOG2_E_f
+            if head_idx < Int32(attn_sink.shape[0])
+            else -Float32.inf
+        )
+        m_old = Float32(m_frag[0, row_slot])
+        m_new = attention_utils.fmax(m_old, sink_val)
+        rescale = (
+            Float32(1.0)
+            if m_old == -Float32.inf or m_old == m_new
+            else _exp2_approx_ftz_f32(m_old - m_new)
+        )
+        sink_term = (
+            Float32(0.0)
+            if sink_val == -Float32.inf or m_new == -Float32.inf
+            else _exp2_approx_ftz_f32(sink_val - m_new)
+        )
+        d_new = Float32(d_frag[0, row_slot]) * rescale + sink_term
+        m_frag[0, row_slot] = m_new
+        d_frag[0, row_slot] = d_new
+        # Rescale O accumulators by the same exp2(m_old - m_new).
+        for mma_d in cutlass.range_constexpr(_MLA_VO_NUM_MMA_D):
+            reg_base = row_slot * 2
+            o_frag0[0, mma_d, reg_base + 0] = Float32(o_frag0[0, mma_d, reg_base + 0] * rescale)
+            o_frag0[0, mma_d, reg_base + 1] = Float32(o_frag0[0, mma_d, reg_base + 1] * rescale)
+            o_frag0[0, mma_d, reg_base + 4] = Float32(o_frag0[0, mma_d, reg_base + 4] * rescale)
+            o_frag0[0, mma_d, reg_base + 5] = Float32(o_frag0[0, mma_d, reg_base + 5] * rescale)
+            o_frag1[0, mma_d, reg_base + 0] = Float32(o_frag1[0, mma_d, reg_base + 0] * rescale)
+            o_frag1[0, mma_d, reg_base + 1] = Float32(o_frag1[0, mma_d, reg_base + 1] * rescale)
+            o_frag1[0, mma_d, reg_base + 4] = Float32(o_frag1[0, mma_d, reg_base + 4] * rescale)
+            o_frag1[0, mma_d, reg_base + 5] = Float32(o_frag1[0, mma_d, reg_base + 5] * rescale)
+            o_frag2[0, mma_d, reg_base + 0] = Float32(o_frag2[0, mma_d, reg_base + 0] * rescale)
+            o_frag2[0, mma_d, reg_base + 1] = Float32(o_frag2[0, mma_d, reg_base + 1] * rescale)
+            o_frag2[0, mma_d, reg_base + 4] = Float32(o_frag2[0, mma_d, reg_base + 4] * rescale)
+            o_frag2[0, mma_d, reg_base + 5] = Float32(o_frag2[0, mma_d, reg_base + 5] * rescale)
+            o_frag3[0, mma_d, reg_base + 0] = Float32(o_frag3[0, mma_d, reg_base + 0] * rescale)
+            o_frag3[0, mma_d, reg_base + 1] = Float32(o_frag3[0, mma_d, reg_base + 1] * rescale)
+            o_frag3[0, mma_d, reg_base + 4] = Float32(o_frag3[0, mma_d, reg_base + 4] * rescale)
+            o_frag3[0, mma_d, reg_base + 5] = Float32(o_frag3[0, mma_d, reg_base + 5] * rescale)
+
+
+@cute.jit
 def _fill_normalized_p_frag_from_scores(
     p_frag: cute.Tensor,
     score_frag: cute.Tensor,
@@ -2118,6 +2189,7 @@ def _run_one_pass_sparse_mla_tile(
     out_chunk_idx: Int32,
     lse_tensor: cute.Tensor | None,
     nope_q_u32_offset: Int32,
+    attn_sink: cute.Tensor | None = None,
 ):
     md_layout = cute.make_layout((1, 2), stride=(2, 1))
     frag_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 8), stride=(16, 8, 1))
@@ -2293,6 +2365,21 @@ def _run_one_pass_sparse_mla_tile(
 
             token_base = tile_end
     if cutlass.const_expr(lse_tensor is None):
+        # Single-pass path produces the final output directly. Apply per-head sink
+        # to (m, d) and rescale O accumulators before the divide-and-store epilogue.
+        # Split-decode path (lse_tensor is not None) defers sink to the merge kernel.
+        if cutlass.const_expr(attn_sink is not None):
+            _apply_attn_sink_finalize(
+                o_frag0,
+                o_frag1,
+                o_frag2,
+                o_frag3,
+                m_frag,
+                d_frag,
+                attn_sink,
+                head_tile_start,
+                lane,
+            )
         _store_output_groups(
             out_tensor,
             o_frag0,
@@ -2369,6 +2456,7 @@ class SparseMLAKernel:
         active_token_counts: cute.Tensor,
         sm_scale: cute.Tensor,
         output: cute.Tensor,
+        attn_sink: cute.Tensor,
         stream: cuda.CUstream,
     ):
         self.kernel(
@@ -2379,6 +2467,7 @@ class SparseMLAKernel:
             active_token_counts,
             sm_scale,
             output,
+            attn_sink,
         ).launch(
             grid=(output.shape[0], self.head_tiles, 1),
             block=[_MLA_WARP_THREADS, 1, 1],
@@ -2395,6 +2484,7 @@ class SparseMLAKernel:
         active_token_counts: cute.Tensor,
         sm_scale: cute.Tensor,
         output: cute.Tensor,
+        attn_sink: cute.Tensor,
     ):
         lane = cute.arch.lane_idx()
         q_idx, head_tile_idx, _ = cute.arch.block_idx()
@@ -2431,6 +2521,7 @@ class SparseMLAKernel:
             Int32(0),
             None,
             Int32(self.nope_logical_dim // 2),
+            attn_sink,
         )
 
 @lru_cache(maxsize=16)
@@ -2485,6 +2576,7 @@ def run_sparse_mla_kernel(
     sm_scale: float | torch.Tensor,
     output: torch.Tensor,
     workspace: object | None = None,
+    attn_sink: torch.Tensor | None = None,
 ) -> None:
     traits = select_sparse_mla_traits(
         q_all=q_all,
@@ -2518,7 +2610,12 @@ def run_sparse_mla_kernel(
     if sm_scale_tensor.device != q_all.device:
         raise ValueError("sm_scale tensor must be on the same device as q_all")
 
-    head_tiles = (int(output.shape[1]) + _MLA_HEADS_PER_TILE - 1) // _MLA_HEADS_PER_TILE
+    num_heads = int(output.shape[1])
+    attn_sink_tensor = _materialize_attn_sink_tensor(
+        attn_sink, workspace=workspace, num_heads=num_heads, device=q_all.device,
+    )
+
+    head_tiles = (num_heads + _MLA_HEADS_PER_TILE - 1) // _MLA_HEADS_PER_TILE
     kernel = _build_sparse_mla_kernel_for_shape(traits, head_tiles)
     args = (
         _to_kernel_tensor(q_u32, cutlass.Uint32, assumed_align=16),
@@ -2528,6 +2625,7 @@ def run_sparse_mla_kernel(
         _to_kernel_tensor(active_token_counts, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(sm_scale_tensor, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(output, _torch_to_cutlass_dtype(output.dtype)),
+        _to_kernel_tensor(attn_sink_tensor, cutlass.BFloat16, assumed_align=2),
         current_cuda_stream(),
     )
     # Use phantom tensors from workspace for stable cache keys when available.
@@ -2536,6 +2634,7 @@ def run_sparse_mla_kernel(
     _cpt = getattr(workspace, "_contract_page_table", None)
     _cnt = getattr(workspace, "_contract_nsa_cache_seqlens", None)
     _co = getattr(workspace, "_contract_output", None)
+    _cas = getattr(workspace, "_contract_attn_sink", None)
     cache_key = (
         _tensor_meta_key(_cq if _cq is not None else q_u32),
         _tensor_meta_key(_ckv if _ckv is not None else kv_rows_u32),
@@ -2543,8 +2642,64 @@ def run_sparse_mla_kernel(
         _tensor_meta_key(_cpt if _cpt is not None else page_table_1),
         _tensor_meta_key(_cnt if _cnt is not None else active_token_counts),
         _tensor_meta_key(_co if _co is not None else output),
+        _tensor_meta_key(_cas if _cas is not None else attn_sink_tensor),
         traits,
         head_tiles,
         str(output.dtype),
     )
     _run_cached_host_launcher(kernel, cache_key, args)
+
+
+# Cached -inf BF16 sink sentinels keyed by (device, num_heads). Reused across calls so
+# repeated "no sink" invocations do not allocate or shape-thrash the kernel cache key.
+_NO_SINK_TENSOR_CACHE: dict[tuple[str, int, int], torch.Tensor] = {}
+
+
+def _materialize_attn_sink_tensor(
+    attn_sink: torch.Tensor | None,
+    *,
+    workspace: object | None,
+    num_heads: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return a `(num_heads,)` BF16 sink tensor, materializing a -inf sentinel if None.
+
+    A `-inf` sink is a no-op in `_apply_attn_sink_finalize` (m_new == m_old, rescale==1,
+    sink_term==0). Caching the sentinel keeps the kernel-launcher cache key stable.
+    """
+    if attn_sink is not None:
+        if attn_sink.device != device:
+            raise ValueError(
+                f"attn_sink device {attn_sink.device} does not match q device {device}"
+            )
+        if attn_sink.dtype != torch.bfloat16:
+            attn_sink = attn_sink.to(torch.bfloat16)
+        if attn_sink.ndim != 1 or attn_sink.shape[0] < num_heads:
+            raise ValueError(
+                f"attn_sink must be rank-1 with at least {num_heads} elements, "
+                f"got shape {tuple(attn_sink.shape)}"
+            )
+        if not attn_sink.is_contiguous():
+            attn_sink = attn_sink.contiguous()
+        return attn_sink
+
+    cached = getattr(workspace, "_no_sink_tensor", None) if workspace is not None else None
+    if (
+        cached is not None
+        and cached.device == device
+        and cached.shape[0] >= num_heads
+        and cached.dtype == torch.bfloat16
+    ):
+        return cached
+
+    key = (str(device), int(device.index) if device.index is not None else -1, int(num_heads))
+    cached = _NO_SINK_TENSOR_CACHE.get(key)
+    if cached is None:
+        cached = torch.full((num_heads,), float("-inf"), dtype=torch.bfloat16, device=device)
+        _NO_SINK_TENSOR_CACHE[key] = cached
+    if workspace is not None:
+        try:
+            workspace._no_sink_tensor = cached
+        except Exception:
+            pass
+    return cached

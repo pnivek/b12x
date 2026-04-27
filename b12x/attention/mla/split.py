@@ -31,6 +31,7 @@ from .kernel import (
     _exp2_approx_ftz_f32,
     _log2_approx_ftz_f32,
     _clamp_active_token_count,
+    _materialize_attn_sink_tensor,
     _run_cached_host_launcher,
     _run_one_pass_sparse_mla_tile,
     _tensor_meta_key,
@@ -321,7 +322,15 @@ class SparseMLASplitDecodeForwardKernel:
 
 
 class SparseMLASplitDecodeMergeKernel:
-    """Reduce normalized chunk partials into the final decode output."""
+    """Reduce normalized chunk partials into the final decode output.
+
+    The per-head ``attn_sink`` (BF16) is folded into the final softmax denominator
+    here — *after* all chunks are merged. Sink contributes a virtual chunk with
+    LSE = sink * LOG2_E and zero output, so it scales the merged_d only:
+        new_d = merged_d * exp2(merged_m - new_m) + exp2(sink_log2 - new_m)
+        acc  *= exp2(merged_m - new_m)
+    A -inf sink (default sentinel) is a no-op.
+    """
 
     @cute.jit
     def __call__(
@@ -330,6 +339,7 @@ class SparseMLASplitDecodeMergeKernel:
         tmp_lse: cute.Tensor,
         num_chunks_ptr: cute.Tensor,
         output: cute.Tensor,
+        attn_sink: cute.Tensor,
         stream: cuda.CUstream,
     ):
         self.kernel(
@@ -337,6 +347,7 @@ class SparseMLASplitDecodeMergeKernel:
             tmp_lse,
             num_chunks_ptr,
             output,
+            attn_sink,
         ).launch(
             grid=(output.shape[0], output.shape[1], _MLA_SCALE_GROUPS),
             block=[_MLA_WARP_THREADS, 1, 1],
@@ -350,6 +361,7 @@ class SparseMLASplitDecodeMergeKernel:
         tmp_lse: cute.Tensor,
         num_chunks_ptr: cute.Tensor,
         output: cute.Tensor,
+        attn_sink: cute.Tensor,
     ):
         lane = cute.arch.lane_idx()
         q_idx, head_idx, group_idx = cute.arch.block_idx()
@@ -404,6 +416,39 @@ class SparseMLASplitDecodeMergeKernel:
                     )
                     merged_m = Float32(new_m)
                 chunk_idx += Int32(1)
+
+            # Fold per-head attn_sink into merged (m, d) before final division.
+            # A -inf sink is the no-op sentinel: m_new == merged_m, prev_scale == 1,
+            # sink_term == 0. With finite sink, sink contributes only to denominator
+            # (sink-virtual o == 0), so acc only rescales (no addition).
+            sink_log2 = (
+                Float32(attn_sink[head_idx]) * Float32(attention_utils.LOG2_E)
+                if head_idx < Int32(attn_sink.shape[0])
+                else -Float32.inf
+            )
+            if sink_log2 != -Float32.inf:
+                if merged_m == -Float32.inf:
+                    # No real chunks contributed; sink dominates → output is zero.
+                    merged_m = sink_log2
+                    merged_d = Float32(1.0)
+                    acc[0] = Float32(0.0)
+                    acc[1] = Float32(0.0)
+                    acc[2] = Float32(0.0)
+                    acc[3] = Float32(0.0)
+                else:
+                    new_m = attention_utils.fmax(merged_m, sink_log2)
+                    prev_scale = (
+                        Float32(1.0)
+                        if merged_m == new_m
+                        else _exp2_approx_ftz_f32(merged_m - new_m)
+                    )
+                    sink_scale = _exp2_approx_ftz_f32(sink_log2 - new_m)
+                    merged_d = Float32(merged_d * prev_scale + sink_scale)
+                    acc[0] = Float32(acc[0] * prev_scale)
+                    acc[1] = Float32(acc[1] * prev_scale)
+                    acc[2] = Float32(acc[2] * prev_scale)
+                    acc[3] = Float32(acc[3] * prev_scale)
+                    merged_m = new_m
 
             if merged_m == Float32(-Float32.inf):
                 output[q_idx, head_idx, out_base + Int32(0)] = Float32(0.0).to(output.element_type)
@@ -533,23 +578,31 @@ def run_sparse_mla_split_decode_merge(
     num_chunks_ptr: torch.Tensor,
     output: torch.Tensor,
     workspace: object | None = None,
+    attn_sink: torch.Tensor | None = None,
 ) -> None:
+    num_heads = int(output.shape[1])
+    attn_sink_tensor = _materialize_attn_sink_tensor(
+        attn_sink, workspace=workspace, num_heads=num_heads, device=output.device,
+    )
     merge_kernel = _build_sparse_mla_split_merge_kernel()
     merge_args = (
         _to_kernel_tensor(tmp_output, _torch_to_cutlass_dtype(tmp_output.dtype)),
         _to_kernel_tensor(tmp_lse, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(num_chunks_ptr, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(output, _torch_to_cutlass_dtype(output.dtype)),
+        _to_kernel_tensor(attn_sink_tensor, cutlass.BFloat16, assumed_align=2),
         current_cuda_stream(),
     )
     _cto = getattr(workspace, "_contract_tmp_output", None)
     _ctl = getattr(workspace, "_contract_tmp_lse", None)
     _co = getattr(workspace, "_contract_output", None)
+    _cas = getattr(workspace, "_contract_attn_sink", None)
     merge_cache_key = (
         _tensor_meta_key(_cto if _cto is not None else tmp_output),
         _tensor_meta_key(_ctl if _ctl is not None else tmp_lse),
         _tensor_meta_key(num_chunks_ptr),
         _tensor_meta_key(_co if _co is not None else output),
+        _tensor_meta_key(_cas if _cas is not None else attn_sink_tensor),
         str(tmp_output.dtype),
         str(output.dtype),
     )
@@ -570,6 +623,7 @@ def run_sparse_mla_split_decode(
     output: torch.Tensor,
     launch_num_chunks: int,
     workspace: object | None = None,
+    attn_sink: torch.Tensor | None = None,
 ) -> None:
     run_sparse_mla_split_decode_forward(
         q_all=q_all,
@@ -590,4 +644,5 @@ def run_sparse_mla_split_decode(
         num_chunks_ptr=num_chunks_ptr,
         output=output,
         workspace=workspace,
+        attn_sink=attn_sink,
     )
