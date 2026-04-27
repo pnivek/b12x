@@ -146,6 +146,19 @@ if "safetensors==0.8.0rc0" not in content:
 else:
     print("  safetensors already upgraded")
 
+# 6b. nvidia-cutlass-dsl-libs-cu13 — required for sm_121a + FP8 cvt instructions.
+#     Without this, the bundled libs-base falls back to CUDA 12.9-era NVVM/ptxas
+#     which doesn't recognize cvt.rn.satfinite.e4m3x2.bf16x2 etc., breaking the
+#     b12x cuTe path with a "ptxas application ptx input ... Unexpected
+#     instruction types specified for 'cvt'" error at JIT compile time.
+content = "".join(lines)
+if "nvidia-cutlass-dsl-libs-cu13" not in content:
+    lines.append("\n# CUTLASS-DSL CUDA 13 binaries (fixes ptxas cvt incompat for sm_121a FP8)\n")
+    lines.append("RUN pip install nvidia-cutlass-dsl-libs-cu13==4.4.2\n")
+    print("  Appended nvidia-cutlass-dsl-libs-cu13==4.4.2 install")
+else:
+    print("  cutlass-dsl-libs-cu13 already present")
+
 # 7. Install b12x from our public fork.
 #    We pin to the resolved master SHA so Docker's RUN-layer cache invalidates
 #    when b12x master moves forward (otherwise pip install with the same command
