@@ -34,6 +34,7 @@ from b12x.cute.fp4 import (
     ldmatrix_m8n8x4_b16,
     ldmatrix_m8n8x4_left_half_b16,
     ldmatrix_m8n8x4_right_half_b16,
+    ldmatrix_m8n8x4_trans_b16,
     ldmatrix_m8n8x4_trans_left_half_b16,
     ldmatrix_m8n8x4_trans_right_half_b16,
     mxfp8_mma_m16n8k32_f32_e4m3,
@@ -1377,6 +1378,79 @@ def _literal_pv_mma_into_ofrag_fp8_raw_scaled(
 
 
 @cute.jit
+def _accumulate_pv_rope_bf16_into_o_frag3(
+    o_frag3: cute.Tensor,
+    p_frag: cute.Tensor,
+    rope_base_addr: Int32,
+    lane: Int32,
+):
+    """P @ K_rope (BF16) → accumulate into o_frag3[mma_d 4..7] for output dims 448..511.
+
+    Used only when v_head_dim == _MLA_HEAD_DIM (DSV4-Flash absorbed-MLA: V = K = nope+rope).
+    For other v_head_dim values (e.g. GLM-5.1 v=512=nope_only, or DSV4 v=448) this helper
+    is not called, and o_frag3[4..7] remains zero from the zero-padded FP8 nope storage.
+
+    K_rope is staged at ``rope_base_addr`` as 32 tokens × 64 BF16 = 4096 bytes
+    (128 B/row, 8 vec128/row). We compute _MLA_NUM_MMA_KV=2 token-tile halves × 4 dim
+    chunks = 8 BF16 m16n16k16 MMAs total. Each MMA covers 16 heads × 16 tokens × 16 dims.
+
+    The output reg layout from bf16_mma_m16n16k16_f32 matches what _store_output_group
+    expects for o_frag3[mma_d ∈ {4..7}]: reg_id {0,1,4,5} → row_slot 0 dim_offsets
+    {0,1,8,9}; reg_id {2,3,6,7} → row_slot 1.  With group_idx=3 and mma_d=4..7,
+    dim_base = 3*128 + mma_d*16 + lane_pair_base spans 448..511 — exactly the rope dims.
+
+    No softmax-related scaling is applied here: the existing per-tile rescaling in the
+    multi-tile path (lines 2266-2285 above) and the sink-finalize rescaling already
+    iterate `_MLA_VO_NUM_MMA_D=8` register slots over o_frag3, so the rope contribution
+    is rescaled coherently with the nope contribution as new max-stats arrive.
+    """
+    rope_kv_vecs = Int32(_MLA_ROPE_DIM * 2 // 16)  # = 8 (64 bf16 = 128 B/row = 8 vec128)
+
+    v_offset = _permuted_offset_128b(
+        lane % Int32(16),
+        lane // Int32(16),
+        rope_kv_vecs,
+    )
+    for mma_kv in cutlass.range_constexpr(_MLA_NUM_MMA_KV):
+        v_offset_cur = v_offset
+        for mma_d_rope in cutlass.range_constexpr(4):  # 4 mma_d × 16 dims = 64 rope dims
+            b0, b1, b2, b3 = ldmatrix_m8n8x4_trans_b16(
+                _smem_addr_from_b128_offset(rope_base_addr, v_offset_cur)
+            )
+            target = mma_d_rope + Int32(4)  # write into o_frag3 slots 4..7 (dims 448..511)
+            d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
+                o_frag3[0, target, 0],
+                o_frag3[0, target, 1],
+                o_frag3[0, target, 2],
+                o_frag3[0, target, 3],
+                o_frag3[0, target, 4],
+                o_frag3[0, target, 5],
+                o_frag3[0, target, 6],
+                o_frag3[0, target, 7],
+                p_frag[0, mma_kv, 0],
+                p_frag[0, mma_kv, 1],
+                p_frag[0, mma_kv, 2],
+                p_frag[0, mma_kv, 3],
+                b0, b1, b2, b3,
+            )
+            o_frag3[0, target, 0] = d0
+            o_frag3[0, target, 1] = d1
+            o_frag3[0, target, 2] = d2
+            o_frag3[0, target, 3] = d3
+            o_frag3[0, target, 4] = d4
+            o_frag3[0, target, 5] = d5
+            o_frag3[0, target, 6] = d6
+            o_frag3[0, target, 7] = d7
+            # Full BF16 ldmatrix covers one 16-dim col-group per mma_d (vs FP8's
+            # left/right-half pair-of-mma_d covering one col-group). So we advance
+            # every mma_d, with step_idx = mma_d_rope. Skip advance after the last
+            # mma_d since the next mma_kv resets v_offset anyway.
+            if mma_d_rope < Int32(3):
+                v_offset_cur = _advance_offset_by_column_128b_2(v_offset_cur, mma_d_rope)
+        v_offset = _advance_offset_by_row_128b(v_offset, 16, rope_kv_vecs)
+
+
+@cute.jit
 def _store_output_group(
     out_tensor: cute.Tensor,
     o_frag: cute.Tensor,
@@ -1560,6 +1634,8 @@ def _accumulate_pv_groups_from_p_frag(
     sScale: cute.Tensor,
     kv_base_addr: Int32,
     lane: Int32,
+    rope_base_addr: Int32 = Int32(0),
+    include_rope_in_v: bool = False,
 ):
     for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
         group_idx = Int32(block_offset)
@@ -1626,6 +1702,9 @@ def _accumulate_pv_groups_from_p_frag(
         else:
             _accumulate_scaled_output_frag(o_frag3, tile_o_frag, accum_scale)
         cute.arch.sync_threads()
+    # Rope-as-V: see comment in _accumulate_pv_groups_from_p_frag_staged.
+    if cutlass.const_expr(include_rope_in_v):
+        _accumulate_pv_rope_bf16_into_o_frag3(o_frag3, p_frag, rope_base_addr, lane)
 
 
 @cute.jit
@@ -2034,6 +2113,8 @@ def _accumulate_pv_groups_from_p_frag_staged(
     sScale: cute.Tensor,
     kv_nope_base_addr: Int32,
     lane: Int32,
+    rope_base_addr: Int32 = Int32(0),
+    include_rope_in_v: bool = False,
 ):
     for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
         group_idx = Int32(block_offset)
@@ -2061,6 +2142,10 @@ def _accumulate_pv_groups_from_p_frag_staged(
             _run_staged_pv_group_into_target(
                 o_frag3, p_frag, sScale, group_base_addr, scale_base, tile_pv_scale, lane
             )
+    # Rope-as-V: P @ K_rope (BF16) → o_frag3[mma_d 4..7] for dims 448..511.
+    # Only when v_head_dim spans into the rope storage region (DSV4-Flash absorbed: v=512).
+    if cutlass.const_expr(include_rope_in_v):
+        _accumulate_pv_rope_bf16_into_o_frag3(o_frag3, p_frag, rope_base_addr, lane)
 
 
 @cute.jit
@@ -2190,6 +2275,7 @@ def _run_one_pass_sparse_mla_tile(
     lse_tensor: cute.Tensor | None,
     nope_q_u32_offset: Int32,
     attn_sink: cute.Tensor | None = None,
+    include_rope_in_v: bool = False,
 ):
     md_layout = cute.make_layout((1, 2), stride=(2, 1))
     frag_layout = cute.make_layout((1, _MLA_NUM_MMA_KV, 8), stride=(16, 8, 1))
@@ -2270,6 +2356,8 @@ def _run_one_pass_sparse_mla_tile(
                 sScale,
                 kv_base_addr,
                 lane,
+                kv_base_addr + Int32(_MLA_SCALE_GROUPS * _MLA_KV_NOPE_STAGE_BYTES),
+                include_rope_in_v,
             )
         else:
             _accumulate_pv_groups_from_p_frag_staged(
@@ -2281,6 +2369,8 @@ def _run_one_pass_sparse_mla_tile(
                 sScale,
                 kv_base_addr,
                 lane,
+                kv_base_addr + Int32(_MLA_SCALE_GROUPS * _MLA_KV_NOPE_STAGE_BYTES),
+                include_rope_in_v,
             )
     else:
         # Multi-tile: serial K/V staging (single buffer, saves ~21KB smem for 2x occupancy)
@@ -2361,6 +2451,8 @@ def _run_one_pass_sparse_mla_tile(
             _accumulate_pv_groups_from_p_frag_staged(
                 o_frag0, o_frag1, o_frag2, o_frag3,
                 p_frag, sScale, kv_base_addr, lane,
+                kv_base_addr + Int32(_MLA_SCALE_GROUPS * _MLA_KV_NOPE_STAGE_BYTES),
+                include_rope_in_v,
             )
 
             token_base = tile_end
@@ -2442,9 +2534,15 @@ def get_sparse_mla_shared_storage_cls():
 class SparseMLAKernel:
     """Single-pass sparse MLA kernel using MXFP8 MMA for nope and BF16 MMA for rope."""
 
-    def __init__(self, head_tiles: int, nope_logical_dim: int = _MLA_NOPE_DIM):
+    def __init__(
+        self,
+        head_tiles: int,
+        nope_logical_dim: int = _MLA_NOPE_DIM,
+        include_rope_in_v: bool = False,
+    ):
         self.head_tiles = int(head_tiles)
         self.nope_logical_dim = int(nope_logical_dim)
+        self.include_rope_in_v = bool(include_rope_in_v)
 
     @cute.jit
     def __call__(
@@ -2522,6 +2620,7 @@ class SparseMLAKernel:
             None,
             Int32(self.nope_logical_dim // 2),
             attn_sink,
+            self.include_rope_in_v,
         )
 
 @lru_cache(maxsize=16)
@@ -2529,7 +2628,11 @@ def _build_sparse_mla_kernel_for_shape(
     traits: SparseMLATraits,
     head_tiles: int,
 ) -> SparseMLAKernel:
-    return SparseMLAKernel(head_tiles, nope_logical_dim=traits.nope_logical_dim)
+    return SparseMLAKernel(
+        head_tiles,
+        nope_logical_dim=traits.nope_logical_dim,
+        include_rope_in_v=(traits.v_head_dim > traits.nope_logical_dim),
+    )
 
 
 def clear_sparse_mla_kernel_cache() -> None:

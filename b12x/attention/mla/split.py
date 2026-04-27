@@ -211,10 +211,17 @@ def _zero_partial_head_tile(
 class SparseMLASplitDecodeForwardKernel:
     """Chunk-local sparse MLA partial forward for decode."""
 
-    def __init__(self, launch_num_chunks: int, head_tiles: int, nope_logical_dim: int = _MLA_NOPE_DIM):
+    def __init__(
+        self,
+        launch_num_chunks: int,
+        head_tiles: int,
+        nope_logical_dim: int = _MLA_NOPE_DIM,
+        include_rope_in_v: bool = False,
+    ):
         self.launch_num_chunks = int(launch_num_chunks)
         self.head_tiles = int(head_tiles)
         self.nope_logical_dim = int(nope_logical_dim)
+        self.include_rope_in_v = bool(include_rope_in_v)
 
     @cute.jit
     def __call__(
@@ -318,6 +325,8 @@ class SparseMLASplitDecodeForwardKernel:
                 chunk_idx,
                 tmp_lse,
                 Int32(self.nope_logical_dim // 2),
+                None,
+                self.include_rope_in_v,
             )
 
 
@@ -470,7 +479,10 @@ def _build_sparse_mla_split_forward_kernel(
     head_tiles: int,
 ) -> SparseMLASplitDecodeForwardKernel:
     return SparseMLASplitDecodeForwardKernel(
-        launch_num_chunks, head_tiles, nope_logical_dim=traits.nope_logical_dim
+        launch_num_chunks,
+        head_tiles,
+        nope_logical_dim=traits.nope_logical_dim,
+        include_rope_in_v=(traits.v_head_dim > traits.nope_logical_dim),
     )
 
 

@@ -443,3 +443,199 @@ def test_dsv4_kernel_split_decode_with_sink_matches_reference(width: int) -> Non
     max_abs, rmse, cos = _compare(output, expected)
     assert cos >= 0.99, f"width={width}: cos={cos:.6f} (max_abs={max_abs:.4f} rmse={rmse:.4f})"
     assert max_abs <= 0.15, f"width={width}: max_abs={max_abs:.6f}"
+
+
+# ---------------------------------------------------------------------------
+# v=512 native rope-as-V (Steps 1+2+3+6 of Path A scoping)
+#
+# vLLM's DSV4-Flash absorbed-MLA contract requires V = K = nope ⊕ rope (512 dims).
+# The cuTe kernel folds the rope-V contribution into o_frag3[mma_d 4..7] via a
+# new BF16 PV-rope MMA helper (`_accumulate_pv_rope_bf16_into_o_frag3`).
+# These tests assert parity vs sparse_mla_reference at v=512.
+# ---------------------------------------------------------------------------
+
+
+_DSV4_V_HEAD_DIM_FULL = 512  # = nope_logical_dim 448 + rope_dim 64
+
+
+@pytest.mark.parametrize("num_tokens", [63, 64, 128])
+def test_dsv4_kernel_decode_v512_matches_reference(num_tokens: int) -> None:
+    """run_sparse_mla_kernel with v_head_dim=512 (rope folded into V) matches reference."""
+    device = require_sm120()
+    q_all, k_nope, k_rope = _make_dsv4_tensors(
+        num_tokens=num_tokens, num_q=1, seed=60_000 + num_tokens, device=device
+    )
+    packed = pack_mla_kv_cache_reference(k_nope, k_rope, nope_logical_dim=_DSV4_NOPE_DIM)
+    page_table_1 = torch.arange(num_tokens, dtype=torch.int32, device=device).unsqueeze(0)
+    active_token_counts = torch.tensor([num_tokens], dtype=torch.int32, device=device)
+
+    output = torch.zeros(1, _DSV4_NUM_HEADS, _DSV4_V_HEAD_DIM_FULL, dtype=torch.bfloat16, device=device)
+    run_sparse_mla_kernel(
+        q_all=q_all,
+        kv_cache=packed,
+        page_table_1=page_table_1,
+        active_token_counts=active_token_counts,
+        sm_scale=_make_sm_scale(device),
+        output=output,
+    )
+    expected = sparse_mla_reference(
+        q_all=q_all,
+        kv_cache=packed,
+        page_table_1=page_table_1,
+        active_token_counts=active_token_counts,
+        sm_scale=_DSV4_SM_SCALE,
+        v_head_dim=_DSV4_V_HEAD_DIM_FULL,
+        nope_logical_dim=_DSV4_NOPE_DIM,
+    )
+    torch.cuda.synchronize(device)
+
+    assert output.shape == (1, _DSV4_NUM_HEADS, _DSV4_V_HEAD_DIM_FULL)
+    max_abs, rmse, cos = _compare(output, expected)
+    assert cos >= 0.99, f"num_tokens={num_tokens}: cos={cos:.6f} (max_abs={max_abs:.4f} rmse={rmse:.4f})"
+    assert max_abs <= 0.15, f"num_tokens={num_tokens}: max_abs={max_abs:.6f}"
+
+
+@pytest.mark.parametrize("num_tokens", [128, 256])
+def test_dsv4_kernel_decode_v512_with_sink_matches_reference(num_tokens: int) -> None:
+    """v=512 + sink: full vLLM-DSV4 contract (rope-V + per-head sink) end-to-end."""
+    device = require_sm120()
+    q_all, k_nope, k_rope = _make_dsv4_tensors(
+        num_tokens=num_tokens, num_q=1, seed=61_000 + num_tokens, device=device
+    )
+    packed = pack_mla_kv_cache_reference(k_nope, k_rope, nope_logical_dim=_DSV4_NOPE_DIM)
+    page_table_1 = torch.arange(num_tokens, dtype=torch.int32, device=device).unsqueeze(0)
+    active_token_counts = torch.tensor([num_tokens], dtype=torch.int32, device=device)
+    attn_sink = _make_attn_sink(_DSV4_NUM_HEADS, seed=82_000 + num_tokens, device=device)
+
+    output = torch.zeros(1, _DSV4_NUM_HEADS, _DSV4_V_HEAD_DIM_FULL, dtype=torch.bfloat16, device=device)
+    run_sparse_mla_kernel(
+        q_all=q_all,
+        kv_cache=packed,
+        page_table_1=page_table_1,
+        active_token_counts=active_token_counts,
+        sm_scale=_make_sm_scale(device),
+        output=output,
+        attn_sink=attn_sink,
+    )
+    expected = sparse_mla_reference(
+        q_all=q_all,
+        kv_cache=packed,
+        page_table_1=page_table_1,
+        active_token_counts=active_token_counts,
+        sm_scale=_DSV4_SM_SCALE,
+        v_head_dim=_DSV4_V_HEAD_DIM_FULL,
+        nope_logical_dim=_DSV4_NOPE_DIM,
+        attn_sink=attn_sink,
+    )
+    torch.cuda.synchronize(device)
+
+    assert output.shape == (1, _DSV4_NUM_HEADS, _DSV4_V_HEAD_DIM_FULL)
+    max_abs, rmse, cos = _compare(output, expected)
+    assert cos >= 0.99, f"num_tokens={num_tokens}: cos={cos:.6f} (max_abs={max_abs:.4f} rmse={rmse:.4f})"
+    assert max_abs <= 0.15, f"num_tokens={num_tokens}: max_abs={max_abs:.6f}"
+
+
+@pytest.mark.parametrize("num_q", [2, 4])
+def test_dsv4_kernel_mtp_v512_matches_reference(num_q: int) -> None:
+    """MTP + v=512 + sink — the full vLLM contract for speculative decode."""
+    device = require_sm120()
+    num_tokens = 128
+    q_all, k_nope, k_rope = _make_dsv4_tensors(
+        num_tokens=num_tokens, num_q=num_q, seed=62_000 + num_q, device=device
+    )
+    packed = pack_mla_kv_cache_reference(k_nope, k_rope, nope_logical_dim=_DSV4_NOPE_DIM)
+    page_table_1 = torch.arange(num_tokens, dtype=torch.int32, device=device).repeat(num_q, 1)
+    active_token_counts = torch.full((num_q,), num_tokens, dtype=torch.int32, device=device)
+    attn_sink = _make_attn_sink(_DSV4_NUM_HEADS, seed=84_000 + num_q, device=device)
+
+    output = torch.zeros(num_q, _DSV4_NUM_HEADS, _DSV4_V_HEAD_DIM_FULL, dtype=torch.bfloat16, device=device)
+    run_sparse_mla_kernel(
+        q_all=q_all,
+        kv_cache=packed,
+        page_table_1=page_table_1,
+        active_token_counts=active_token_counts,
+        sm_scale=_make_sm_scale(device),
+        output=output,
+        attn_sink=attn_sink,
+    )
+    expected = sparse_mla_reference(
+        q_all=q_all,
+        kv_cache=packed,
+        page_table_1=page_table_1,
+        active_token_counts=active_token_counts,
+        sm_scale=_DSV4_SM_SCALE,
+        v_head_dim=_DSV4_V_HEAD_DIM_FULL,
+        nope_logical_dim=_DSV4_NOPE_DIM,
+        attn_sink=attn_sink,
+    )
+    torch.cuda.synchronize(device)
+
+    assert output.shape == (num_q, _DSV4_NUM_HEADS, _DSV4_V_HEAD_DIM_FULL)
+    max_abs, rmse, cos = _compare(output, expected)
+    assert cos >= 0.99, f"num_q={num_q}: cos={cos:.6f} (max_abs={max_abs:.4f} rmse={rmse:.4f})"
+    assert max_abs <= 0.15, f"num_q={num_q}: max_abs={max_abs:.6f}"
+
+
+@pytest.mark.parametrize("width", [256, 512])
+def test_dsv4_split_decode_v512_with_sink_matches_reference(width: int) -> None:
+    """Split-decode with v=512 (rope folded into V) + sink — covers chunked path."""
+    from b12x.attention.mla.split import (
+        forced_sparse_mla_split_decode_config_for_width,
+    )
+    device = require_sm120()
+    num_tokens = width
+    q_all, k_nope, k_rope = _make_dsv4_tensors(
+        num_tokens=num_tokens, num_q=1, seed=63_000 + width, device=device
+    )
+    packed = pack_mla_kv_cache_reference(k_nope, k_rope, nope_logical_dim=_DSV4_NOPE_DIM)
+    page_table_1 = torch.arange(num_tokens, dtype=torch.int32, device=device).unsqueeze(0)
+    active_token_counts = torch.tensor([num_tokens], dtype=torch.int32, device=device)
+    attn_sink = _make_attn_sink(_DSV4_NUM_HEADS, seed=86_000 + width, device=device)
+
+    cfg = forced_sparse_mla_split_decode_config_for_width(width)
+    if cfg is None:
+        pytest.skip(f"no split config for width={width}")
+    num_chunks = cfg.num_chunks
+
+    tmp_output = torch.zeros(
+        1, _DSV4_NUM_HEADS, num_chunks, _DSV4_V_HEAD_DIM_FULL,
+        dtype=torch.bfloat16, device=device,
+    )
+    tmp_lse = torch.full(
+        (1, _DSV4_NUM_HEADS, num_chunks), float("-inf"),
+        dtype=torch.float32, device=device,
+    )
+    output = torch.zeros(1, _DSV4_NUM_HEADS, _DSV4_V_HEAD_DIM_FULL, dtype=torch.bfloat16, device=device)
+    kv_chunk_size_ptr = torch.tensor([cfg.chunk_size], dtype=torch.int32, device=device)
+    num_chunks_ptr = torch.tensor([num_chunks], dtype=torch.int32, device=device)
+
+    run_sparse_mla_split_decode(
+        q_all=q_all,
+        kv_cache=packed,
+        page_table_1=page_table_1,
+        active_token_counts=active_token_counts,
+        sm_scale=_make_sm_scale(device),
+        kv_chunk_size_ptr=kv_chunk_size_ptr,
+        num_chunks_ptr=num_chunks_ptr,
+        tmp_output=tmp_output,
+        tmp_lse=tmp_lse,
+        output=output,
+        launch_num_chunks=num_chunks,
+        attn_sink=attn_sink,
+    )
+    expected = sparse_mla_reference(
+        q_all=q_all,
+        kv_cache=packed,
+        page_table_1=page_table_1,
+        active_token_counts=active_token_counts,
+        sm_scale=_DSV4_SM_SCALE,
+        v_head_dim=_DSV4_V_HEAD_DIM_FULL,
+        nope_logical_dim=_DSV4_NOPE_DIM,
+        attn_sink=attn_sink,
+    )
+    torch.cuda.synchronize(device)
+
+    assert output.shape == (1, _DSV4_NUM_HEADS, _DSV4_V_HEAD_DIM_FULL)
+    max_abs, rmse, cos = _compare(output, expected)
+    assert cos >= 0.99, f"width={width}: cos={cos:.6f} (max_abs={max_abs:.4f} rmse={rmse:.4f})"
+    assert max_abs <= 0.15, f"width={width}: max_abs={max_abs:.6f}"

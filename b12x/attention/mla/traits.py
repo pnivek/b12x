@@ -14,10 +14,19 @@ _MLA_GROUP_SIZE = 128
 # Supported (head_dim, v_head_dim) pairs.  head_dim = nope_logical + rope.
 # nope_logical must be a multiple of _MLA_GROUP_SIZE for full groups, OR
 # equal to k*128 + 64 for a single half-group (DSV4: 448 = 3*128 + 64).
+#
+# DSV4-Flash has TWO supported v_head_dim values:
+#   * v=448: V = K_nope only (legacy / pre-absorption convention; matches
+#     dense_mla_reference). Output dims 0..447.
+#   * v=512: V = K_full = K_nope ⊕ K_rope (vLLM absorbed-MLA convention).
+#     Output dims 0..511, where dims 448..511 = P @ K_rope (BF16 PV-rope MMA).
+#     Selected automatically when v_head_dim > nope_logical_dim — the kernel
+#     adds an extra rope-PV pass into o_frag3[mma_d 4..7].
 _SUPPORTED_SHAPES: dict[tuple[int, int], int] = {
     # (head_dim, v_head_dim) -> nope_logical_dim
     (576, 512): 512,  # GLM-5.1
-    (512, 448): 448,  # DSV4-Flash
+    (512, 448): 448,  # DSV4-Flash, V = K_nope only
+    (512, 512): 448,  # DSV4-Flash, V = K_full (kernel folds rope into V via BF16 PV-rope)
 }
 
 
