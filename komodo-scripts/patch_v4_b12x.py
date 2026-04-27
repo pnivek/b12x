@@ -146,15 +146,46 @@ if "safetensors==0.8.0rc0" not in content:
 else:
     print("  safetensors already upgraded")
 
-# 7. Install b12x from our public fork
+# 7. Install b12x from our public fork.
+#    We pin to the resolved master SHA so Docker's RUN-layer cache invalidates
+#    when b12x master moves forward (otherwise pip install with the same command
+#    text would re-use the cached layer even when master has new commits).
+import urllib.request
+B12X_REF = "master"
+try:
+    with urllib.request.urlopen(
+        f"https://api.github.com/repos/pnivek/b12x/commits/{B12X_REF}",
+        timeout=10,
+    ) as resp:
+        import json as _json
+        B12X_SHA = _json.load(resp)["sha"]
+    print(f"  Resolved b12x master -> {B12X_SHA}")
+except Exception as exc:
+    # Fallback: use ref name; cache will be stale but build still works.
+    B12X_SHA = B12X_REF
+    print(f"  WARN: GitHub SHA lookup failed ({exc}); using ref={B12X_REF}",
+          file=sys.stderr)
+
 content = "".join(lines)
-B12X_PIP = "pip install --no-deps git+https://github.com/pnivek/b12x.git@master"
+B12X_PIP = f"pip install --no-deps git+https://github.com/pnivek/b12x.git@{B12X_SHA}"
 if "github.com/pnivek/b12x" not in content:
     lines.append("\n# Install b12x sparse MLA library (DSV4-Flash patches)\n")
     lines.append(f"RUN {B12X_PIP}\n")
-    print("  Appended b12x install")
+    print(f"  Appended b12x install (pinned to {B12X_SHA[:12]})")
 else:
-    print("  b12x install already present")
+    # Replace any existing b12x line with the freshly-resolved SHA so subsequent
+    # builds in the same Komodo workspace always pick up the latest master.
+    new_lines = []
+    replaced = False
+    for line in lines:
+        if "github.com/pnivek/b12x" in line:
+            new_lines.append(f"RUN {B12X_PIP}\n")
+            replaced = True
+        else:
+            new_lines.append(line)
+    lines = new_lines
+    if replaced:
+        print(f"  Re-pinned b12x install to {B12X_SHA[:12]}")
 
 # 8. Write patched Dockerfile
 with open(df_path, "w") as f:
