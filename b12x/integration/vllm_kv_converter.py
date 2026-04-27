@@ -144,10 +144,12 @@ def gather_and_dequant_fp8ds(
     k_nope = _dequant_nope(token_data, token_scales).squeeze(1)  # (num_rows, 448)
     k_rope = _extract_rope(token_data).squeeze(1)                # (num_rows, 64)
 
-    if (~valid).any():
-        invalid_rows = (~valid).nonzero(as_tuple=False).squeeze(-1)
-        k_nope[invalid_rows] = 0
-        k_rope[invalid_rows] = 0
+    # Unconditionally mask invalid rows. Host-side `.any()` would force a CPU
+    # sync that is forbidden during CUDA graph capture; masking is cheap.
+    valid_nope = valid.view(-1, 1).to(k_nope.dtype)  # (num_rows, 1) bf16
+    valid_rope = valid.view(-1, 1).to(k_rope.dtype)
+    k_nope = k_nope * valid_nope
+    k_rope = k_rope * valid_rope
 
     new_page_table = torch.arange(
         num_rows, dtype=torch.int32, device=page_table_1.device
@@ -187,10 +189,13 @@ def convert_fp8ds_to_b12x_gathered(
     k_nope = _dequant_nope(token_data, token_scales)
     k_rope = _extract_rope(token_data)
 
-    if (~valid).any():
-        invalid_rows = (~valid).nonzero(as_tuple=False).squeeze(-1)
-        k_nope[invalid_rows] = 0
-        k_rope[invalid_rows] = 0
+    # Unconditionally mask invalid rows to zero. The host-side `(~valid).any()`
+    # early-exit was a small optimization but it forces a CPU sync that is
+    # forbidden during CUDA graph capture. Masking is cheap; just always do it.
+    valid_nope = valid.view(-1, 1, 1).to(k_nope.dtype)  # (num_rows, 1, 1) bf16
+    valid_rope = valid.view(-1, 1, 1).to(k_rope.dtype)
+    k_nope = k_nope * valid_nope
+    k_rope = k_rope * valid_rope
 
     packed = pack_mla_kv_cache_reference(
         k_nope, k_rope, nope_logical_dim=_DSV4_NOPE_DIM
