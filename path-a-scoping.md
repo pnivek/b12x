@@ -1,5 +1,17 @@
-# Path A — cuTe Sparse MLA Kernel Native DSV4-Flash Support: Scoping
+# Path A — cuTe Sparse MLA Kernel Native DSV4-Flash Support: Scoping → IMPLEMENTED
 
+**Status:** ✅ **landed** as of b12x `e6a0a5d` (Step 9) + `d4357b7` (Steps 1+2+3+5+6) and vllm-b12x `326b0fdf4` (Step 8). 32/32 cuTe parity tests pass on sparky GB10. Final perf validation pending image rebuild.
+
+## Quick links
+
+- b12x kernel commit (rope-as-V): https://github.com/pnivek/b12x/commit/d4357b7
+- b12x kernel commit (attn_sink): https://github.com/pnivek/b12x/commit/e6a0a5d
+- vllm-b12x dispatch swap: https://github.com/pnivek/vllm/commit/326b0fdf4
+- Test fixture file: `tests/test_mla_dsv4_kernel.py` — 32 tests covering single-pass, MTP, split-decode at v=448 and v=512 with/without sink
+
+---
+
+## Original scoping (kept below for reference)
 **Status:** scoping (no code changes yet)
 **Author:** ds4 integration follow-up
 **Baseline being beaten:** 23.5 tok/s (build #8 image, vectorized BF16 reference path with bypass) — already +59% over Triton+MTP=14.8.
