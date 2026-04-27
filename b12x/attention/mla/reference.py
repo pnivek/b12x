@@ -175,10 +175,15 @@ def sparse_mla_reference(
     k_nope = kv[:, :nope_logical_dim]
     k_rope = kv[:, _MLA_NOPE_DIM:]  # rope always starts at storage offset 512
     k_all = torch.cat([k_nope, k_rope], dim=1)
+    # MLA-absorbed convention: V = K (the full latent, including the rope
+    # portion).  For GLM-5.1, v_head_dim=512 == nope_logical_dim, so this
+    # collapses to k_nope.  For DSV4-Flash, v_head_dim=512 spans nope (448)
+    # plus rope (64) — using k_all preserves both pieces.
+    v_all = k_all[:, :v_head_dim]
     return _sparse_attention_reference(
         q_all=q_all,
         k_all=k_all,
-        v_all=k_nope[:, :v_head_dim],
+        v_all=v_all,
         page_table_1=page_table_1,
         active_token_counts=active_token_counts,
         sm_scale=sm_scale,
