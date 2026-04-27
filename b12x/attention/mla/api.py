@@ -114,6 +114,7 @@ def sparse_mla_decode_forward(
     workspace: B12XAttentionWorkspace,
     sm_scale: float,
     v_head_dim: int,
+    attn_sink: torch.Tensor | None = None,
 ) -> torch.Tensor:
     workspace.prepare_decode(
         metadata.page_table_1,
@@ -126,6 +127,7 @@ def sparse_mla_decode_forward(
         workspace=workspace,
         sm_scale=sm_scale,
         v_head_dim=v_head_dim,
+        attn_sink=attn_sink,
     )
 
 
@@ -159,6 +161,7 @@ def _run_sparse_mla(
     workspace: B12XAttentionWorkspace,
     sm_scale: float,
     v_head_dim: int,
+    attn_sink: torch.Tensor | None = None,
 ) -> torch.Tensor:
     selected_indices = workspace.page_table_1
     active_token_counts = workspace.nsa_cache_seqlens_int32
@@ -342,6 +345,7 @@ def _run_sparse_mla(
             sm_scale=sm_scale,
             v_head_dim=v_head_dim,
             nope_logical_dim=int(nope_logical_dim),
+            attn_sink=attn_sink,
         )
     return output
 

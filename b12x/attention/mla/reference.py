@@ -163,6 +163,7 @@ def sparse_mla_reference(
     sm_scale: float,
     v_head_dim: int,
     nope_logical_dim: int = _MLA_NOPE_DIM,
+    attn_sink: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Reference attention using the packed NSA MLA cache layout.
 
@@ -187,6 +188,7 @@ def sparse_mla_reference(
         page_table_1=page_table_1,
         active_token_counts=active_token_counts,
         sm_scale=sm_scale,
+        attn_sink=attn_sink,
     )
 
 
@@ -198,6 +200,7 @@ def _sparse_attention_reference(
     page_table_1: torch.Tensor,
     active_token_counts: torch.Tensor | None = None,
     sm_scale: float,
+    attn_sink: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if q_all.ndim != 3:
         raise ValueError(f"q_all must be rank-3, got {tuple(q_all.shape)}")
@@ -235,7 +238,18 @@ def _sparse_attention_reference(
         k_sel = k_all.index_select(0, valid.to(torch.long))
         v_sel = v_all.index_select(0, valid.to(torch.long))
         scores = torch.matmul(q_all_f[row], k_sel.transpose(0, 1)) * float(sm_scale)
-        probs = torch.softmax(scores, dim=-1)
+        if attn_sink is not None:
+            # Sink contributes a (num_heads,) per-head additive bias to the
+            # softmax denominator (not the value sum).
+            sink = attn_sink.to(torch.float32).to(q_all.device)
+            sink = sink[: scores.shape[0]]  # tolerate padded sinks
+            m = torch.maximum(scores.amax(dim=-1, keepdim=True), sink.unsqueeze(-1))
+            exp_scores = torch.exp(scores - m)
+            exp_sink = torch.exp(sink.unsqueeze(-1) - m)
+            denom = exp_scores.sum(dim=-1, keepdim=True) + exp_sink
+            probs = exp_scores / denom
+        else:
+            probs = torch.softmax(scores, dim=-1)
         out[row] = torch.matmul(probs, v_sel)
 
     return out.to(q_all.dtype)
