@@ -202,6 +202,106 @@ def _sparse_attention_reference(
     sm_scale: float,
     attn_sink: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Dispatch to the vectorised path by default; opt out via env for parity."""
+    import os
+    if os.environ.get("B12X_MLA_REFERENCE_LOOP", "0") != "1":
+        return _sparse_attention_reference_vectorized(
+            q_all=q_all, k_all=k_all, v_all=v_all,
+            page_table_1=page_table_1,
+            active_token_counts=active_token_counts,
+            sm_scale=sm_scale, attn_sink=attn_sink,
+        )
+    return _sparse_attention_reference_loop(
+        q_all=q_all, k_all=k_all, v_all=v_all,
+        page_table_1=page_table_1,
+        active_token_counts=active_token_counts,
+        sm_scale=sm_scale, attn_sink=attn_sink,
+    )
+
+
+def _sparse_attention_reference_vectorized(
+    *,
+    q_all: torch.Tensor,
+    k_all: torch.Tensor,
+    v_all: torch.Tensor,
+    page_table_1: torch.Tensor,
+    active_token_counts: torch.Tensor | None = None,
+    sm_scale: float,
+    attn_sink: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Batched (N) sparse attention — same math as _loop, no Python per-row sync.
+
+    Shapes:
+        q_all:        (N, H, D)
+        k_all:        (T, D)
+        v_all:        (T, V)
+        page_table_1: (N, W) int
+        active_token_counts: optional (N,) int — prefix length per row
+        attn_sink:    optional (H,) per-head softmax sink bias
+    Returns:
+        out:          (N, H, V) same dtype as q_all
+    """
+    if q_all.ndim != 3:
+        raise ValueError(f"q_all must be rank-3, got {tuple(q_all.shape)}")
+    if page_table_1.ndim != 2:
+        raise ValueError(f"page_table_1 must be rank-2, got {tuple(page_table_1.shape)}")
+    if page_table_1.shape[0] != q_all.shape[0]:
+        raise ValueError(
+            f"page_table_1 rows {page_table_1.shape[0]} do not match q rows {q_all.shape[0]}"
+        )
+
+    N, H, _ = q_all.shape
+    T = k_all.shape[0]
+    W = page_table_1.shape[1]
+
+    pt = page_table_1.long()
+    valid_mask = (pt >= 0) & (pt < T)  # (N, W)
+    if active_token_counts is not None:
+        widths = torch.arange(W, device=pt.device).unsqueeze(0)  # (1, W)
+        valid_mask = valid_mask & (widths < active_token_counts.long().unsqueeze(1))
+
+    safe_pt = torch.where(valid_mask, pt, torch.zeros_like(pt))  # (N, W)
+    k_sel = k_all[safe_pt]  # (N, W, D)
+    v_sel = v_all[safe_pt]  # (N, W, V)
+
+    q_f = q_all.to(torch.float32)
+    k_f = k_sel.to(torch.float32)
+    v_f = v_sel.to(torch.float32)
+
+    scores = torch.bmm(q_f, k_f.transpose(1, 2)) * float(sm_scale)  # (N, H, W)
+    scores = scores.masked_fill(~valid_mask.unsqueeze(1), float("-inf"))
+
+    if attn_sink is not None:
+        sink = attn_sink.to(torch.float32).to(q_all.device)[:H]  # (H,)
+        m = torch.maximum(scores.amax(dim=-1, keepdim=True),
+                          sink.view(1, H, 1))  # (N, H, 1)
+        exp_scores = torch.exp(scores - m)
+        exp_sink = torch.exp(sink.view(1, H, 1) - m)
+        denom = exp_scores.sum(dim=-1, keepdim=True) + exp_sink
+        probs = exp_scores / denom
+    else:
+        probs = torch.softmax(scores, dim=-1)
+
+    # Rows where ALL entries are -inf (no valid candidates) yield NaNs from softmax;
+    # zero them so we match the loop's "skip empty row" behaviour.
+    no_valid_row = ~valid_mask.any(dim=-1, keepdim=True)  # (N, 1)
+    if no_valid_row.any():
+        probs = probs.masked_fill(no_valid_row.unsqueeze(1), 0.0)
+
+    out = torch.bmm(probs, v_f)  # (N, H, V)
+    return out.to(q_all.dtype)
+
+
+def _sparse_attention_reference_loop(
+    *,
+    q_all: torch.Tensor,
+    k_all: torch.Tensor,
+    v_all: torch.Tensor,
+    page_table_1: torch.Tensor,
+    active_token_counts: torch.Tensor | None = None,
+    sm_scale: float,
+    attn_sink: torch.Tensor | None = None,
+) -> torch.Tensor:
     if q_all.ndim != 3:
         raise ValueError(f"q_all must be rank-3, got {tuple(q_all.shape)}")
     if page_table_1.ndim != 2:
